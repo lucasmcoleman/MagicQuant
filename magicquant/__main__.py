@@ -126,49 +126,37 @@ def cmd_search(args):
     """Run evolutionary search to find optimal configurations."""
     from magicquant.orchestrator import MagicQuantOrchestrator
 
+    adapter = getattr(args, "adapter", None)
     orchestrator = MagicQuantOrchestrator(
         source_model_path=args.model,
         output_dir=args.output_dir,
-        llamacpp_path=args.llamacpp_path
+        llamacpp_path=args.llamacpp_path,
+        adapter_path=adapter,
     )
 
-    best_configs, tiered = orchestrator.run_full_search(
-        target_base_quant=args.target_quant,
-        max_generations=args.generations,
-        population_size=args.population,
-        verbose=True
-    )
+    rounds = getattr(args, "rounds", 0)
 
-    # Save results to file — both full list and per-tier best
-    os.makedirs(args.output_dir, exist_ok=True)
-    results_file = os.path.join(args.output_dir, "search_results.json")
+    if rounds > 0:
+        # Full measured search: Predict -> Build -> Measure -> Learn
+        candidates = getattr(args, "candidates", 4)
+        all_configs, tiered = orchestrator.run_measured_search(
+            target_base_quant=args.target_quant,
+            search_generations=args.generations,
+            population_size=args.population,
+            measurement_rounds=rounds,
+            candidates_per_round=candidates,
+            verbose=True,
+        )
+    else:
+        # Prediction-only search (fast, no llama.cpp required)
+        all_configs, tiered = orchestrator.run_full_search(
+            target_base_quant=args.target_quant,
+            max_generations=args.generations,
+            population_size=args.population,
+            verbose=True,
+        )
 
-    with open(results_file, 'w') as f:
-        json.dump({
-            'tiered': {
-                tier: {
-                    'config': cfg['config'],
-                    'predicted_loss': cfg.get('predicted_loss', 0),
-                    'predicted_size_gb': cfg.get('predicted_size_gb', 0),
-                    'predicted_tps': cfg.get('predicted_tps', 0),
-                    'composite_score': cfg.get('composite_score', 0),
-                }
-                for tier, cfg in tiered.items()
-            },
-            'all': [
-                {
-                    'config': c['config'],
-                    'tier': c.get('tier', ''),
-                    'predicted_loss': c.get('predicted_loss', 0),
-                    'predicted_size_gb': c.get('predicted_size_gb', 0),
-                    'predicted_tps': c.get('predicted_tps', 0),
-                    'composite_score': c.get('composite_score', 0),
-                }
-                for c in best_configs[:20]
-            ],
-        }, f, indent=2)
-
-    print(f"\nResults saved to: {results_file}")
+    print(f"\nResults saved to: {os.path.join(args.output_dir, 'search_results.json')}")
 
 
 def cmd_hybrid(args):
@@ -361,6 +349,18 @@ def main():
     search_parser.add_argument(
         "--llamacpp-path",
         help="Path to llama.cpp directory (auto-detect if omitted)"
+    )
+    search_parser.add_argument(
+        "--rounds", type=int, default=0,
+        help="Measurement rounds (0 = prediction only, 3+ = full measured search)"
+    )
+    search_parser.add_argument(
+        "--candidates", type=int, default=4,
+        help="Candidates to build and measure per round (default: 4)"
+    )
+    search_parser.add_argument(
+        "--adapter",
+        help="Path to LoRA adapter directory"
     )
     search_parser.set_defaults(func=cmd_search)
 

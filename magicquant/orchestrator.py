@@ -1,18 +1,21 @@
 """
-MagicQuant Orchestrator - Coordinates evolutionary search with llama.cpp.
+MagicQuant Orchestrator - Coordinates the full Predict -> Measure -> Learn pipeline.
 
-This script:
-1. Runs sensitivity probing (real or heuristic) to weight tensor groups
-2. Runs evolutionary search to find optimal hybrid configurations
-3. Uses the hybrid GGUF writer to generate per-group quantized models
-4. Optionally validates results with llama.cpp perplexity measurements
+The core loop:
+1. Sensitivity probing — measure per-group PPL impact
+2. Evolutionary search — generate candidate hybrid configs, predict performance
+3. Build & measure — create GGUFs for tier winners, run real perplexity
+4. Active learning — feed residuals (measured - predicted) back into predictor
+5. Repeat until convergence or budget exhausted
+6. Output the best verified survivor per tier
 """
 
 import os
 import json
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
+from collections import defaultdict
 
 from magicquant.evolution.predictor import PredictiveScorer
 from magicquant.evolution.survival import EvolutionarySurvivor
@@ -23,68 +26,91 @@ from magicquant.utils.llamacpp import LlamaCppTools, get_llamacpp_quant_type
 
 
 class MagicQuantOrchestrator:
-    """Orchestrate MagicQuant search with llama.cpp execution."""
+    """
+    Orchestrate the full MagicQuant search with real measurement feedback.
+
+    The key difference from a prediction-only search: after each evolutionary
+    round, the top candidates are actually built as GGUF files and measured
+    with llama-perplexity. The residuals (measured_loss - predicted_loss)
+    are fed back into the predictor, making it increasingly accurate for
+    this specific model architecture.
+    """
 
     def __init__(
         self,
         source_model_path: str,
         output_dir: str,
         llamacpp_path: Optional[str] = None,
+        adapter_path: Optional[str] = None,
     ):
-        """
-        Args:
-            source_model_path: Path to source GGUF (BF16/F16)
-            output_dir: Directory for output models
-            llamacpp_path: Path to llama.cpp (auto-detect if None)
-        """
         self.source_model_path = source_model_path
+        self.adapter_path = adapter_path
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Initialize llama.cpp tools
         self.llama_tools = LlamaCppTools(llamacpp_path)
 
-        # Will be populated during run
         self.baseline_ppl: Optional[float] = None
         self.sensitivity_weights: Optional[Dict[str, float]] = None
+        self.predictor: Optional[PredictiveScorer] = None
 
-    def run_full_search(
+        # Track all measured configs across rounds
+        self._measured: Dict[str, Dict] = {}  # config_key -> {config, ppl, loss, path}
+
+    # ------------------------------------------------------------------
+    # Full measured search (the real MagicQuant pipeline)
+    # ------------------------------------------------------------------
+
+    def run_measured_search(
         self,
         target_base_quant: str = "MXFP4_MOE",
-        max_generations: int = 50,
-        population_size: int = 100,
+        search_generations: int = 30,
+        population_size: int = 80,
+        measurement_rounds: int = 3,
+        candidates_per_round: int = 4,
         verbose: bool = True,
-    ) -> List[Dict]:
+    ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
-        Run complete MagicQuant workflow.
+        Run the full Predict -> Measure -> Learn loop.
+
+        Args:
+            target_base_quant: Default base quantization scheme
+            search_generations: Evolutionary generations per round
+            population_size: Candidates per generation
+            measurement_rounds: How many build-measure-learn cycles
+            candidates_per_round: How many configs to actually build and
+                measure per round (tier winners + epsilon-greedy picks)
+            verbose: Print progress
 
         Returns:
-            List of discovered configurations sorted by score
+            (all_configs, tiered_best) where tiered_best maps tier names
+            to the best *measured* config for that tier.
         """
         if verbose:
             print("=" * 60)
-            print("MagicQuant Hybrid Quantization Search")
+            print("MagicQuant Measured Hybrid Search")
             print("=" * 60)
-            print(f"Source Model: {self.source_model_path}")
-            print(f"Output Directory: {self.output_dir}")
-            print(f"Target Base Quant: {target_base_quant}")
+            print(f"Source: {self.source_model_path}")
+            if self.adapter_path:
+                print(f"Adapter: {self.adapter_path}")
+            print(f"Output: {self.output_dir}")
+            print(f"Rounds: {measurement_rounds} x {candidates_per_round} measurements")
             print()
 
-        # Step 1: Calculate baseline perplexity
+        # ── Step 1: Baseline perplexity ──
         if verbose:
-            print("Step 1: Calculating baseline perplexity...")
+            print("Step 1: Baseline perplexity...")
 
         self.baseline_ppl = self.llama_tools.calculate_perplexity(
             self.source_model_path, verbose=verbose
         )
-
         if self.baseline_ppl is None:
-            print("WARNING: Could not calculate baseline PPL. Using default.")
+            print("WARNING: Could not measure baseline PPL. Using default 5.0")
             self.baseline_ppl = 5.0
 
-        # Step 2: Run real sensitivity probing
+        # ── Step 2: Sensitivity probing ──
         if verbose:
-            print("\nStep 2: Running sensitivity probing...")
+            print("\nStep 2: Sensitivity probing...")
 
         prober = SensitivityProber(
             base_model_path=self.source_model_path,
@@ -94,44 +120,296 @@ class MagicQuantOrchestrator:
         )
 
         groups = ["E", "H", "Q", "K", "O", "U", "D"]
-        prober.probe_all_groups(
-            groups=groups,
-            aggressive_scheme="Q4_K_M",
-            verbose=verbose,
-        )
-
+        prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
         self.sensitivity_weights = prober.get_normalized_weights()
-
-        # Save sensitivity results
-        sensitivity_path = str(self.output_dir / "sensitivity.json")
-        prober.save_results(sensitivity_path)
+        prober.save_results(str(self.output_dir / "sensitivity.json"))
 
         if verbose:
             print("\nSensitivity weights:")
-            for group, weight in self.sensitivity_weights.items():
-                print(f"  {group}: {weight:.3f}")
+            for g, w in self.sensitivity_weights.items():
+                print(f"  {g}: {w:.3f}")
 
-        # Step 3: Get baseline size and speed estimates
+        # ── Step 3: Initialize predictor ──
         baseline_size_gb = self._estimate_model_size(self.source_model_path)
-        baseline_tps = 360
 
-        if verbose:
-            print(f"\nBaseline Size: {baseline_size_gb:.2f} GB")
-            print(f"Baseline TPS: {baseline_tps} tokens/sec")
-
-        # Step 4: Run evolutionary search
-        if verbose:
-            print(f"\nStep 3: Running evolutionary search "
-                  f"({max_generations} generations)...")
-
-        predictor = PredictiveScorer(
+        self.predictor = PredictiveScorer(
             sensitivity_weights=self.sensitivity_weights,
             baseline_size_gb=baseline_size_gb,
-            baseline_tps=baseline_tps,
+            baseline_tps=360,
+        )
+
+        # ── Step 4: Measured search rounds ──
+        all_configs = []
+
+        for round_idx in range(measurement_rounds):
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"Measurement Round {round_idx + 1}/{measurement_rounds}")
+                print(f"{'='*60}")
+
+            # 4a. Run evolutionary search with current predictor
+            survivor = EvolutionarySurvivor(
+                predictor=self.predictor,
+                baseline_config={"E": "BF16", "H": "BF16"},
+                max_generations=search_generations,
+                population_size=population_size,
+                epsilon=0.2,
+            )
+
+            round_configs = survivor.run_evolution(verbose=verbose)
+            all_configs.extend(round_configs)
+
+            # 4b. Pick candidates to measure: tier winners + epsilon picks
+            to_measure = self._select_measurement_candidates(
+                round_configs, baseline_size_gb, candidates_per_round
+            )
+
+            if verbose:
+                print(f"\nSelected {len(to_measure)} candidates for measurement:")
+
+            # 4c. Build, measure, learn
+            for i, candidate in enumerate(to_measure):
+                config = candidate["config"]
+                config_key = self._config_key(config)
+
+                # Skip if already measured
+                if config_key in self._measured:
+                    if verbose:
+                        print(f"  [{i+1}/{len(to_measure)}] Already measured, skipping")
+                    continue
+
+                if verbose:
+                    schemes = " ".join(f"{g}:{s}" for g, s in sorted(config.items()))
+                    print(f"  [{i+1}/{len(to_measure)}] Building: {schemes}")
+
+                # Build GGUF
+                model_name = f"round{round_idx+1}_candidate{i+1}"
+                path = self._build_candidate(config, model_name, target_base_quant)
+
+                if path is None:
+                    continue
+
+                # Measure perplexity
+                ppl = self.llama_tools.calculate_perplexity(path, verbose=verbose)
+
+                if ppl is not None:
+                    measured_loss = (ppl - self.baseline_ppl) / self.baseline_ppl
+                    predicted_loss = self.predictor.predict_loss(config)
+                    residual = measured_loss - predicted_loss
+
+                    # Record measurement
+                    self._measured[config_key] = {
+                        "config": config,
+                        "ppl": ppl,
+                        "measured_loss": measured_loss,
+                        "predicted_loss": predicted_loss,
+                        "residual": residual,
+                        "path": path,
+                        "size_gb": os.path.getsize(path) / (1024 ** 3),
+                    }
+
+                    # Active learning: feed residual back
+                    self.predictor.record_residual(config, residual)
+
+                    if verbose:
+                        print(f"    PPL: {ppl:.4f}  "
+                              f"Loss: {measured_loss:.4f} (predicted {predicted_loss:.4f})  "
+                              f"Residual: {residual:+.4f}")
+                else:
+                    if verbose:
+                        print(f"    Measurement failed")
+
+                # Clean up candidate GGUF to save disk (keep only final survivors)
+                # We'll rebuild the final survivors at the end
+                if os.path.exists(path):
+                    os.remove(path)
+
+            # 4d. Log round summary
+            if verbose and self._measured:
+                print(f"\n  Round {round_idx + 1} summary: "
+                      f"{len(self._measured)} total measurements")
+                avg_residual = sum(
+                    abs(m["residual"]) for m in self._measured.values()
+                ) / len(self._measured)
+                print(f"  Mean |residual|: {avg_residual:.4f} "
+                      f"(lower = predictor is more accurate)")
+
+        # ── Step 5: Select final survivors per tier ──
+        tiered = self._select_final_survivors(baseline_size_gb)
+
+        # Save all results
+        self._save_results(all_configs, tiered)
+
+        if verbose:
+            print(f"\n{'='*60}")
+            print("Final Verified Survivors:")
+            print(f"{'='*60}")
+            for tier, info in tiered.items():
+                c = info["config"]
+                schemes = " ".join(f"{g}:{s}" for g, s in sorted(c.items()))
+                print(f"\n  {tier}: PPL={info['ppl']:.4f}  "
+                      f"Loss={info['measured_loss']:.4f}  "
+                      f"Size={info['size_gb']:.2f}GB")
+                print(f"    {schemes}")
+
+        return all_configs, tiered
+
+    def _select_measurement_candidates(
+        self,
+        configs: List[Dict],
+        baseline_gb: float,
+        n: int,
+    ) -> List[Dict]:
+        """Pick the best candidates to actually build and measure."""
+        # Get tier winners
+        tiered = self._pick_best_per_tier(configs, baseline_gb)
+        candidates = list(tiered.values())
+
+        # Add epsilon-greedy: random picks that might be surprise winners
+        import random
+        remaining = [c for c in configs if c not in candidates]
+        if remaining and len(candidates) < n:
+            random.shuffle(remaining)
+            candidates.extend(remaining[:n - len(candidates)])
+
+        # Skip already-measured configs
+        candidates = [
+            c for c in candidates
+            if self._config_key(c["config"]) not in self._measured
+        ]
+
+        return candidates[:n]
+
+    def _build_candidate(
+        self, config: Dict[str, str], name: str, base_quant: str
+    ) -> Optional[str]:
+        """Build a hybrid GGUF for measurement. Returns path or None."""
+        from magicquant.gguf.writer import create_hybrid_gguf
+
+        output_filename = generate_name(name, base_quant, config)
+        output_path = str(self.output_dir / "_candidates" / output_filename)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        try:
+            return create_hybrid_gguf(
+                output_path=output_path,
+                base_model_path=self.source_model_path,
+                quant_config={"base": base_quant, "groups": config},
+                verbose=False,
+                adapter_path=self.adapter_path,
+            )
+        except Exception as exc:
+            print(f"    Build failed: {exc}")
+            return None
+
+    def _select_final_survivors(self, baseline_gb: float) -> Dict[str, Dict]:
+        """From all measured configs, pick the best per tier."""
+        by_tier: Dict[str, List[Dict]] = defaultdict(list)
+        for info in self._measured.values():
+            tier = self._classify_tier(info["size_gb"], baseline_gb)
+            by_tier[tier].append(info)
+
+        result = {}
+        for tier in ["Q6", "Q5", "Q4", "Q3"]:
+            if tier in by_tier:
+                # Best = lowest measured loss within the tier
+                best = min(by_tier[tier], key=lambda x: x["measured_loss"])
+                result[tier] = best
+        return result
+
+    def _save_results(self, all_configs, tiered):
+        """Persist search results and measurements to JSON."""
+        results = {
+            "baseline_ppl": self.baseline_ppl,
+            "measurements": {
+                k: {
+                    "config": v["config"],
+                    "ppl": v["ppl"],
+                    "measured_loss": v["measured_loss"],
+                    "predicted_loss": v["predicted_loss"],
+                    "residual": v["residual"],
+                    "size_gb": v["size_gb"],
+                }
+                for k, v in self._measured.items()
+            },
+            "tiered_survivors": {
+                tier: {
+                    "config": info["config"],
+                    "ppl": info["ppl"],
+                    "measured_loss": info["measured_loss"],
+                    "size_gb": info["size_gb"],
+                }
+                for tier, info in tiered.items()
+            },
+            "tiered": {
+                tier: {
+                    "config": info["config"],
+                    "ppl": info.get("ppl"),
+                    "measured_loss": info.get("measured_loss"),
+                    "predicted_loss": info.get("predicted_loss"),
+                    "size_gb": info.get("size_gb"),
+                }
+                for tier, info in tiered.items()
+            },
+        }
+
+        path = str(self.output_dir / "search_results.json")
+        with open(path, "w") as f:
+            json.dump(results, f, indent=2)
+
+    # ------------------------------------------------------------------
+    # Prediction-only search (no llama.cpp needed)
+    # ------------------------------------------------------------------
+
+    def run_full_search(
+        self,
+        target_base_quant: str = "MXFP4_MOE",
+        max_generations: int = 50,
+        population_size: int = 100,
+        verbose: bool = True,
+    ) -> Tuple[List[Dict], Dict[str, Dict]]:
+        """
+        Run prediction-only evolutionary search (no real measurements).
+        Use run_measured_search() for the full Predict->Measure->Learn loop.
+        """
+        if verbose:
+            print("=" * 60)
+            print("MagicQuant Prediction-Only Search")
+            print("=" * 60)
+            print(f"Source: {self.source_model_path}")
+            print()
+
+        # Baseline PPL
+        self.baseline_ppl = self.llama_tools.calculate_perplexity(
+            self.source_model_path, verbose=verbose
+        )
+        if self.baseline_ppl is None:
+            self.baseline_ppl = 5.0
+
+        # Sensitivity probing
+        if verbose:
+            print("\nSensitivity probing...")
+        prober = SensitivityProber(
+            base_model_path=self.source_model_path,
+            baseline_perplexity=self.baseline_ppl,
+            perplexity_calculator=self.llama_tools,
+            output_dir=str(self.output_dir / "_probes"),
+        )
+        groups = ["E", "H", "Q", "K", "O", "U", "D"]
+        prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
+        self.sensitivity_weights = prober.get_normalized_weights()
+        prober.save_results(str(self.output_dir / "sensitivity.json"))
+
+        baseline_size_gb = self._estimate_model_size(self.source_model_path)
+
+        self.predictor = PredictiveScorer(
+            sensitivity_weights=self.sensitivity_weights,
+            baseline_size_gb=baseline_size_gb,
+            baseline_tps=360,
         )
 
         survivor = EvolutionarySurvivor(
-            predictor=predictor,
+            predictor=self.predictor,
             baseline_config={"E": "BF16", "H": "BF16"},
             max_generations=max_generations,
             population_size=population_size,
@@ -139,31 +417,124 @@ class MagicQuantOrchestrator:
         )
 
         best_configs = survivor.run_evolution(verbose=verbose)
-
-        # Step 5: Pick the best config per tier
         tiered = self._pick_best_per_tier(best_configs, baseline_size_gb)
 
-        if verbose:
-            print("\n" + "=" * 60)
-            print("Best Configuration Per Tier:")
-            print("=" * 60)
-            for tier_name, cfg in tiered.items():
-                c = cfg['config']
-                ratio = cfg.get('predicted_size_gb', 0) / max(baseline_size_gb, 0.01)
-                print(f"\n  {tier_name} ({ratio:.0%} of BF16):")
-                print(f"    Loss={cfg.get('predicted_loss', 0):.3f}  "
-                      f"Size={cfg.get('predicted_size_gb', 0):.1f}GB  "
-                      f"Score={cfg.get('composite_score', 0):.3f}")
-                for g in sorted(c):
-                    print(f"      {g}: {c[g]}")
-
-        # Return all configs but attach tier info
         for cfg in best_configs:
             if 'tier' not in cfg:
-                size_gb = cfg.get('predicted_size_gb', 0)
-                cfg['tier'] = self._classify_tier(size_gb, baseline_size_gb)
+                cfg['tier'] = self._classify_tier(
+                    cfg.get('predicted_size_gb', 0), baseline_size_gb
+                )
 
         return best_configs, tiered
+
+    # ------------------------------------------------------------------
+    # Model generation
+    # ------------------------------------------------------------------
+
+    def generate_hybrid_model(
+        self, config: Dict[str, str], model_name: str,
+        base_quant: str = "MXFP4_MOE", verify: bool = True,
+    ) -> Optional[str]:
+        """Generate a hybrid GGUF model."""
+        from magicquant.gguf.writer import create_hybrid_gguf
+
+        output_filename = generate_name(model_name, base_quant, config)
+        output_path = self.output_dir / output_filename
+
+        print(f"\nGenerating hybrid GGUF: {output_filename}")
+        for grp, sch in sorted(config.items()):
+            print(f"  {grp} -> {sch}")
+
+        try:
+            result = create_hybrid_gguf(
+                output_path=str(output_path),
+                base_model_path=self.source_model_path,
+                quant_config={"base": base_quant, "groups": config},
+                verbose=True,
+                adapter_path=self.adapter_path,
+            )
+            if not os.path.isfile(result):
+                return None
+        except Exception as exc:
+            print(f"Failed: {exc}")
+            return None
+
+        if verify and self.baseline_ppl:
+            ppl = self.llama_tools.calculate_perplexity(str(output_path))
+            if ppl:
+                loss = (ppl - self.baseline_ppl) / self.baseline_ppl
+                print(f"  PPL: {ppl:.4f}  Loss: {loss*100:.2f}%")
+
+        return str(output_path)
+
+    def generate_tiered_models(
+        self, tiered: Dict[str, Dict], model_name_prefix: str = "Model",
+        tiers: Optional[List[str]] = None, verify: bool = False,
+    ) -> List[str]:
+        """Generate one hybrid GGUF per compression tier."""
+        if tiers is None:
+            tiers = ["Q6", "Q5", "Q4"]
+
+        generated = []
+        for tier in tiers:
+            if tier not in tiered:
+                print(f"\nNo config for tier {tier}, skipping")
+                continue
+
+            entry = tiered[tier]
+            config = entry["config"]
+            name = f"{model_name_prefix}-{tier}"
+
+            base_quant = max(
+                set(config.values()),
+                key=lambda s: {
+                    "BF16": 0, "Q8_0": 1, "Q6_K": 2, "Q5_K": 3,
+                    "IQ4_NL": 4, "MXFP4_MOE": 5, "Q4_K_M": 6
+                }.get(s, 3)
+            )
+
+            print(f"\n{'='*60}")
+            print(f"Generating {tier} tier: {name}")
+            if "ppl" in entry:
+                print(f"  Measured PPL: {entry['ppl']:.4f}  "
+                      f"Loss: {entry['measured_loss']:.4f}")
+            print(f"{'='*60}")
+
+            path = self.generate_hybrid_model(
+                config=config, model_name=name,
+                base_quant=base_quant, verify=verify,
+            )
+            if path:
+                generated.append(path)
+            else:
+                print(f"  -> FAILED")
+
+        return generated
+
+    def generate_top_models(
+        self, results: List[Dict], top_n: int = 3,
+        model_name_prefix: str = "Model", base_quant: str = "MXFP4_MOE",
+        verify: bool = False,
+    ) -> List[str]:
+        """Generate hybrid GGUFs for the top-N results by score."""
+        generated = []
+        for i, entry in enumerate(results[:top_n], 1):
+            path = self.generate_hybrid_model(
+                config=entry["config"],
+                model_name=f"{model_name_prefix}-Config{i}",
+                base_quant=base_quant, verify=verify,
+            )
+            if path:
+                generated.append(path)
+        return generated
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _config_key(config: Dict[str, str]) -> str:
+        return "|".join(f"{g}:{config[g]}" for g in sorted(config))
 
     @staticmethod
     def _classify_tier(size_gb: float, baseline_gb: float) -> str:
@@ -176,15 +547,10 @@ class MagicQuantOrchestrator:
             return "Q5"
         elif ratio > 0.28:
             return "Q4"
-        else:
-            return "Q3"
+        return "Q3"
 
     @staticmethod
-    def _pick_best_per_tier(
-        configs: List[Dict], baseline_gb: float
-    ) -> Dict[str, Dict]:
-        """Select the highest-scoring config from each compression tier."""
-        from collections import defaultdict
+    def _pick_best_per_tier(configs: List[Dict], baseline_gb: float) -> Dict[str, Dict]:
         by_tier: Dict[str, List[Dict]] = defaultdict(list)
         for cfg in configs:
             size_gb = cfg.get('predicted_size_gb', 0)
@@ -193,204 +559,37 @@ class MagicQuantOrchestrator:
         result = {}
         for tier in ["Q6", "Q5", "Q4", "Q3"]:
             if tier in by_tier:
-                best = max(by_tier[tier], key=lambda x: x.get('composite_score', 0))
-                result[tier] = best
+                result[tier] = max(by_tier[tier], key=lambda x: x.get('composite_score', 0))
         return result
 
-    def generate_hybrid_model(
-        self,
-        config: Dict[str, str],
-        model_name: str,
-        base_quant: str = "MXFP4_MOE",
-        verify: bool = True,
-    ) -> Optional[str]:
-        """
-        Generate a true per-group hybrid GGUF model.
-
-        Uses the hybrid GGUF writer to read the source model, quantise
-        each tensor according to its group assignment in *config*, and
-        write a single output GGUF file.
-
-        Args:
-            config: Group -> quant scheme mapping
-            model_name: Base model name for output file
-            base_quant: Default scheme for groups not in *config*
-            verify: Calculate PPL after generation
-
-        Returns:
-            Path to generated model or None on failure
-        """
-        from magicquant.gguf.writer import create_hybrid_gguf
-
-        output_filename = generate_name(model_name, base_quant, config)
-        output_path = self.output_dir / output_filename
-
-        print(f"\nGenerating hybrid GGUF: {output_filename}")
-        print(f"  Base scheme: {base_quant}")
-        for grp, sch in config.items():
-            print(f"  Group {grp} -> {sch}")
-
-        try:
-            quant_config = {
-                "base": base_quant,
-                "groups": config,
-            }
-
-            result = create_hybrid_gguf(
-                output_path=str(output_path),
-                base_model_path=self.source_model_path,
-                quant_config=quant_config,
-                verbose=True,
-            )
-
-            if not os.path.isfile(result):
-                print("Failed to generate model")
-                return None
-
-        except Exception as exc:
-            print(f"Failed to generate model: {exc}")
-            return None
-
-        # Verify if requested
-        if verify:
-            print(f"\nVerifying {output_filename}...")
-            ppl = self.llama_tools.calculate_perplexity(str(output_path))
-
-            if ppl and self.baseline_ppl:
-                loss = (ppl - self.baseline_ppl) / self.baseline_ppl
-                print(f"  Baseline PPL: {self.baseline_ppl:.4f}")
-                print(f"  Quantized PPL: {ppl:.4f}")
-                print(f"  Precision Loss: {loss*100:.2f}%")
-
-        return str(output_path)
-
-    def generate_tiered_models(
-        self,
-        tiered: Dict[str, Dict],
-        model_name_prefix: str = "Model",
-        tiers: Optional[List[str]] = None,
-        verify: bool = False,
-    ) -> List[str]:
-        """
-        Generate one hybrid GGUF per compression tier.
-
-        Args:
-            tiered: Dict of tier_name -> best config (from run_full_search)
-            model_name_prefix: Prefix for output filenames
-            tiers: Which tiers to generate (default: all available)
-            verify: Run perplexity verification
-
-        Returns:
-            List of paths to successfully generated models
-        """
-        if tiers is None:
-            tiers = ["Q6", "Q5", "Q4"]
-
-        generated = []
-        for tier in tiers:
-            if tier not in tiered:
-                print(f"\nNo config found for tier {tier}, skipping")
-                continue
-
-            entry = tiered[tier]
-            config = entry["config"]
-            name = f"{model_name_prefix}-{tier}"
-
-            # Use the most aggressive scheme in the config as the "base" for naming
-            base_quant = max(
-                set(config.values()),
-                key=lambda s: {
-                    "BF16": 0, "Q8_0": 1, "Q6_K": 2, "Q5_K": 3,
-                    "IQ4_NL": 4, "MXFP4_MOE": 5, "Q4_K_M": 6
-                }.get(s, 3)
-            )
-
-            print(f"\n{'='*60}")
-            print(f"Generating {tier} tier: {name}")
-            print(f"  Predicted: loss={entry.get('predicted_loss', 0):.3f}  "
-                  f"size={entry.get('predicted_size_gb', 0):.1f}GB")
-            print(f"{'='*60}")
-
-            path = self.generate_hybrid_model(
-                config=config,
-                model_name=name,
-                base_quant=base_quant,
-                verify=verify,
-            )
-
-            if path:
-                generated.append(path)
-                print(f"  -> {path}")
-            else:
-                print(f"  -> FAILED")
-
-        return generated
-
-    def generate_top_models(
-        self,
-        results: List[Dict],
-        top_n: int = 3,
-        model_name_prefix: str = "Model",
-        base_quant: str = "MXFP4_MOE",
-        verify: bool = False,
-    ) -> List[str]:
-        """Generate hybrid GGUFs for the top-N search results by score."""
-        generated = []
-        for i, entry in enumerate(results[:top_n], 1):
-            config = entry["config"]
-            name = f"{model_name_prefix}-Config{i}"
-
-            print(f"\n{'='*60}")
-            print(f"Generating Configuration {i}/{top_n}")
-            print(f"{'='*60}")
-
-            path = self.generate_hybrid_model(
-                config=config,
-                model_name=name,
-                base_quant=base_quant,
-                verify=verify,
-            )
-
-            if path:
-                generated.append(path)
-                print(f"  -> {path}")
-            else:
-                print(f"  -> FAILED")
-
-        return generated
-
     def _estimate_model_size(self, model_path: str) -> float:
-        size_bytes = os.path.getsize(model_path)
-        return size_bytes / (1024 ** 3)
+        if os.path.isfile(model_path):
+            return os.path.getsize(model_path) / (1024 ** 3)
+        # Directory (safetensors) — sum all .safetensors files
+        if os.path.isdir(model_path):
+            total = sum(
+                os.path.getsize(os.path.join(model_path, f))
+                for f in os.listdir(model_path)
+                if f.endswith(".safetensors")
+            )
+            return total / (1024 ** 3)
+        return 1.0
 
 
 def main():
-    """Main entry point for orchestrator."""
     import argparse
 
     parser = argparse.ArgumentParser(
         description="MagicQuant Orchestrator - Hybrid Quantization Search"
     )
-    parser.add_argument(
-        "source_model",
-        help="Path to source GGUF model (BF16/F16)",
-    )
-    parser.add_argument(
-        "--output-dir", default="./output",
-        help="Output directory for generated models",
-    )
-    parser.add_argument(
-        "--target-quant", default="MXFP4_MOE",
-        help="Target base quantization scheme",
-    )
-    parser.add_argument(
-        "--generations", type=int, default=50,
-        help="Number of evolutionary generations",
-    )
-    parser.add_argument(
-        "--llamacpp-path",
-        help="Path to llama.cpp directory",
-    )
+    parser.add_argument("source_model", help="Path to source model (GGUF, safetensors, or directory)")
+    parser.add_argument("--output-dir", default="./output")
+    parser.add_argument("--target-quant", default="MXFP4_MOE")
+    parser.add_argument("--generations", type=int, default=30)
+    parser.add_argument("--rounds", type=int, default=3, help="Measurement rounds (0 = prediction only)")
+    parser.add_argument("--candidates", type=int, default=4, help="Candidates to measure per round")
+    parser.add_argument("--llamacpp-path", help="Path to llama.cpp directory")
+    parser.add_argument("--adapter", help="Path to LoRA adapter directory")
 
     args = parser.parse_args()
 
@@ -398,25 +597,34 @@ def main():
         source_model_path=args.source_model,
         output_dir=args.output_dir,
         llamacpp_path=args.llamacpp_path,
+        adapter_path=args.adapter,
     )
 
-    best_configs = orchestrator.run_full_search(
-        target_base_quant=args.target_quant,
-        max_generations=args.generations,
-        verbose=True,
-    )
+    if args.rounds > 0:
+        all_configs, tiered = orchestrator.run_measured_search(
+            target_base_quant=args.target_quant,
+            search_generations=args.generations,
+            measurement_rounds=args.rounds,
+            candidates_per_round=args.candidates,
+            verbose=True,
+        )
+    else:
+        all_configs, tiered = orchestrator.run_full_search(
+            target_base_quant=args.target_quant,
+            max_generations=args.generations,
+            verbose=True,
+        )
 
-    # Generate top 3 configurations
+    # Generate final survivors
     print("\n" + "=" * 60)
-    print("Generating Top 3 Configurations...")
+    print("Generating Final Survivors...")
     print("=" * 60)
 
-    orchestrator.generate_top_models(
-        results=best_configs,
-        top_n=3,
-        model_name_prefix="Qwen3-Coder-30B",
-        base_quant=args.target_quant,
-        verify=True,
+    orchestrator.generate_tiered_models(
+        tiered=tiered,
+        model_name_prefix=Path(args.source_model).stem,
+        tiers=["Q4", "Q5", "Q6"],
+        verify=False,
     )
 
 
