@@ -4,29 +4,13 @@ GGUF Writer - Create hybrid quantization GGUF files.
 This module creates new GGUF files with mixed-precision quantization,
 combining different quant schemes for different tensor groups.
 
-Quantization is delegated to ``magicquant.quant.converters`` which is
-the single source of truth for all ggml block-format encoders.
+Accepts both GGUF and safetensors as source formats via the ModelSource
+abstraction in ``magicquant.gguf.source``.
 
-GGUF binary format (version 3):
-  [magic: 4 bytes "GGUF" LE] [version: uint32] [tensor_count: uint64]
-  [metadata_kv_count: uint64] [metadata KV pairs...] [tensor info entries...]
-  [padding to 32-byte alignment] [tensor data (each tensor 32-byte aligned)]
-
-Tensor info entry:
-  [name_len: uint64] [name: bytes] [n_dims: uint32] [dims: uint64 * n_dims]
-  [type: uint32 (ggml_type enum)] [offset: uint64 (into data section)]
-
-The writer uses a two-pass streaming architecture to avoid holding all
-quantized tensor data in memory simultaneously:
-
+The writer uses a two-pass streaming architecture:
   Pass 1 (header): Compute target types, data sizes, and offsets for every
-      tensor without touching actual data. Write the complete GGUF header
-      (magic, version, counts, metadata KV pairs, tensor info entries).
-
-  Pass 2 (data): Stream tensor-by-tensor. For each tensor: read source
-      bytes, decode to f32, quantize via encode_to_ggml_bytes(), write
-      alignment padding + blob directly to the output file, then discard
-      the buffer.
+      tensor without touching actual data. Write the complete GGUF header.
+  Pass 2 (data): Stream tensor-by-tensor via source.read_tensor_f32().
 """
 
 from typing import Dict, List, Any
@@ -37,8 +21,6 @@ import numpy as np
 from magicquant.quant.converters import (
     encode_to_ggml_bytes,
     ggml_tensor_data_size,
-    GGML_BLOCK_SIZE,
-    GGML_TYPE_SIZE,
 )
 
 
@@ -73,10 +55,9 @@ GGML_TYPE = {
     "F64":     28,
     "IQ1_M":   29,
     "BF16":    30,
-    "MXFP4":  100,  # MagicQuant custom: OCP MX FP4 (E2M1 + shared E8M0)
+    "MXFP4":  100,
 }
 
-# Reverse lookup: integer id -> type name
 _GGML_TYPE_NAME = {v: k for k, v in GGML_TYPE.items()}
 
 # GGUF metadata value-type tags
@@ -104,9 +85,9 @@ SCHEME_TO_GGML = {
     "Q8_0":      "Q8_0",
     "Q6_K":      "Q6_K",
     "Q5_K":      "Q5_K",
-    "Q4_K_M":    "Q4_K",   # Q4_K_M maps to ggml Q4_K
+    "Q4_K_M":    "Q4_K",
     "IQ4_NL":    "IQ4_NL",
-    "MXFP4_MOE": "MXFP4",  # OCP MX FP4 (custom type, proper microscaling)
+    "MXFP4_MOE": "MXFP4",
 }
 
 
@@ -123,37 +104,6 @@ def _tensor_n_elements(shape: List[int]) -> int:
     for d in shape:
         n *= d
     return n
-
-
-def _read_source_tensor_bytes(
-    filepath: str, data_section_offset: int,
-    tensor_offset: int, byte_length: int,
-) -> bytes:
-    with open(filepath, "rb") as f:
-        f.seek(data_section_offset + tensor_offset)
-        return f.read(byte_length)
-
-
-# ---------------------------------------------------------------------------
-# Source tensor decoding (float types only)
-# ---------------------------------------------------------------------------
-
-def _decode_tensor_to_f32(buf: bytes, source_ggml_type: int, n_elements: int):
-    """
-    Decode source tensor bytes into float32 numpy array.
-
-    Returns None when the source is already quantised (cannot losslessly
-    decode without full ggml dequant kernels).
-    """
-    type_name = _GGML_TYPE_NAME.get(source_ggml_type, "")
-    if type_name == "F32":
-        return np.frombuffer(buf, dtype=np.float32).copy()
-    if type_name == "F16":
-        return np.frombuffer(buf, dtype=np.float16).astype(np.float32)
-    if type_name == "BF16":
-        raw = np.frombuffer(buf, dtype=np.uint16)
-        return (raw.astype(np.uint32) << 16).view(np.float32)
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -222,27 +172,6 @@ def _write_metadata_value(f, value: Any):
         _write_string(f, str(value))
 
 
-def _skip_value(f, vtype: int):
-    """Skip a GGUF metadata value of the given type."""
-    if vtype in (_GGUF_TYPE_UINT8, _GGUF_TYPE_INT8, _GGUF_TYPE_BOOL):
-        f.read(1)
-    elif vtype in (_GGUF_TYPE_UINT16, _GGUF_TYPE_INT16):
-        f.read(2)
-    elif vtype in (_GGUF_TYPE_UINT32, _GGUF_TYPE_INT32, _GGUF_TYPE_FLOAT32):
-        f.read(4)
-    elif vtype in (_GGUF_TYPE_UINT64, _GGUF_TYPE_INT64, _GGUF_TYPE_FLOAT64):
-        f.read(8)
-    elif vtype == _GGUF_TYPE_STRING:
-        f.read(struct.unpack("<Q", f.read(8))[0])
-    elif vtype == _GGUF_TYPE_ARRAY:
-        elem_type = struct.unpack("<I", f.read(4))[0]
-        length = struct.unpack("<Q", f.read(8))[0]
-        for _ in range(length):
-            _skip_value(f, elem_type)
-    else:
-        raise ValueError(f"Unknown GGUF type tag {vtype} while skipping value")
-
-
 # ---------------------------------------------------------------------------
 # GGUFWriter
 # ---------------------------------------------------------------------------
@@ -251,8 +180,8 @@ class GGUFWriter:
     """
     Write GGUF files with custom quantization configurations.
 
-    Quantization of individual tensors is delegated to
-    ``magicquant.quant.converters.encode_to_ggml_bytes()``.
+    Accepts any ModelSource (GGUF or safetensors) as input.
+    Quantization is delegated to magicquant.quant.converters.
     """
 
     def __init__(self, output_path: str):
@@ -265,14 +194,22 @@ class GGUFWriter:
         quant_config: Dict,
         verbose: bool = True,
     ) -> str:
-        from magicquant.gguf.reader import GGUFReader
+        """
+        Create a hybrid GGUF from any supported source format.
+
+        Args:
+            base_model_path: Path to source model — .gguf file, .safetensors
+                file, or directory containing safetensors + config.json
+            quant_config: {"base": "MXFP4_MOE", "groups": {"E": "BF16", ...}}
+            verbose: Print progress
+        """
+        from magicquant.gguf.source import open_model_source
         from magicquant.gguf.tensor_groups import TensorGroupClassifier
 
         if verbose:
-            print(f"Loading base model: {base_model_path}")
+            print(f"Loading source: {base_model_path}")
 
-        reader = GGUFReader(base_model_path)
-        reader.open()
+        source = open_model_source(base_model_path)
 
         try:
             base_quant = quant_config.get("base", "Q4_K_M")
@@ -284,12 +221,8 @@ class GGUFWriter:
                     print(f"  Group {grp} -> {sch}")
 
             classifier = TensorGroupClassifier()
-            source_metadata = reader.get_metadata()
-            all_tensors_info = reader.get_all_tensors_info()
-
-            source_data_offset = self._find_source_data_offset(
-                base_model_path, len(source_metadata), len(all_tensors_info)
-            )
+            source_metadata = source.get_metadata()
+            all_tensors_info = source.get_all_tensors_info()
 
             # ==============================================================
             # Pass 1: Compute target types and offsets (no data reading)
@@ -301,7 +234,6 @@ class GGUFWriter:
                 name = tinfo["name"]
                 shape = tinfo["shape"]
                 n_dims = tinfo["n_dims"]
-                source_type = tinfo["data_type"]
 
                 group = classifier.classify_tensor(name)
                 scheme = group_schemes.get(group, base_quant)
@@ -310,17 +242,13 @@ class GGUFWriter:
 
                 n_elems = _tensor_n_elements(shape)
 
-                source_type_name = _GGML_TYPE_NAME.get(source_type, "F16")
-
-                # Check if the source can be decoded to f32 for re-quantization.
-                # If not, we will pass through raw bytes, so target = source.
+                source_type_name = source.get_source_type_name(name)
                 can_decode = source_type_name in ("F32", "F16", "BF16")
                 if not can_decode:
                     target_ggml_name = source_type_name
-                    target_ggml_id = source_type
+                    target_ggml_id = GGML_TYPE.get(source_type_name, 0)
 
                 expected_size = ggml_tensor_data_size(target_ggml_name, n_elems)
-
                 aligned_offset = _align(data_offset)
 
                 tensor_entries.append({
@@ -329,15 +257,12 @@ class GGUFWriter:
                     "shape": shape,
                     "ggml_type": target_ggml_id,
                     "offset": aligned_offset,
-                    # Fields used during Pass 2 (not written to header):
                     "_target_ggml_name": target_ggml_name,
-                    "_source_type": source_type,
-                    "_source_type_name": source_type_name,
-                    "_source_offset": tinfo["offset"],
                     "_n_elems": n_elems,
                     "_expected_size": expected_size,
                     "_can_decode": can_decode,
                     "_group": group,
+                    "_source_type_name": source_type_name,
                 })
 
                 data_offset = aligned_offset + expected_size
@@ -354,7 +279,7 @@ class GGUFWriter:
             filtered_meta = {k: v for k, v in self.metadata.items() if v is not None}
 
             # ==============================================================
-            # Write header (magic, version, counts, metadata, tensor infos)
+            # Write header
             # ==============================================================
             if verbose:
                 print(f"\nWriting output: {self.output_path}")
@@ -385,41 +310,36 @@ class GGUFWriter:
                     f.write(b"\x00" * (aligned_header - header_end))
 
                 # ==========================================================
-                # Pass 2: Stream tensor data directly to file
+                # Pass 2: Stream tensor data
                 # ==========================================================
                 data_section_start = f.tell()
 
                 for idx, entry in enumerate(tensor_entries):
                     name = entry["name"]
-                    n_elems = entry["_n_elems"]
-                    source_type = entry["_source_type"]
-                    source_type_name = entry["_source_type_name"]
                     target_ggml_name = entry["_target_ggml_name"]
                     expected_size = entry["_expected_size"]
                     can_decode = entry["_can_decode"]
                     aligned_offset = entry["offset"]
 
-                    # Write alignment padding to reach this tensor's offset
+                    # Alignment padding
                     current_pos = f.tell() - data_section_start
                     padding = aligned_offset - current_pos
                     if padding > 0:
                         f.write(b"\x00" * padding)
 
-                    # Read source bytes
-                    source_byte_len = ggml_tensor_data_size(source_type_name, n_elems)
-                    raw_bytes = _read_source_tensor_bytes(
-                        base_model_path, source_data_offset,
-                        entry["_source_offset"], source_byte_len,
-                    )
-
-                    # Decode and re-quantize, or pass through
+                    # Read and quantize
                     if can_decode:
-                        f32 = _decode_tensor_to_f32(raw_bytes, source_type, n_elems)
-                        blob = encode_to_ggml_bytes(f32, target_ggml_name)
+                        f32 = source.read_tensor_f32(name)
+                        if f32 is not None:
+                            blob = encode_to_ggml_bytes(f32, target_ggml_name)
+                        else:
+                            blob = b"\x00" * expected_size
                     else:
-                        blob = raw_bytes
+                        # Quantised source — pass through raw bytes
+                        f32 = source.read_tensor_f32(name)
+                        blob = f32.view(np.uint8).tobytes() if f32 is not None else b"\x00" * expected_size
 
-                    # Pad / trim to exact expected size
+                    # Pad/trim
                     if len(blob) < expected_size:
                         blob = blob + b"\x00" * (expected_size - len(blob))
                     elif len(blob) > expected_size:
@@ -429,7 +349,7 @@ class GGUFWriter:
 
                     if verbose:
                         print(f"  [{idx+1}/{len(tensor_entries)}] {name}: "
-                              f"{source_type_name} -> {target_ggml_name} "
+                              f"{entry['_source_type_name']} -> {target_ggml_name} "
                               f"(group={entry['_group']})")
 
             output_size_mb = os.path.getsize(self.output_path) / (1024 * 1024)
@@ -439,23 +359,7 @@ class GGUFWriter:
             return self.output_path
 
         finally:
-            reader.close()
-
-    @staticmethod
-    def _find_source_data_offset(filepath: str, n_metadata: int, n_tensors: int) -> int:
-        with open(filepath, "rb") as f:
-            f.read(4 + 4 + 8 + 8)
-            for _ in range(n_metadata):
-                key_len = struct.unpack("<Q", f.read(8))[0]
-                f.read(key_len)
-                vtype = struct.unpack("<I", f.read(4))[0]
-                _skip_value(f, vtype)
-            for _ in range(n_tensors):
-                name_len = struct.unpack("<Q", f.read(8))[0]
-                f.read(name_len)
-                n_dims = struct.unpack("<I", f.read(4))[0]
-                f.read(n_dims * 8 + 4 + 8)
-            return _align(f.tell())
+            source.close()
 
     def set_metadata(self, key: str, value: Any):
         self.metadata[key] = value
@@ -478,7 +382,8 @@ if __name__ == "__main__":
     import json as _json
 
     if len(sys.argv) < 4:
-        print("Usage: python gguf_writer.py <output.gguf> <base_model.gguf> <config.json>")
+        print("Usage: python -m magicquant.gguf.writer <output.gguf> <source> <config.json>")
+        print("  source: .gguf file, .safetensors file, or HF model directory")
         sys.exit(1)
 
     output_path = sys.argv[1]
