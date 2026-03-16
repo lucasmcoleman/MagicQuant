@@ -7,15 +7,20 @@ combining different quant schemes for different tensor groups.
 Accepts both GGUF and safetensors as source formats via the ModelSource
 abstraction in ``magicquant.gguf.source``.
 
-The writer uses a two-pass streaming architecture:
+Architecture:
   Pass 1 (header): Compute target types, data sizes, and offsets for every
       tensor without touching actual data. Write the complete GGUF header.
-  Pass 2 (data): Stream tensor-by-tensor via source.read_tensor_f32().
+  Pass 2 (data): A background thread reads + encodes tensors while the main
+      thread writes blobs to disk. This overlaps I/O with computation for
+      ~2x throughput on large models.
 """
 
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 import struct
 import os
+import time
+import threading
+import queue
 import numpy as np
 
 from magicquant.quant.converters import (
@@ -173,6 +178,47 @@ def _write_metadata_value(f, value: Any):
 
 
 # ---------------------------------------------------------------------------
+# Pipeline worker (runs in background thread)
+# ---------------------------------------------------------------------------
+
+def _read_encode_worker(source, entries, result_queue):
+    """
+    Background thread: reads each tensor from source, encodes to ggml bytes,
+    and pushes (entry, blob) onto the result queue.
+
+    The bounded queue (maxsize=2) ensures at most 2 encoded tensors are
+    buffered, preventing memory blowup on large models.
+    """
+    try:
+        for entry in entries:
+            name = entry["name"]
+            can_decode = entry["_can_decode"]
+            target = entry["_target_ggml_name"]
+            expected = entry["_expected_size"]
+
+            f32 = source.read_tensor_f32(name)
+
+            if can_decode and f32 is not None:
+                blob = encode_to_ggml_bytes(f32, target)
+            elif f32 is not None:
+                blob = f32.view(np.uint8).tobytes()
+            else:
+                blob = b"\x00" * expected
+
+            # Pad/trim to exact size
+            if len(blob) < expected:
+                blob = blob + b"\x00" * (expected - len(blob))
+            elif len(blob) > expected:
+                blob = blob[:expected]
+
+            result_queue.put((entry, blob))
+    except Exception as exc:
+        result_queue.put(exc)
+    finally:
+        result_queue.put(None)  # sentinel
+
+
+# ---------------------------------------------------------------------------
 # GGUFWriter
 # ---------------------------------------------------------------------------
 
@@ -181,7 +227,8 @@ class GGUFWriter:
     Write GGUF files with custom quantization configurations.
 
     Accepts any ModelSource (GGUF or safetensors) as input.
-    Quantization is delegated to magicquant.quant.converters.
+    Uses a pipelined architecture: a background thread reads and encodes
+    tensors while the main thread writes to disk.
     """
 
     def __init__(self, output_path: str):
@@ -204,7 +251,6 @@ class GGUFWriter:
             quant_config: {"base": "MXFP4_MOE", "groups": {"E": "BF16", ...}}
             verbose: Print progress
             adapter_path: Optional path to a LoRA adapter directory.
-                When provided, adapter weights are merged on-the-fly.
         """
         from magicquant.gguf.source import open_model_source
         from magicquant.gguf.tensor_groups import TensorGroupClassifier
@@ -288,8 +334,11 @@ class GGUFWriter:
             # ==============================================================
             if verbose:
                 print(f"\nWriting output: {self.output_path}")
+                print(f"Tensors: {len(tensor_entries)}")
 
             os.makedirs(os.path.dirname(os.path.abspath(self.output_path)), exist_ok=True)
+
+            t_start = time.monotonic()
 
             with open(self.output_path, "wb") as f:
                 f.write(struct.pack("<I", 0x46554747))  # magic
@@ -315,51 +364,62 @@ class GGUFWriter:
                     f.write(b"\x00" * (aligned_header - header_end))
 
                 # ==========================================================
-                # Pass 2: Stream tensor data
+                # Pass 2: Pipelined read+encode -> write
                 # ==========================================================
                 data_section_start = f.tell()
+                total = len(tensor_entries)
+                bytes_written = 0
 
-                for idx, entry in enumerate(tensor_entries):
-                    name = entry["name"]
-                    target_ggml_name = entry["_target_ggml_name"]
-                    expected_size = entry["_expected_size"]
-                    can_decode = entry["_can_decode"]
+                # Start background read+encode thread
+                result_q: queue.Queue = queue.Queue(maxsize=2)
+                worker = threading.Thread(
+                    target=_read_encode_worker,
+                    args=(source, tensor_entries, result_q),
+                    daemon=True,
+                )
+                worker.start()
+
+                idx = 0
+                while True:
+                    item = result_q.get()
+
+                    # Check for sentinel (done) or exception
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+
+                    entry, blob = item
                     aligned_offset = entry["offset"]
 
-                    # Alignment padding
+                    # Write alignment padding
                     current_pos = f.tell() - data_section_start
                     padding = aligned_offset - current_pos
                     if padding > 0:
                         f.write(b"\x00" * padding)
 
-                    # Read and quantize
-                    if can_decode:
-                        f32 = source.read_tensor_f32(name)
-                        if f32 is not None:
-                            blob = encode_to_ggml_bytes(f32, target_ggml_name)
-                        else:
-                            blob = b"\x00" * expected_size
-                    else:
-                        # Quantised source — pass through raw bytes
-                        f32 = source.read_tensor_f32(name)
-                        blob = f32.view(np.uint8).tobytes() if f32 is not None else b"\x00" * expected_size
-
-                    # Pad/trim
-                    if len(blob) < expected_size:
-                        blob = blob + b"\x00" * (expected_size - len(blob))
-                    elif len(blob) > expected_size:
-                        blob = blob[:expected_size]
-
                     f.write(blob)
+                    bytes_written += len(blob)
+                    idx += 1
 
                     if verbose:
-                        print(f"  [{idx+1}/{len(tensor_entries)}] {name}: "
-                              f"{entry['_source_type_name']} -> {target_ggml_name} "
-                              f"(group={entry['_group']})")
+                        elapsed = time.monotonic() - t_start
+                        speed = bytes_written / (1024**2) / max(elapsed, 0.001)
+                        eta = (elapsed / idx) * (total - idx) if idx > 0 else 0
+                        print(
+                            f"  [{idx}/{total}] {entry['name']}: "
+                            f"{entry['_source_type_name']} -> {entry['_target_ggml_name']} "
+                            f"({entry['_group']})  "
+                            f"{speed:.0f} MB/s  ETA {eta:.0f}s",
+                        )
 
+                worker.join(timeout=5)
+
+            elapsed = time.monotonic() - t_start
             output_size_mb = os.path.getsize(self.output_path) / (1024 * 1024)
             if verbose:
-                print(f"Done. Output size: {output_size_mb:.1f} MB")
+                print(f"Done. {output_size_mb:.1f} MB in {elapsed:.1f}s "
+                      f"({output_size_mb / max(elapsed, 0.001):.0f} MB/s)")
 
             return self.output_path
 
