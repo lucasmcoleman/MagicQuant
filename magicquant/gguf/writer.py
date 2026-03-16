@@ -345,6 +345,27 @@ class GGUFWriter:
 
                 data_offset = aligned_offset + expected_size
 
+            # ── Validate: detect pre-quantized sources that can't be re-quantized ──
+            bad_tensors = []
+            for entry in tensor_entries:
+                if not entry["_can_decode"]:
+                    source_type = entry["_source_type_name"]
+                    # Check if the user wanted a different type than the source
+                    group = entry["_group"]
+                    scheme = group_schemes.get(group, base_quant)
+                    desired_ggml_name = scheme_map.get(scheme, "Q4_0")
+                    if desired_ggml_name != source_type:
+                        bad_tensors.append((entry["name"], source_type, desired_ggml_name))
+
+            if bad_tensors:
+                count = len(bad_tensors)
+                source_type = bad_tensors[0][1]
+                raise ValueError(
+                    f"Cannot re-quantize {count} tensors: source is already quantized "
+                    f"({source_type}). MagicQuant requires BF16, F16, or F32 source weights. "
+                    f"Use a high-precision source model."
+                )
+
             # ── Prepare metadata ──
             self.metadata = {}
             for k, v in source_metadata.items():
@@ -353,6 +374,10 @@ class GGUFWriter:
             self.metadata["magicquant.base_quant"] = base_quant
             import json
             self.metadata["magicquant.group_schemes"] = json.dumps(group_schemes)
+
+            # Set general.file_type for llama.cpp compatibility
+            # Use the ggml file type that best represents the hybrid config
+            self.metadata["general.file_type"] = 1  # LLAMA_FTYPE_MOSTLY_F16 as safe default
 
             filtered_meta = {k: v for k, v in self.metadata.items() if v is not None}
 

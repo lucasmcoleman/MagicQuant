@@ -48,7 +48,8 @@ class MagicQuantOrchestrator:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.llama_tools = LlamaCppTools(llamacpp_path)
+        self._llamacpp_path = llamacpp_path
+        self._llama_tools: Optional[LlamaCppTools] = None
 
         self.baseline_ppl: Optional[float] = None
         self.sensitivity_weights: Optional[Dict[str, float]] = None
@@ -56,6 +57,17 @@ class MagicQuantOrchestrator:
 
         # Track all measured configs across rounds
         self._measured: Dict[str, Dict] = {}  # config_key -> {config, ppl, loss, path}
+
+    @property
+    def llama_tools(self) -> Optional[LlamaCppTools]:
+        """Lazily initialize LlamaCppTools on first access."""
+        if self._llama_tools is None:
+            try:
+                self._llama_tools = LlamaCppTools(self._llamacpp_path)
+            except Exception as exc:
+                print(f"WARNING: llama.cpp not available: {exc}")
+                return None
+        return self._llama_tools
 
     # ------------------------------------------------------------------
     # Full measured search (the real MagicQuant pipeline)
@@ -380,10 +392,16 @@ class MagicQuantOrchestrator:
             print()
 
         # Baseline PPL
-        self.baseline_ppl = self.llama_tools.calculate_perplexity(
-            self.source_model_path, verbose=verbose
-        )
-        if self.baseline_ppl is None:
+        _llama = self.llama_tools
+        if _llama is not None:
+            self.baseline_ppl = _llama.calculate_perplexity(
+                self.source_model_path, verbose=verbose
+            )
+            if self.baseline_ppl is None:
+                self.baseline_ppl = 5.0
+        else:
+            print("WARNING: llama.cpp unavailable. Using default baseline PPL=5.0")
+            print("WARNING: Results are prediction-only — no real perplexity measurements.")
             self.baseline_ppl = 5.0
 
         # Sensitivity probing
@@ -392,7 +410,7 @@ class MagicQuantOrchestrator:
         prober = SensitivityProber(
             base_model_path=self.source_model_path,
             baseline_perplexity=self.baseline_ppl,
-            perplexity_calculator=self.llama_tools,
+            perplexity_calculator=_llama,
             output_dir=str(self.output_dir / "_probes"),
         )
         groups = ["E", "H", "Q", "K", "O", "U", "D"]

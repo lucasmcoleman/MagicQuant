@@ -374,6 +374,23 @@ def _optimize_symmetric_scale(
     if min_q is None:
         min_q = -max_q
     n_cand = len(_SCALE_CANDIDATES)
+    n_blocks, n_sub = naive_scales.shape
+    sub_size = sub_blocks.shape[2]
+
+    # Estimate memory for the full vectorized path (bytes)
+    mem_est = n_blocks * n_sub * sub_size * n_cand * 4
+
+    if mem_est > 500_000_000:
+        # Chunked path: process 1024 blocks at a time to avoid OOM
+        chunk_size = 1024
+        result = np.empty_like(naive_scales)
+        for start in range(0, n_blocks, chunk_size):
+            end = min(start + chunk_size, n_blocks)
+            result[start:end] = _optimize_symmetric_scale(
+                sub_blocks[start:end], naive_scales[start:end], max_q, min_q
+            )
+        return result
+
     # candidate_scales: (n_blocks, n_sub, n_cand)
     candidates = naive_scales[:, :, None] * _SCALE_CANDIDATES[None, None, :]
     # Avoid division by zero
@@ -418,6 +435,24 @@ def _optimize_asymmetric_scale(
         Optimized scales: (n_blocks, n_sub)
     """
     n_cand = len(_SCALE_CANDIDATES)
+    n_blocks, n_sub = naive_scales.shape
+    sub_size = sub_blocks.shape[2]
+
+    # Estimate memory for the full vectorized path (bytes)
+    mem_est = n_blocks * n_sub * sub_size * n_cand * 4
+
+    if mem_est > 500_000_000:
+        # Chunked path: process 1024 blocks at a time to avoid OOM
+        chunk_size = 1024
+        result = np.empty_like(naive_scales)
+        for start in range(0, n_blocks, chunk_size):
+            end = min(start + chunk_size, n_blocks)
+            result[start:end] = _optimize_asymmetric_scale(
+                sub_blocks[start:end], naive_scales[start:end],
+                offsets[start:end], max_q
+            )
+        return result
+
     candidates = naive_scales[:, :, None] * _SCALE_CANDIDATES[None, None, :]
     inv_cand = np.where(candidates > 0, 1.0 / candidates, 0.0)
     # shifted = val + offset

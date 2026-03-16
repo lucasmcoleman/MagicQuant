@@ -70,38 +70,7 @@ class GGUFSource(ModelSource):
         self._path = filepath
         self._reader = GGUFReader(filepath)
         self._reader.open()
-        self._data_offset = self._find_data_offset()
-
-    def _find_data_offset(self) -> int:
-        meta = self._reader.get_metadata()
-        tensors = self._reader.get_all_tensors_info()
-        # Walk the header to find the true data offset
-        from magicquant.quant.converters import GGML_BLOCK_SIZE, GGML_TYPE_SIZE
-        with open(self._path, "rb") as f:
-            f.read(4 + 4 + 8 + 8)
-            for _ in range(len(meta)):
-                kl = struct.unpack("<Q", f.read(8))[0]; f.read(kl)
-                vt = struct.unpack("<I", f.read(4))[0]
-                self._skip_value(f, vt)
-            for _ in range(len(tensors)):
-                nl = struct.unpack("<Q", f.read(8))[0]; f.read(nl)
-                nd = struct.unpack("<I", f.read(4))[0]
-                f.read(nd * 8 + 4 + 8)
-            return ((f.tell() + 31) // 32) * 32
-
-    @staticmethod
-    def _skip_value(f, vtype):
-        if vtype in (0, 1, 7): f.read(1)
-        elif vtype in (2, 3): f.read(2)
-        elif vtype in (4, 5, 6): f.read(4)
-        elif vtype in (10, 11, 12): f.read(8)
-        elif vtype == 8:
-            f.read(struct.unpack("<Q", f.read(8))[0])
-        elif vtype == 9:
-            et = struct.unpack("<I", f.read(4))[0]
-            ln = struct.unpack("<Q", f.read(8))[0]
-            for _ in range(ln):
-                GGUFSource._skip_value(f, et)
+        self._data_offset = self._reader.data_offset
 
     def get_metadata(self):
         return self._reader.get_metadata()
@@ -402,7 +371,17 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
 
         # Chat template
         chat_template = tok_cfg.get("chat_template")
-        if chat_template and isinstance(chat_template, str):
+        if isinstance(chat_template, list):
+            # Find the "default" template, or use the first one
+            for entry in chat_template:
+                if isinstance(entry, dict):
+                    if entry.get("name") == "default":
+                        chat_template = entry.get("template", "")
+                        break
+            else:
+                if chat_template and isinstance(chat_template[0], dict):
+                    chat_template = chat_template[0].get("template", "")
+        if isinstance(chat_template, str) and chat_template:
             meta["tokenizer.chat_template"] = chat_template
 
     return meta
