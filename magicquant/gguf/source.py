@@ -202,8 +202,19 @@ _HF_TO_GGUF_COMPILED = [(re.compile(p), r) for p, r in _HF_TO_GGUF_PATTERNS]
 
 def _hf_name_to_gguf(hf_name: str) -> str:
     """Convert a HuggingFace tensor name to GGUF convention."""
+    # Handle top-level output/lm_head directly
+    if hf_name in ("output.weight", "lm_head.weight"):
+        return "output.weight"
+
+    # Strip common multimodal prefixes so patterns match the LLM core
+    stripped = hf_name
+    for prefix in ("model.language_model.", "language_model."):
+        if stripped.startswith(prefix):
+            stripped = "model." + stripped[len(prefix):]
+            break
+
     for pattern, replacement in _HF_TO_GGUF_COMPILED:
-        m = pattern.match(hf_name)
+        m = pattern.match(stripped)
         if m:
             if callable(replacement):
                 return replacement(m)
@@ -238,20 +249,46 @@ _ST_DTYPE_NUMPY = {
 
 def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Build GGUF-compatible metadata from a HuggingFace config.json."""
-    model_type = config.get("model_type", "llama")
+    # For multimodal/composite models, the LLM config is nested
+    # under text_config, language_config, or llm_config.
+    effective = config
+    for sub_key in ("text_config", "language_config", "llm_config"):
+        if sub_key in config and isinstance(config[sub_key], dict):
+            effective = {**config, **config[sub_key]}
+            break
 
-    # Map HF model_type to GGUF architecture name
+    model_type = effective.get("model_type", "llama")
+
+    # Synced from llama.cpp convert_hf_to_gguf.py (2026-03)
     arch_map = {
-        "llama": "llama", "qwen2": "qwen2", "qwen2_moe": "qwen2moe",
-        "mistral": "llama", "mixtral": "llama", "phi3": "phi3",
-        "deepseek_v2": "deepseek2", "gemma": "gemma", "gemma2": "gemma2",
-        "starcoder2": "starcoder2", "cohere": "command-r",
+        "arctic": "arctic", "baichuan": "baichuan", "bloom": "bloom",
+        "chatglm": "chatglm", "cohere": "command-r", "cohere2": "cohere2",
+        "dbrx": "dbrx", "deepseek": "deepseek", "deepseek_v2": "deepseek2",
+        "deepseek_v3": "deepseek2", "exaone": "exaone",
+        "falcon": "falcon", "falcon_h1": "falcon-h1",
+        "falcon_mamba": "mamba", "gemma": "gemma", "gemma2": "gemma2",
+        "gemma3": "gemma3", "glm4": "glm4", "gpt2": "gpt2",
+        "gpt_neox": "gptneox", "granite": "granite",
+        "granitemoe": "granitemoe", "grok": "grok",
+        "internlm2": "internlm2", "internlm3": "llama",
+        "jamba": "jamba", "llama": "llama", "llama4": "llama4",
+        "mamba": "mamba", "mamba2": "mamba2", "minicpm": "minicpm",
+        "minicpm3": "minicpm3", "mistral": "llama", "mistral3": "mistral3",
+        "mixtral": "llama", "nemotron": "nemotron",
+        "olmo": "olmo", "olmo2": "olmo2", "olmoe": "olmoe",
+        "phi": "phi2", "phi3": "phi3", "phimoe": "phimoe",
+        "qwen": "qwen", "qwen2": "qwen2", "qwen2_moe": "qwen2moe",
+        "qwen2_vl": "qwen2vl", "qwen3": "qwen3", "qwen3_5": "qwen35",
+        "qwen3_5_text": "qwen35", "qwen3_5_moe": "qwen35moe",
+        "qwen3_moe": "qwen3moe", "rwkv6": "rwkv6", "rwkv7": "rwkv7",
+        "stablelm": "stablelm", "starcoder": "starcoder",
+        "starcoder2": "starcoder2",
     }
     arch = arch_map.get(model_type, "llama")
 
     meta: Dict[str, Any] = {}
     meta["general.architecture"] = arch
-    meta["general.name"] = config.get("_name_or_path", model_type)
+    meta["general.name"] = effective.get("_name_or_path", config.get("_name_or_path", model_type))
 
     # Map config.json fields to GGUF metadata keys
     field_map = {
@@ -267,8 +304,8 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     for hf_key, gguf_key in field_map.items():
-        if hf_key in config:
-            val = config[hf_key]
+        if hf_key in effective:
+            val = effective[hf_key]
             # GGUF expects integers for counts, floats for epsilon/theta
             if isinstance(val, float) and val == int(val) and "epsilon" not in hf_key and "theta" not in hf_key:
                 val = int(val)
@@ -410,9 +447,11 @@ class SafetensorsSource(ModelSource):
         if np_dtype is None:
             return None
 
-        with open(info["filepath"], "rb") as f:
-            f.seek(info["data_start"] + info["byte_offset"])
-            buf = f.read(info["byte_length"])
+        # Use memory-mapped I/O for zero-copy reads
+        mmap = self._get_mmap(info["filepath"])
+        start = info["data_start"] + info["byte_offset"]
+        end = start + info["byte_length"]
+        buf = mmap[start:end]
 
         if dtype == "F32":
             return np.frombuffer(buf, dtype=np.float32).copy()
@@ -422,11 +461,27 @@ class SafetensorsSource(ModelSource):
             raw = np.frombuffer(buf, dtype=np.uint16)
             return (raw.astype(np.uint32) << 16).view(np.float32)
         else:
-            # Integer types — cast to float32
             return np.frombuffer(buf, dtype=np_dtype).astype(np.float32)
 
+    def _get_mmap(self, filepath: str):
+        """Get or create a memory-mapped view of a safetensors file."""
+        if not hasattr(self, "_mmaps"):
+            self._mmaps: Dict[str, Any] = {}
+            self._mmap_files: Dict[str, Any] = {}
+        if filepath not in self._mmaps:
+            import mmap
+            f = open(filepath, "rb")
+            self._mmap_files[filepath] = f
+            self._mmaps[filepath] = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        return self._mmaps[filepath]
+
     def close(self):
-        pass
+        for mm in getattr(self, "_mmaps", {}).values():
+            mm.close()
+        for f in getattr(self, "_mmap_files", {}).values():
+            f.close()
+        self._mmaps = {}
+        self._mmap_files = {}
 
 
 # =====================================================================

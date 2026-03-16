@@ -11,6 +11,9 @@ Groups:
 - D: FFN Down (ffn_down.weight)
 - X: MoE Experts (ffn_*_expert.*)
 - R: MoE Router (router.*, gate.*)
+- S: SSM / Linear Attention (linear_attn.*, mamba.*)
+- N: Normalization layers (attn_norm, ffn_norm, etc.) — tiny, keep at source precision
+- V: Vision encoder (model.visual.*) — separate modality
 """
 
 from typing import Dict, List, Tuple
@@ -20,23 +23,28 @@ import re
 class TensorGroupClassifier:
     """
     Classifies GGUF tensors into functional groups based on their names.
-    
-    This is crucial for MagicQuant because different tensor groups have 
+
+    This is crucial for MagicQuant because different tensor groups have
     different sensitivity levels to quantization noise. By grouping them,
     we can apply hybrid quantization strategies effectively.
     """
-    
-    # Group definitions with regex patterns
+
+    # Group definitions with regex patterns.
+    # Order matters: first match wins. More specific patterns come first.
     GROUP_PATTERNS = {
-        'E': ['token_embd.weight'],
-        'H': ['output.weight', 'lm_head.weight'],
-        'Q': ['attn_q.weight'],
-        'K': ['attn_k.weight', 'attn_v.weight'],
-        'O': ['attn_output.weight'],
-        'U': ['ffn_up.weight', 'ffn_gate.weight', 'ffn_up', 'ffn_gate'],
-        'D': ['ffn_down.weight'],
-        'X': ['ffn.*expert.*'],  # MoE experts
-        'R': ['router.*', 'gate.*'],  # MoE router
+        'V': [r'model\.visual\.', r'vision_model\.', r'visual\.'],
+        'N': [r'_norm\.weight$', r'layernorm', r'_norm\.bias$',
+              r'q_norm\.weight$', r'k_norm\.weight$'],
+        'E': [r'token_embd\.weight'],
+        'H': [r'output\.weight', r'lm_head\.weight', r'mtp\.'],
+        'X': [r'ffn.*expert'],
+        'R': [r'ffn_gate_inp', r'router'],
+        'Q': [r'attn_q\.weight', r'attn_qkv\.weight'],
+        'K': [r'attn_k\.weight', r'attn_v\.weight'],
+        'O': [r'attn_output\.weight'],
+        'S': [r'linear_attn\.', r'mamba\.', r'ssm\.'],
+        'U': [r'ffn_up', r'ffn_gate'],
+        'D': [r'ffn_down'],
     }
     
     def __init__(self):
@@ -66,16 +74,8 @@ class TensorGroupClassifier:
         return 'UNKNOWN'
     
     def classify_tensors(self, tensors: List[str]) -> Dict[str, List[str]]:
-        """
-        Classify multiple tensors into groups.
-        
-        Args:
-            tensors: List of tensor names
-            
-        Returns:
-            Dictionary mapping group identifiers to lists of tensor names
-        """
-        grouped = {group: [] for group in self.GROUP_PATTERNS.keys()}
+        """Classify multiple tensors into groups."""
+        grouped = {group: [] for group in self.GROUP_PATTERNS}
         grouped['UNKNOWN'] = []
         
         for tensor_name in tensors:
