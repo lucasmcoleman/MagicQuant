@@ -63,7 +63,7 @@ GGML_TYPE = {
     "F64":     28,
     "IQ1_M":   29,
     "BF16":    30,
-    "MXFP4":  100,
+    "MXFP4":   39,  # GGML_TYPE_MXFP4 (native llama.cpp support)
 }
 
 _GGML_TYPE_NAME = {v: k for k, v in GGML_TYPE.items()}
@@ -97,7 +97,7 @@ SCHEME_TO_GGML = {
     "Q5_K":      "Q5_K",
     "Q4_K_M":    "Q4_K",
     "IQ4_NL":    "IQ4_NL",
-    "MXFP4_MOE": "Q4_0",  # compatible default; native_mxfp4 overrides to "MXFP4"
+    "MXFP4_MOE": "MXFP4",  # native llama.cpp support (ggml_type 39)
 }
 
 
@@ -254,7 +254,6 @@ class GGUFWriter:
         quant_config: Dict,
         verbose: bool = True,
         adapter_path: str = None,
-        native_mxfp4: bool = False,
     ) -> str:
         """
         Create a hybrid GGUF from any supported source format.
@@ -265,27 +264,16 @@ class GGUFWriter:
             quant_config: {"base": "MXFP4_MOE", "groups": {"E": "BF16", ...}}
             verbose: Print progress
             adapter_path: Optional path to a LoRA adapter directory.
-            native_mxfp4: If True, use custom MXFP4 type (ID 100) for
-                MXFP4_MOE tensors. Requires a compatible runtime.
-                If False (default), MXFP4_MOE maps to Q4_0 for
-                standard llama.cpp compatibility.
         """
         from magicquant.gguf.source import open_model_source
         from magicquant.gguf.tensor_groups import TensorGroupClassifier
 
-        # Build the scheme-to-ggml mapping for this run
-        scheme_map = dict(SCHEME_TO_GGML)
-        if native_mxfp4:
-            scheme_map["MXFP4_MOE"] = "MXFP4"
+        scheme_map = SCHEME_TO_GGML
 
         if verbose:
             print(f"Loading source: {base_model_path}")
             if adapter_path:
                 print(f"LoRA adapter: {adapter_path}")
-            if native_mxfp4:
-                print("MXFP4 mode: native (type 100, requires compatible runtime)")
-            else:
-                print("MXFP4 mode: compatible (encoded as Q4_0 for llama.cpp)")
 
         source = open_model_source(base_model_path, adapter_path=adapter_path)
 
@@ -376,8 +364,11 @@ class GGUFWriter:
             self.metadata["magicquant.group_schemes"] = json.dumps(group_schemes)
 
             # Set general.file_type for llama.cpp compatibility
-            # Use the ggml file type that best represents the hybrid config
-            self.metadata["general.file_type"] = 1  # LLAMA_FTYPE_MOSTLY_F16 as safe default
+            # 25 = LLAMA_FTYPE_MOSTLY_MXFP4 if MXFP4 is the base scheme, else 1 (MOSTLY_F16)
+            if base_quant == "MXFP4_MOE":
+                self.metadata["general.file_type"] = 25
+            else:
+                self.metadata["general.file_type"] = 1
 
             filtered_meta = {k: v for k, v in self.metadata.items() if v is not None}
 
@@ -488,13 +479,13 @@ class GGUFWriter:
 def create_hybrid_gguf(
     output_path: str, base_model_path: str,
     quant_config: Dict, verbose: bool = True,
-    adapter_path: str = None, native_mxfp4: bool = False,
+    adapter_path: str = None,
 ) -> str:
     """Convenience function to create a hybrid GGUF model."""
     writer = GGUFWriter(output_path)
     return writer.create_hybrid_gguf(
         base_model_path, quant_config, verbose,
-        adapter_path=adapter_path, native_mxfp4=native_mxfp4
+        adapter_path=adapter_path
     )
 
 

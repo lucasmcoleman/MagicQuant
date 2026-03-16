@@ -72,7 +72,7 @@ class GGUFReader:
         28: "F64",
         29: "IQ1_M",
         30: "BF16",
-        100: "MXFP4",  # MagicQuant custom: OCP MX FP4
+        39: "MXFP4",  # GGML_TYPE_MXFP4 (native llama.cpp)
     }
     
     def __init__(self, filepath: str):
