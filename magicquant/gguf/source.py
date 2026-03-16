@@ -430,10 +430,144 @@ class SafetensorsSource(ModelSource):
 
 
 # =====================================================================
+# LoRA Merged Source
+# =====================================================================
+
+class LoRAMergedSource(ModelSource):
+    """
+    Wraps a base model source and merges LoRA adapter weights on-the-fly.
+
+    For each tensor that has a LoRA delta (lora_A + lora_B matrices), the
+    merge formula is:
+        W_merged = W_base + (lora_B @ lora_A) * (alpha / rank)
+
+    Tensors without LoRA adapters pass through from the base model unchanged.
+    No full merged copy is written to disk — merging happens per-tensor as
+    the writer reads each one.
+    """
+
+    def __init__(self, base_path: str, adapter_path: str):
+        """
+        Args:
+            base_path: Path to the base model (directory or .safetensors/.gguf)
+            adapter_path: Path to the LoRA adapter directory (contains
+                adapter_config.json + adapter_model.safetensors)
+        """
+        from magicquant.gguf.source import open_model_source
+
+        self._base = open_model_source(base_path)
+
+        # Load adapter config
+        if os.path.isdir(adapter_path):
+            adapter_dir = adapter_path
+        else:
+            adapter_dir = os.path.dirname(adapter_path)
+
+        config_path = os.path.join(adapter_dir, "adapter_config.json")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"No adapter_config.json in {adapter_dir}")
+
+        with open(config_path) as f:
+            adapter_cfg = json.load(f)
+
+        self._rank = adapter_cfg.get("r", 8)
+        self._alpha = adapter_cfg.get("lora_alpha", self._rank)
+        self._scale = self._alpha / self._rank
+        self._target_modules = set(adapter_cfg.get("target_modules", []))
+
+        # Load adapter tensors
+        adapter_st = os.path.join(adapter_dir, "adapter_model.safetensors")
+        if not os.path.exists(adapter_st):
+            raise FileNotFoundError(f"No adapter_model.safetensors in {adapter_dir}")
+
+        self._adapter_tensors: Dict[str, Dict] = {}
+        header, data_start = SafetensorsSource._parse_header(adapter_st)
+        for name, info in header.items():
+            if name.startswith("__"):
+                continue
+            self._adapter_tensors[name] = {
+                "dtype": info.get("dtype", "F32"),
+                "shape": info.get("shape", []),
+                "filepath": adapter_st,
+                "byte_offset": info["data_offsets"][0],
+                "byte_length": info["data_offsets"][1] - info["data_offsets"][0],
+                "data_start": data_start,
+            }
+
+        # Build map: base HF tensor name -> (lora_A_key, lora_B_key)
+        self._lora_map: Dict[str, Tuple[str, str]] = {}
+        lora_a_keys = [k for k in self._adapter_tensors if ".lora_A." in k]
+        for a_key in lora_a_keys:
+            b_key = a_key.replace(".lora_A.", ".lora_B.")
+            if b_key in self._adapter_tensors:
+                # Extract the base tensor name:
+                # "base_model.model.layers.0.self_attn.q_proj.lora_A.weight"
+                # -> "model.layers.0.self_attn.q_proj.weight"
+                base_name = a_key.replace(".lora_A.", ".")
+                if base_name.startswith("base_model.model."):
+                    base_name = base_name[len("base_model.model."):]
+                elif base_name.startswith("base_model."):
+                    base_name = base_name[len("base_model."):]
+                # Convert to GGUF name
+                gguf_name = _hf_name_to_gguf(base_name)
+                self._lora_map[gguf_name] = (a_key, b_key)
+
+    def _read_adapter_tensor(self, key: str) -> np.ndarray:
+        info = self._adapter_tensors[key]
+        with open(info["filepath"], "rb") as f:
+            f.seek(info["data_start"] + info["byte_offset"])
+            buf = f.read(info["byte_length"])
+        dtype = info["dtype"]
+        if dtype == "BF16":
+            raw = np.frombuffer(buf, dtype=np.uint16)
+            return (raw.astype(np.uint32) << 16).view(np.float32).reshape(info["shape"])
+        elif dtype == "F16":
+            return np.frombuffer(buf, dtype=np.float16).astype(np.float32).reshape(info["shape"])
+        else:
+            return np.frombuffer(buf, dtype=np.float32).copy().reshape(info["shape"])
+
+    def get_metadata(self):
+        return self._base.get_metadata()
+
+    def get_tensor_names(self):
+        return self._base.get_tensor_names()
+
+    def get_all_tensors_info(self):
+        return self._base.get_all_tensors_info()
+
+    def get_source_type_name(self, tensor_name: str) -> str:
+        return self._base.get_source_type_name(tensor_name)
+
+    def read_tensor_f32(self, tensor_name: str) -> Optional[np.ndarray]:
+        base_f32 = self._base.read_tensor_f32(tensor_name)
+        if base_f32 is None:
+            return None
+
+        if tensor_name not in self._lora_map:
+            return base_f32
+
+        a_key, b_key = self._lora_map[tensor_name]
+        lora_a = self._read_adapter_tensor(a_key)  # (rank, in_features)
+        lora_b = self._read_adapter_tensor(b_key)  # (out_features, rank)
+
+        # Merge: W = W_base + (B @ A) * scale
+        delta = (lora_b @ lora_a) * self._scale
+        base_f32 = base_f32.reshape(delta.shape) + delta
+
+        return base_f32.flatten()
+
+    def close(self):
+        self._base.close()
+
+
+# =====================================================================
 # Factory
 # =====================================================================
 
-def open_model_source(path: str) -> ModelSource:
+def open_model_source(
+    path: str,
+    adapter_path: Optional[str] = None,
+) -> ModelSource:
     """
     Open a model source, auto-detecting the format.
 
@@ -441,29 +575,47 @@ def open_model_source(path: str) -> ModelSource:
     - A .gguf file path -> GGUFSource
     - A .safetensors file path -> SafetensorsSource
     - A directory containing .safetensors files -> SafetensorsSource
+    - A LoRA adapter directory (adapter_config.json) -> LoRAMergedSource
+      (auto-downloads or locates the base model)
+
+    If *adapter_path* is given, the result wraps the base model with
+    LoRA merge-on-read.
     """
+    # If the path itself is a LoRA adapter directory, resolve the base
+    if os.path.isdir(path):
+        adapter_cfg = os.path.join(path, "adapter_config.json")
+        if os.path.exists(adapter_cfg) and adapter_path is None:
+            with open(adapter_cfg) as f:
+                cfg = json.load(f)
+            base_model = cfg.get("base_model_name_or_path", "")
+            if base_model and os.path.isdir(base_model):
+                return LoRAMergedSource(base_path=base_model, adapter_path=path)
+            raise ValueError(
+                f"LoRA adapter detected at {path} but base model "
+                f"'{base_model}' not found locally. Download it first or "
+                f"pass the base model path explicitly."
+            )
+
+    # Explicit adapter
+    if adapter_path is not None:
+        return LoRAMergedSource(base_path=path, adapter_path=adapter_path)
+
+    # Standard format detection
     if os.path.isfile(path):
         if path.endswith(".gguf"):
             return GGUFSource(path)
         if path.endswith(".safetensors"):
             return SafetensorsSource(path)
-        # Try to detect by magic
         with open(path, "rb") as f:
             magic = f.read(4)
         if magic == b"GGUF":
             return GGUFSource(path)
-        # Assume safetensors
         return SafetensorsSource(path)
 
     if os.path.isdir(path):
-        # Check for safetensors files
-        has_st = any(
-            f.endswith(".safetensors")
-            for f in os.listdir(path)
-        )
+        has_st = any(f.endswith(".safetensors") for f in os.listdir(path))
         if has_st:
             return SafetensorsSource(path)
-        # Check for GGUF
         gguf_files = [f for f in os.listdir(path) if f.endswith(".gguf")]
         if gguf_files:
             return GGUFSource(os.path.join(path, gguf_files[0]))

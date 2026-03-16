@@ -193,6 +193,7 @@ class GGUFWriter:
         base_model_path: str,
         quant_config: Dict,
         verbose: bool = True,
+        adapter_path: str = None,
     ) -> str:
         """
         Create a hybrid GGUF from any supported source format.
@@ -202,14 +203,18 @@ class GGUFWriter:
                 file, or directory containing safetensors + config.json
             quant_config: {"base": "MXFP4_MOE", "groups": {"E": "BF16", ...}}
             verbose: Print progress
+            adapter_path: Optional path to a LoRA adapter directory.
+                When provided, adapter weights are merged on-the-fly.
         """
         from magicquant.gguf.source import open_model_source
         from magicquant.gguf.tensor_groups import TensorGroupClassifier
 
         if verbose:
             print(f"Loading source: {base_model_path}")
+            if adapter_path:
+                print(f"LoRA adapter: {adapter_path}")
 
-        source = open_model_source(base_model_path)
+        source = open_model_source(base_model_path, adapter_path=adapter_path)
 
         try:
             base_quant = quant_config.get("base", "Q4_K_M")
@@ -371,10 +376,13 @@ class GGUFWriter:
 def create_hybrid_gguf(
     output_path: str, base_model_path: str,
     quant_config: Dict, verbose: bool = True,
+    adapter_path: str = None,
 ) -> str:
     """Convenience function to create a hybrid GGUF model."""
     writer = GGUFWriter(output_path)
-    return writer.create_hybrid_gguf(base_model_path, quant_config, verbose)
+    return writer.create_hybrid_gguf(
+        base_model_path, quant_config, verbose, adapter_path=adapter_path
+    )
 
 
 if __name__ == "__main__":
