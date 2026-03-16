@@ -346,6 +346,98 @@ def _pad_to(arr: np.ndarray, block_size: int) -> np.ndarray:
     return arr
 
 
+# Scale multipliers for RMSE optimization.  We try each candidate and
+# keep the one with the lowest mean-squared error per sub-block.
+_SCALE_CANDIDATES = np.array(
+    [0.88, 0.92, 0.96, 1.0, 1.04, 1.08, 1.12], dtype=np.float32
+)
+
+
+def _optimize_symmetric_scale(
+    sub_blocks: np.ndarray,
+    naive_scales: np.ndarray,
+    max_q: int,
+    min_q: int = None,
+) -> np.ndarray:
+    """
+    Find the scale that minimizes MSE for symmetric quantization.
+
+    Args:
+        sub_blocks: (n_blocks, n_sub, sub_size) — the float32 values
+        naive_scales: (n_blocks, n_sub) — initial scale estimates
+        max_q: Maximum quantized value (e.g., 32 for Q6_K signed -32..31)
+        min_q: Minimum quantized value (default: -max_q)
+
+    Returns:
+        Optimized scales: (n_blocks, n_sub)
+    """
+    if min_q is None:
+        min_q = -max_q
+    n_cand = len(_SCALE_CANDIDATES)
+    # candidate_scales: (n_blocks, n_sub, n_cand)
+    candidates = naive_scales[:, :, None] * _SCALE_CANDIDATES[None, None, :]
+    # Avoid division by zero
+    inv_cand = np.where(candidates > 0, 1.0 / candidates, 0.0)
+    # Quantize with each candidate: (n_blocks, n_sub, sub_size, n_cand)
+    q = np.round(
+        sub_blocks[:, :, :, None] * inv_cand[:, :, None, :]
+    ).clip(min_q, max_q)
+    # Dequantize
+    deq = q * candidates[:, :, None, :]
+    # MSE per candidate: (n_blocks, n_sub, n_cand)
+    mse = np.mean((sub_blocks[:, :, :, None] - deq) ** 2, axis=2)
+    # Pick best candidate per sub-block
+    best_idx = np.argmin(mse, axis=2)  # (n_blocks, n_sub)
+    # Gather the best scale
+    n_b, n_s = naive_scales.shape
+    return candidates[
+        np.arange(n_b)[:, None],
+        np.arange(n_s)[None, :],
+        best_idx,
+    ]
+
+
+def _optimize_asymmetric_scale(
+    sub_blocks: np.ndarray,
+    naive_scales: np.ndarray,
+    offsets: np.ndarray,
+    max_q: int,
+) -> np.ndarray:
+    """
+    Find the scale that minimizes MSE for asymmetric quantization.
+
+    The offset (min) is fixed by the format; only the scale is optimized.
+
+    Args:
+        sub_blocks: (n_blocks, n_sub, sub_size) — float32 values
+        naive_scales: (n_blocks, n_sub) — initial scale estimates
+        offsets: (n_blocks, n_sub) — min offsets (subtracted before quantizing)
+        max_q: Maximum quantized value (e.g., 15 for Q4_K, 31 for Q5_K)
+
+    Returns:
+        Optimized scales: (n_blocks, n_sub)
+    """
+    n_cand = len(_SCALE_CANDIDATES)
+    candidates = naive_scales[:, :, None] * _SCALE_CANDIDATES[None, None, :]
+    inv_cand = np.where(candidates > 0, 1.0 / candidates, 0.0)
+    # shifted = val + offset
+    shifted = sub_blocks + offsets[:, :, None]  # (n_blocks, n_sub, sub_size)
+    # Quantize: q = round(shifted / scale), clamped to [0, max_q]
+    q = np.round(
+        shifted[:, :, :, None] * inv_cand[:, :, None, :]
+    ).clip(0, max_q)
+    # Dequantize: val = q * scale - offset
+    deq = q * candidates[:, :, None, :] - offsets[:, :, None, None]
+    mse = np.mean((sub_blocks[:, :, :, None] - deq) ** 2, axis=2)
+    best_idx = np.argmin(mse, axis=2)
+    n_b, n_s = naive_scales.shape
+    return candidates[
+        np.arange(n_b)[:, None],
+        np.arange(n_s)[None, :],
+        best_idx,
+    ]
+
+
 # ── Q8_0: 34 bytes per 32-element block ─────────────────────────────
 
 def _encode_ggml_q8_0(flat: np.ndarray) -> bytes:
@@ -451,7 +543,9 @@ def _encode_ggml_q6_k(flat: np.ndarray) -> bytes:
     # Reshape to (n_blocks, 16, 16) for vectorized sub-block operations
     sub_blocks = blocks.reshape(n_blocks, 16, 16)
     sub_amax = np.max(np.abs(sub_blocks), axis=2)  # (n_blocks, 16)
-    sub_scales = np.where(sub_amax > 0, sub_amax / 32.0, 0.0)  # (n_blocks, 16)
+    naive_scales = np.where(sub_amax > 0, sub_amax / 32.0, 0.0)  # (n_blocks, 16)
+    # RMSE-optimized scale selection
+    sub_scales = _optimize_symmetric_scale(sub_blocks, naive_scales, max_q=31)
 
     # Master scale per super-block
     max_ss = np.max(sub_scales, axis=1)  # (n_blocks,)
@@ -562,7 +656,9 @@ def _encode_ggml_q4_k(flat: np.ndarray) -> bytes:
     sub_max = np.max(sub, axis=2)   # (n_blocks, 8)
     sub_mins = np.where(sub_min < 0, -sub_min, 0.0).astype(np.float32)  # (n_blocks, 8)
     rng = sub_max + sub_mins  # (n_blocks, 8)
-    sub_scales = np.where(rng > 0, rng / 15.0, 0.0).astype(np.float32)  # (n_blocks, 8)
+    naive_scales = np.where(rng > 0, rng / 15.0, 0.0).astype(np.float32)
+    # RMSE-optimized scale selection
+    sub_scales = _optimize_asymmetric_scale(sub, naive_scales, sub_mins, max_q=15)
 
     # Master scales
     max_scale = np.max(sub_scales, axis=1)  # (n_blocks,)
@@ -624,7 +720,9 @@ def _encode_ggml_q5_k(flat: np.ndarray) -> bytes:
     sub_max_vals = np.max(sub, axis=2)   # (n_blocks, 8)
     sub_mins = np.where(sub_min_vals < 0, -sub_min_vals, 0.0).astype(np.float32)
     rng = sub_max_vals + sub_mins
-    sub_scales = np.where(rng > 0, rng / 31.0, 0.0).astype(np.float32)
+    naive_scales = np.where(rng > 0, rng / 31.0, 0.0).astype(np.float32)
+    # RMSE-optimized scale selection
+    sub_scales = _optimize_asymmetric_scale(sub, naive_scales, sub_mins, max_q=31)
 
     # Master scales
     max_scale = np.max(sub_scales, axis=1)  # (n_blocks,)
