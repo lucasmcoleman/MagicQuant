@@ -12,16 +12,28 @@ from pathlib import Path
 class LlamaCppTools:
     """Interface to llama.cpp quantization tools."""
     
-    def __init__(self, llamacpp_path: Optional[str] = None):
+    def __init__(
+        self,
+        llamacpp_path: Optional[str] = None,
+        data_file: Optional[str] = None,
+        ctx_size: int = 512,
+    ):
         """
         Initialize llama.cpp tools wrapper.
-        
+
         Args:
             llamacpp_path: Path to llama.cpp directory (auto-detect if None)
+            data_file: Path to the dataset file used for perplexity evaluation
+                (e.g. wikitext-2-raw/wiki.test.raw).  When *None* the tool
+                will look in common locations relative to the llama.cpp dir.
+            ctx_size: Context size for perplexity evaluation (default 512
+                for fast evaluation; increase for more accurate results).
         """
         self.llamacpp_path = llamacpp_path or self._find_llamacpp()
         self.quantize_tool = self._find_quantize_tool()
         self.perplexity_tool = self._find_perplexity_tool()
+        self.data_file = data_file
+        self.ctx_size = ctx_size
         
     def _find_llamacpp(self) -> str:
         """Auto-detect llama.cpp installation."""
@@ -73,6 +85,47 @@ class LlamaCppTools:
         
         raise FileNotFoundError(f"Could not find perplexity tool in {self.llamacpp_path}")
     
+    def _resolve_data_file(self, data_file: Optional[str] = None) -> Optional[str]:
+        """Resolve the dataset file for perplexity evaluation.
+
+        Priority:
+        1. Explicit *data_file* argument
+        2. Instance-level ``self.data_file``
+        3. Common locations relative to the llama.cpp directory
+
+        Returns:
+            Absolute path to the data file, or *None* with a printed error.
+        """
+        candidate = data_file or self.data_file
+
+        if candidate and os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+
+        # Search common locations relative to the llama.cpp directory
+        search_paths = [
+            os.path.join(self.llamacpp_path, "wikitext-2-raw", "wiki.test.raw"),
+            os.path.join(self.llamacpp_path, "wikitext-2", "wiki.test.raw"),
+            os.path.join(self.llamacpp_path, "models", "wikitext-2-raw", "wiki.test.raw"),
+            # One level up (build dir inside llama.cpp checkout)
+            os.path.join(self.llamacpp_path, "..", "wikitext-2-raw", "wiki.test.raw"),
+        ]
+
+        for p in search_paths:
+            if os.path.isfile(p):
+                return os.path.abspath(p)
+
+        # Nothing found -- print a clear message
+        print(
+            "ERROR: No perplexity data file found.\n"
+            "  llama-perplexity requires a dataset file (e.g. wikitext-2-raw/wiki.test.raw).\n"
+            "  Download it with:\n"
+            "    curl -LO https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip\n"
+            "    unzip wikitext-2-raw-v1.zip\n"
+            f"  Then place 'wikitext-2-raw/wiki.test.raw' inside {self.llamacpp_path}\n"
+            "  or pass data_file=<path> to LlamaCppTools / calculate_perplexity()."
+        )
+        return None
+
     def quantize_model(
         self,
         input_path: str,
@@ -122,22 +175,34 @@ class LlamaCppTools:
     def calculate_perplexity(
         self,
         model_path: str,
-        verbose: bool = True
+        verbose: bool = True,
+        data_file: Optional[str] = None,
+        ctx_size: Optional[int] = None,
     ) -> Optional[float]:
         """
         Calculate perplexity for a model.
-        
+
         Args:
             model_path: Path to GGUF model
             verbose: Print output
-            
+            data_file: Path to dataset file (overrides instance default)
+            ctx_size: Context size (overrides instance default)
+
         Returns:
             Perplexity value or None if failed
         """
+        resolved_data_file = self._resolve_data_file(data_file)
+        if resolved_data_file is None:
+            return None
+
+        effective_ctx = ctx_size if ctx_size is not None else self.ctx_size
+
         cmd = [
             self.perplexity_tool,
             "-m", model_path,
-            "--perplexity"
+            "-f", resolved_data_file,
+            "--ctx-size", str(effective_ctx),
+            "--perplexity",
         ]
         
         if verbose:

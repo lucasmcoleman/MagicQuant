@@ -753,7 +753,9 @@ def _encode_ggml_mxfp4(flat: np.ndarray) -> bytes:
 def _encode_f32_to_bf16(arr: np.ndarray) -> bytes:
     f32 = arr.astype(np.float32)
     u32 = f32.view(np.uint32)
-    bf16 = (u32 >> 16).astype(np.uint16)
+    # Round-to-nearest-even: add 0x7FFF + bit 16 (the lsb of the result) before truncating
+    rounding = np.uint32(0x7FFF) + ((u32 >> 16) & 1)
+    bf16 = ((u32 + rounding) >> 16).astype(np.uint16)
     return bf16.tobytes()
 
 

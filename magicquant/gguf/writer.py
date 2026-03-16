@@ -21,7 +21,10 @@ import os
 import time
 import threading
 import queue
+import logging
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 from magicquant.quant.converters import (
     encode_to_ggml_bytes,
@@ -82,7 +85,9 @@ _GGUF_TYPE_FLOAT64 = 12
 
 ALIGNMENT = 32
 
-# Map MagicQuant scheme names to the ggml_type name we write into the file
+# Map MagicQuant scheme names to the ggml_type name we write into the file.
+# MXFP4_MOE defaults to Q4_0 for llama.cpp compatibility.
+# Use native_mxfp4=True to write the custom type 100 (requires compatible runtime).
 SCHEME_TO_GGML = {
     "BF16":      "BF16",
     "F16":       "F16",
@@ -92,7 +97,7 @@ SCHEME_TO_GGML = {
     "Q5_K":      "Q5_K",
     "Q4_K_M":    "Q4_K",
     "IQ4_NL":    "IQ4_NL",
-    "MXFP4_MOE": "MXFP4",
+    "MXFP4_MOE": "Q4_0",  # compatible default; native_mxfp4 overrides to "MXFP4"
 }
 
 
@@ -206,6 +211,14 @@ def _read_encode_worker(source, entries, result_queue):
                 blob = b"\x00" * expected
 
             # Pad/trim to exact size
+            if len(blob) != expected:
+                logger.warning(
+                    "Tensor %s: encoded blob size %d != expected %d "
+                    "(target type %s, %d elements); %s to fit",
+                    name, len(blob), expected, target,
+                    entry["_n_elems"],
+                    "padding" if len(blob) < expected else "trimming",
+                )
             if len(blob) < expected:
                 blob = blob + b"\x00" * (expected - len(blob))
             elif len(blob) > expected:
@@ -241,6 +254,7 @@ class GGUFWriter:
         quant_config: Dict,
         verbose: bool = True,
         adapter_path: str = None,
+        native_mxfp4: bool = False,
     ) -> str:
         """
         Create a hybrid GGUF from any supported source format.
@@ -251,14 +265,27 @@ class GGUFWriter:
             quant_config: {"base": "MXFP4_MOE", "groups": {"E": "BF16", ...}}
             verbose: Print progress
             adapter_path: Optional path to a LoRA adapter directory.
+            native_mxfp4: If True, use custom MXFP4 type (ID 100) for
+                MXFP4_MOE tensors. Requires a compatible runtime.
+                If False (default), MXFP4_MOE maps to Q4_0 for
+                standard llama.cpp compatibility.
         """
         from magicquant.gguf.source import open_model_source
         from magicquant.gguf.tensor_groups import TensorGroupClassifier
+
+        # Build the scheme-to-ggml mapping for this run
+        scheme_map = dict(SCHEME_TO_GGML)
+        if native_mxfp4:
+            scheme_map["MXFP4_MOE"] = "MXFP4"
 
         if verbose:
             print(f"Loading source: {base_model_path}")
             if adapter_path:
                 print(f"LoRA adapter: {adapter_path}")
+            if native_mxfp4:
+                print("MXFP4 mode: native (type 100, requires compatible runtime)")
+            else:
+                print("MXFP4 mode: compatible (encoded as Q4_0 for llama.cpp)")
 
         source = open_model_source(base_model_path, adapter_path=adapter_path)
 
@@ -288,7 +315,7 @@ class GGUFWriter:
 
                 group = classifier.classify_tensor(name)
                 scheme = group_schemes.get(group, base_quant)
-                target_ggml_name = SCHEME_TO_GGML.get(scheme, "Q4_0")
+                target_ggml_name = scheme_map.get(scheme, "Q4_0")
                 target_ggml_id = GGML_TYPE.get(target_ggml_name, GGML_TYPE["Q4_0"])
 
                 n_elems = _tensor_n_elements(shape)
@@ -436,12 +463,13 @@ class GGUFWriter:
 def create_hybrid_gguf(
     output_path: str, base_model_path: str,
     quant_config: Dict, verbose: bool = True,
-    adapter_path: str = None,
+    adapter_path: str = None, native_mxfp4: bool = False,
 ) -> str:
     """Convenience function to create a hybrid GGUF model."""
     writer = GGUFWriter(output_path)
     return writer.create_hybrid_gguf(
-        base_model_path, quant_config, verbose, adapter_path=adapter_path
+        base_model_path, quant_config, verbose,
+        adapter_path=adapter_path, native_mxfp4=native_mxfp4
     )
 
 

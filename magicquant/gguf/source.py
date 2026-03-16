@@ -314,6 +314,100 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return meta
 
 
+def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
+    """
+    Read tokenizer data from a HuggingFace model directory and return
+    GGUF-compatible tokenizer metadata.
+
+    Handles the common case: BPE tokenizer from tokenizer.json
+    (covers LLaMA, Qwen, Mistral, GPT-NeoX, Falcon, etc.).
+    """
+    meta: Dict[str, Any] = {}
+
+    # ── tokenizer.json (BPE vocab + merges) ──
+    tokenizer_path = os.path.join(model_dir, "tokenizer.json")
+    if not os.path.exists(tokenizer_path):
+        return meta
+
+    with open(tokenizer_path, encoding="utf-8") as f:
+        tok = json.load(f)
+
+    model_info = tok.get("model", {})
+    tok_type = model_info.get("type", "BPE")
+
+    if tok_type == "BPE":
+        meta["tokenizer.ggml.model"] = "gpt2"
+    elif tok_type == "Unigram":
+        meta["tokenizer.ggml.model"] = "llama"
+    else:
+        meta["tokenizer.ggml.model"] = "gpt2"
+
+    # Extract vocabulary: {token_string: id}
+    vocab = model_info.get("vocab", {})
+    if vocab:
+        # Sort by ID to get ordered token list
+        sorted_tokens = sorted(vocab.items(), key=lambda x: x[1])
+        max_id = sorted_tokens[-1][1] if sorted_tokens else 0
+        tokens = [""] * (max_id + 1)
+        scores = [0.0] * (max_id + 1)
+        token_types = [0] * (max_id + 1)  # 0 = normal
+
+        for token_str, token_id in sorted_tokens:
+            if token_id < len(tokens):
+                tokens[token_id] = token_str
+
+        # Check added_tokens for special tokens
+        added = tok.get("added_tokens", [])
+        for at in added:
+            tid = at.get("id", -1)
+            content = at.get("content", "")
+            special = at.get("special", False)
+            if 0 <= tid < len(tokens):
+                tokens[tid] = content
+                if special:
+                    token_types[tid] = 3  # 3 = control token
+
+        meta["tokenizer.ggml.tokens"] = tokens
+        meta["tokenizer.ggml.scores"] = scores
+        meta["tokenizer.ggml.token_type"] = token_types
+
+    # Extract BPE merges
+    merges = model_info.get("merges", [])
+    if merges:
+        meta["tokenizer.ggml.merges"] = merges
+
+    # ── tokenizer_config.json (special token IDs) ──
+    config_path = os.path.join(model_dir, "tokenizer_config.json")
+    if os.path.exists(config_path):
+        with open(config_path, encoding="utf-8") as f:
+            tok_cfg = json.load(f)
+
+        # Map special token config keys to GGUF metadata keys
+        special_map = {
+            "bos_token": "tokenizer.ggml.bos_token_id",
+            "eos_token": "tokenizer.ggml.eos_token_id",
+            "pad_token": "tokenizer.ggml.padding_token_id",
+            "unk_token": "tokenizer.ggml.unknown_token_id",
+        }
+
+        for hf_key, gguf_key in special_map.items():
+            val = tok_cfg.get(hf_key)
+            if val is None:
+                continue
+            # Value can be a string or a dict with "content" key
+            if isinstance(val, dict):
+                val = val.get("content", "")
+            if isinstance(val, str) and val in vocab:
+                meta[gguf_key] = vocab[val]
+
+        # Chat template
+        chat_template = tok_cfg.get("chat_template")
+        if chat_template and isinstance(chat_template, str):
+            meta["tokenizer.chat_template"] = chat_template
+
+    return meta
+
+
 class SafetensorsSource(ModelSource):
     """
     Read tensors from a HuggingFace safetensors model directory.
@@ -379,7 +473,7 @@ class SafetensorsSource(ModelSource):
                     "hf_name": hf_name,
                     "gguf_name": gguf_name,
                     "dtype": dtype,
-                    "shape": list(reversed(shape)),  # reverse for GGUF convention
+                    "shape": list(shape),  # row-major (same as GGUFReader convention)
                     "shape_orig": shape,
                     "n_dims": len(shape),
                     "data_type": _ST_DTYPE_TO_GGML.get(dtype, 0),
@@ -397,6 +491,10 @@ class SafetensorsSource(ModelSource):
             self._metadata = _build_gguf_metadata_from_config(config)
         else:
             self._metadata = {"general.architecture": "llama"}
+
+        # Load tokenizer data
+        tokenizer_meta = _build_tokenizer_metadata(self._model_dir)
+        self._metadata.update(tokenizer_meta)
 
     @staticmethod
     def _parse_header(filepath: str) -> Tuple[Dict, int]:
@@ -528,6 +626,7 @@ class LoRAMergedSource(ModelSource):
         self._rank = adapter_cfg.get("r", 8)
         self._alpha = adapter_cfg.get("lora_alpha", self._rank)
         self._scale = self._alpha / self._rank
+        self._fan_in_fan_out = adapter_cfg.get("fan_in_fan_out", False)
         self._target_modules = set(adapter_cfg.get("target_modules", []))
 
         # Load adapter tensors
@@ -607,6 +706,9 @@ class LoRAMergedSource(ModelSource):
 
         # Merge: W = W_base + (B @ A) * scale
         delta = (lora_b @ lora_a) * self._scale
+        # fan_in_fan_out: transpose delta for Conv1D-based models (GPT-2 style)
+        if self._fan_in_fan_out:
+            delta = delta.T
         base_f32 = base_f32.reshape(delta.shape) + delta
 
         return base_f32.flatten()
