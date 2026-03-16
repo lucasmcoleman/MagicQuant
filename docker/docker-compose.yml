@@ -1,7 +1,3 @@
-# MagicQuant Docker Compose Configuration
-
-version: '3.8'
-
 services:
   magicquant:
     build:
@@ -9,7 +5,7 @@ services:
       dockerfile: docker/Dockerfile
     volumes:
       - ../models:/app/models:ro
-      - ../results:/app/results
+      - ../output:/app/output
     environment:
       - PYTHONUNBUFFERED=1
     deploy:

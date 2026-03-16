@@ -1,14 +1,28 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
 dist/
 build/
+
+# Virtual environments
 venv/
 .venv/
+
+# Model files (large)
 *.gguf
 output/
+models/
+
+# IDE / tools
 .claude/
-*.log
+.vscode/
+.idea/
+
+# Secrets / logs
 .env
+*.log
+
+# Submodules / external docs
 MagicQuant-Wiki/

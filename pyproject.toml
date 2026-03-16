@@ -5,15 +5,25 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "magicquant"
 version = "0.1.0"
-description = "Evolutionary Tensor Search for Optimal LLM Compression"
-readme = "MagicQuant-Wiki/README.md"
+description = "Evolutionary Tensor Search for Optimal LLM GGUF Hybrid Quantization"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.21.0",
 ]
 
+[project.optional-dependencies]
+yaml = ["pyyaml>=6.0"]
+dev = ["pytest>=7.0.0"]
+
 [project.scripts]
 magicquant = "magicquant.__main__:main"
 
+[project.urls]
+Repository = "https://github.com/lucasmcoleman/MagicQuant"
+Original-Research = "https://github.com/magiccodingman/MagicQuant-Wiki"
+
 [tool.setuptools.packages.find]
 where = ["."]
+exclude = ["docker*", "tests*"]

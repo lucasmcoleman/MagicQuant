@@ -6,9 +6,8 @@ This module provides functions to read and parse GGUF files without requiring
 the full llama.cpp library, making it suitable for MagicQuant's preprocessing needs.
 """
 
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 import struct
-import mmap
 import os
 
 
@@ -295,25 +294,23 @@ def read_gguf_file(filepath: str) -> GGUFReader:
 
 
 if __name__ == "__main__":
-    # Test reading a GGUF file (if provided)
     import sys
-    
+    from magicquant.gguf.tensor_groups import TensorGroupClassifier
+
     if len(sys.argv) > 1:
         filepath = sys.argv[1]
         print(f"Reading GGUF file: {filepath}")
-        
+
         with GGUFReader(filepath) as reader:
-            print(f"Model architecture: {reader.get_model_architecture()}")
-            print(f"Parameter count: {reader.get_parameter_count():,}")
-            print(f"File size: {reader.get_file_size_gb():.2f} GB")
-            print(f"Bits per weight: {reader.get_bits_per_weight():.2f}")
+            print(f"Architecture: {reader.get_model_architecture()}")
+            print(f"Parameters:   {reader.get_parameter_count():,}")
+            print(f"File Size:    {reader.get_file_size_gb():.2f} GB")
+            print(f"Bits/Weight:  {reader.get_bits_per_weight():.2f}")
             print()
-            
-            print("Tensor groups:")
             classifier = TensorGroupClassifier()
             grouped = classifier.classify_tensors(reader.get_tensor_names())
             for group, tensors in grouped.items():
                 if tensors:
                     print(f"  {group}: {len(tensors)} tensors")
     else:
-        print("Usage: python gguf_reader.py <path_to_gguf_file>")
+        print("Usage: python -m magicquant.gguf.reader <path_to_gguf_file>")

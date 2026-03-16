@@ -1,13 +1,2 @@
-# MagicQuant Requirements
-
-# Core dependencies
 numpy>=1.21.0
 pyyaml>=6.0
-
-# Optional: for GGUF file operations
-# (gguf library can be added if needed)
-
-# Development/testing dependencies
-pytest>=7.0.0
-black>=23.0.0
-flake8>=6.0.0
