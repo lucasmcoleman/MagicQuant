@@ -1,0 +1,377 @@
+"""
+Evolutionary Survival - Core evolutionary search algorithm.
+
+This module implements the evolutionary search that:
+1. Generates candidate hybrid configurations
+2. Classifies them into tiers based on size ratio to baseline
+3. Runs tournaments to select winners
+4. Applies mutation strategies (Protector/Crusher)
+5. Implements epsilon-greedy exploration
+
+The search is designed around MXFP4 as the primary compression scheme,
+with the evolutionary pressure finding which tensor groups can tolerate
+MXFP4 and which need protection at higher precision.
+"""
+
+from typing import Dict, List, Tuple, Optional
+import random
+import copy
+
+
+# Ordered from highest quality to most compressed.
+# MXFP4_MOE is the sweet spot: best compression of the ~4-bit schemes
+# with lower noise than integer Q4 due to FP4 non-linear levels.
+SCHEME_QUALITY_ORDER = [
+    "BF16", "Q8_0", "Q6_K", "Q5_K", "IQ4_NL", "MXFP4_MOE", "Q4_K_M"
+]
+
+
+class EvolutionarySurvivor:
+    """
+    Run evolutionary search for optimal hybrid quantizations.
+
+    The algorithm follows these phases:
+        1. Initialize population with high-probability seeds
+        2. Predict performance of all candidates
+        3. Classify into tiers by size ratio to baseline
+        4. Tournament selection within each tier
+        5. Mutation of winners (Protector upgrades brain layers,
+           Crusher downgrades robust layers)
+        6. Epsilon-greedy exploration
+    """
+
+    AVAILABLE_SCHEMES = SCHEME_QUALITY_ORDER
+
+    DEFAULT_GROUPS = ['E', 'H', 'Q', 'K', 'O', 'U', 'D']
+
+    # Upgrade: move toward higher quality (less compression)
+    _UPGRADE = {
+        "Q4_K_M":    "MXFP4_MOE",
+        "MXFP4_MOE": "IQ4_NL",
+        "IQ4_NL":    "Q5_K",
+        "Q5_K":      "Q6_K",
+        "Q6_K":      "Q8_0",
+        "Q8_0":      "BF16",
+    }
+
+    # Downgrade: move toward more compression (less quality)
+    _DOWNGRADE = {
+        "BF16":      "Q8_0",
+        "Q8_0":      "Q6_K",
+        "Q6_K":      "Q5_K",
+        "Q5_K":      "IQ4_NL",
+        "IQ4_NL":    "MXFP4_MOE",
+        "MXFP4_MOE": "Q4_K_M",
+    }
+
+    # Groups that are sensitive to quantization ("brain" layers)
+    _HIGH_SENSITIVITY = {'E', 'H', 'O', 'R'}
+
+    # Groups that are robust to quantization (FFN / experts)
+    _LOW_SENSITIVITY = {'U', 'D', 'X'}
+
+    # Floor: minimum acceptable scheme for each group type
+    _MIN_SCHEME = {
+        'sensitive': "Q8_0",      # brain layers shouldn't go below Q8_0
+        'robust':    "Q4_K_M",    # FFN can go all the way down
+    }
+
+    def __init__(
+        self,
+        predictor,
+        baseline_config: Dict[str, str],
+        max_generations: int = 50,
+        population_size: int = 100,
+        epsilon: float = 0.2
+    ):
+        self.predictor = predictor
+        self.baseline_config = baseline_config
+        self.max_generations = max_generations
+        self.population_size = population_size
+        self.epsilon = epsilon
+
+        self.history: List[Dict] = []
+        self.tier_winners: Dict[str, Dict] = {}
+
+    def run_evolution(
+        self,
+        groups: Optional[List[str]] = None,
+        verbose: bool = True
+    ) -> List[Dict]:
+        if groups is None:
+            groups = self.DEFAULT_GROUPS
+
+        population = self._initialize_population(groups)
+
+        if verbose:
+            print(f"Initialized population of {len(population)} candidates")
+
+        best_configs = []
+
+        for generation in range(self.max_generations):
+            predictions = self._predict_population(population)
+            tier_assignment = self._classify_into_tiers(predictions)
+            winners = self._tournament_selection(tier_assignment)
+
+            if verbose and (generation + 1) % 5 == 0:
+                print(f"Gen {generation+1}: {len(winners)} tier winners, "
+                      f"{len(best_configs)} unique configs discovered")
+
+            for winner in winners:
+                config_key = str(sorted(winner['config'].items()))
+                if config_key not in [str(sorted(c['config'].items())) for c in best_configs]:
+                    best_configs.append(winner)
+
+            # Mutation: Protector upgrades brain layers, Crusher downgrades FFN
+            mutants = self._mutate_winners(winners, groups)
+            # Also carry forward the winners themselves
+            population = [{'config': copy.deepcopy(w['config'])} for w in winners]
+            population.extend(mutants)
+
+            # Epsilon-greedy exploration
+            if random.random() < self.epsilon:
+                population.extend(self._generate_exploration_configs(groups, n=10))
+
+            # Fill remaining slots with random configs
+            while len(population) < self.population_size:
+                population.append({'config': self._generate_random_config(groups)})
+
+            population = population[:self.population_size]
+
+        best_configs.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
+        return best_configs
+
+    # ------------------------------------------------------------------
+    # Population initialization
+    # ------------------------------------------------------------------
+
+    def _initialize_population(self, groups: List[str]) -> List[Dict]:
+        population = []
+
+        # Seed 1: MagicQuant signature — brain protected, FFN at MXFP4
+        mxfp4_core = {g: "MXFP4_MOE" for g in groups}
+        mxfp4_core['E'] = "BF16"
+        mxfp4_core['H'] = "BF16"
+        mxfp4_core['O'] = "Q8_0"
+        population.append({'config': mxfp4_core})
+
+        # Seed 2: Maximum MXFP4 — everything except embeddings
+        mxfp4_max = {g: "MXFP4_MOE" for g in groups}
+        mxfp4_max['E'] = "BF16"
+        mxfp4_max['H'] = "BF16"
+        population.append({'config': mxfp4_max})
+
+        # Seed 3: MXFP4 FFN with IQ4_NL attention
+        mxfp4_iq4 = {g: "IQ4_NL" for g in groups}
+        mxfp4_iq4['E'] = "BF16"
+        mxfp4_iq4['H'] = "BF16"
+        mxfp4_iq4['U'] = "MXFP4_MOE"
+        mxfp4_iq4['D'] = "MXFP4_MOE"
+        population.append({'config': mxfp4_iq4})
+
+        # Seed 4: High-Contrast — brain at BF16, attention at Q6_K, FFN at MXFP4
+        high_contrast = {g: "Q6_K" for g in groups}
+        high_contrast['E'] = "BF16"
+        high_contrast['H'] = "BF16"
+        high_contrast['O'] = "Q8_0"
+        high_contrast['U'] = "MXFP4_MOE"
+        high_contrast['D'] = "MXFP4_MOE"
+        population.append({'config': high_contrast})
+
+        # Seed 5: Uniform schemes for reference
+        for scheme in ["Q6_K", "Q5_K", "IQ4_NL", "MXFP4_MOE"]:
+            population.append({'config': {g: scheme for g in groups}})
+
+        # Seed 6: Random configs weighted toward MXFP4
+        for _ in range(self.population_size - len(population)):
+            population.append({'config': self._generate_random_config(groups)})
+
+        return population[:self.population_size]
+
+    def _generate_random_config(self, groups: List[str]) -> Dict[str, str]:
+        """Generate a random config biased toward MXFP4 for FFN and
+        higher precision for brain layers."""
+        config = {}
+
+        # Weights per scheme:          BF16 Q8_0 Q6_K Q5_K IQ4NL MXFP4 Q4KM
+        brain_weights =               [0.30, 0.30, 0.20, 0.10, 0.05, 0.03, 0.02]
+        attention_weights =            [0.05, 0.15, 0.25, 0.20, 0.15, 0.10, 0.10]
+        ffn_weights =                  [0.02, 0.05, 0.08, 0.10, 0.15, 0.35, 0.25]
+
+        for g in groups:
+            if g in self._HIGH_SENSITIVITY:
+                w = brain_weights
+            elif g in self._LOW_SENSITIVITY:
+                w = ffn_weights
+            else:
+                w = attention_weights
+            config[g] = random.choices(self.AVAILABLE_SCHEMES, weights=w)[0]
+        return config
+
+    # ------------------------------------------------------------------
+    # Prediction and tier classification
+    # ------------------------------------------------------------------
+
+    def _predict_population(self, population: List[Dict]) -> List[Dict]:
+        for candidate in population:
+            scores = self.predictor.score_hybrid(candidate['config'])
+            candidate.update(scores)
+        return population
+
+    def _classify_into_tiers(self, predictions: List[Dict]) -> Dict[str, List[Dict]]:
+        """Classify into tiers using size RATIO to baseline, not absolute GB."""
+        baseline_gb = self.predictor.baseline_size_gb
+        tier_assignment: Dict[str, List[Dict]] = {}
+
+        for pred in predictions:
+            size_gb = pred.get('predicted_size_gb', 1.0)
+
+            if baseline_gb > 0:
+                ratio = size_gb / baseline_gb
+            else:
+                # Without baseline, use predicted_size_gb as a proxy
+                ratio = size_gb / max(size_gb, 1.0)
+
+            # Tier by compression ratio relative to BF16 baseline
+            if ratio > 0.55:
+                tier = "Q6"
+            elif ratio > 0.40:
+                tier = "Q5"
+            elif ratio > 0.28:
+                tier = "Q4"    # MXFP4-heavy configs land here
+            else:
+                tier = "Q3"
+
+            if tier not in tier_assignment:
+                tier_assignment[tier] = []
+            tier_assignment[tier].append(pred)
+
+        return tier_assignment
+
+    # ------------------------------------------------------------------
+    # Tournament selection
+    # ------------------------------------------------------------------
+
+    def _tournament_selection(self, tier_assignment: Dict) -> List[Dict]:
+        winners = []
+        for tier, candidates in tier_assignment.items():
+            if not candidates:
+                continue
+            sorted_candidates = sorted(
+                candidates,
+                key=lambda x: x.get('composite_score', 0),
+                reverse=True
+            )
+            tier_winners = sorted_candidates[:min(3, len(sorted_candidates))]
+            for w in tier_winners:
+                w['tier'] = tier
+                self.tier_winners[tier] = w
+            winners.extend(tier_winners)
+        return winners
+
+    # ------------------------------------------------------------------
+    # Mutation (Protector / Crusher)
+    # ------------------------------------------------------------------
+
+    def _mutate_winners(self, winners: List[Dict], groups: List[str]) -> List[Dict]:
+        population = []
+        for winner in winners:
+            config = copy.deepcopy(winner['config'])
+
+            # Protector: upgrade the most sensitive unprotected brain layer
+            target = self._find_protector_target(config, groups)
+            if target:
+                new_scheme = self._UPGRADE.get(target['scheme'])
+                if new_scheme and new_scheme != target['scheme']:
+                    c = config.copy()
+                    c[target['group']] = new_scheme
+                    population.append({'config': c})
+
+            # Crusher: downgrade the most robust high-precision FFN layer
+            target = self._find_crusher_target(config, groups)
+            if target:
+                new_scheme = self._DOWNGRADE.get(target['scheme'])
+                if new_scheme and new_scheme != target['scheme']:
+                    c = config.copy()
+                    c[target['group']] = new_scheme
+                    population.append({'config': c})
+
+            # Swap mutant: try MXFP4 on the attention layers
+            for g in ['Q', 'K']:
+                if g in config and config[g] != "MXFP4_MOE":
+                    c = config.copy()
+                    c[g] = "MXFP4_MOE"
+                    population.append({'config': c})
+
+        return population
+
+    def _find_protector_target(
+        self, config: Dict[str, str], groups: List[str]
+    ) -> Optional[Dict]:
+        """Find the most sensitive brain layer that isn't at max precision."""
+        candidates = []
+        for g in groups:
+            if g not in self._HIGH_SENSITIVITY:
+                continue
+            scheme = config.get(g, "Q8_0")
+            if scheme != "BF16":
+                sensitivity = self.predictor.sensitivity_weights.get(g, 0.5)
+                candidates.append({
+                    'group': g, 'scheme': scheme, 'sensitivity': sensitivity
+                })
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x['sensitivity'], reverse=True)
+        return candidates[0]
+
+    def _find_crusher_target(
+        self, config: Dict[str, str], groups: List[str]
+    ) -> Optional[Dict]:
+        """Find the most robust FFN layer that's above minimum precision."""
+        candidates = []
+        for g in groups:
+            if g not in self._LOW_SENSITIVITY:
+                continue
+            scheme = config.get(g, "MXFP4_MOE")
+            # Can we push it lower?
+            if scheme in self._DOWNGRADE and scheme != "Q4_K_M":
+                sensitivity = self.predictor.sensitivity_weights.get(g, 0.5)
+                candidates.append({
+                    'group': g, 'scheme': scheme, 'sensitivity': sensitivity
+                })
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x['sensitivity'])
+        return candidates[0]
+
+    # ------------------------------------------------------------------
+    # Exploration
+    # ------------------------------------------------------------------
+
+    def _generate_exploration_configs(
+        self, groups: List[str], n: int = 10
+    ) -> List[Dict]:
+        return [{'config': self._generate_random_config(groups)} for _ in range(n)]
+
+    def get_best_config_per_tier(self) -> Dict[str, Dict[str, str]]:
+        return self.tier_winners.copy()
+
+    def get_discovered_configs(self, limit: int = 20) -> List[Dict]:
+        return self.history[:limit]
+
+
+class HybridValidator:
+    """Validate that hybrids meet MagicQuant quality standards."""
+
+    MAX_ACCEPTABLE_LOSS = 0.05  # 5% precision loss
+
+    @staticmethod
+    def validate_config(
+        config: Dict[str, str],
+        scores: Dict,
+        max_loss: float = MAX_ACCEPTABLE_LOSS
+    ) -> Tuple[bool, List[str]]:
+        reasons = []
+        if scores.get('predicted_loss', 0) > max_loss:
+            reasons.append(f"Loss {scores['predicted_loss']:.4f} exceeds {max_loss}")
+        return len(reasons) == 0, reasons

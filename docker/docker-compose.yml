@@ -1,0 +1,18 @@
+# MagicQuant Docker Compose Configuration
+
+version: '3.8'
+
+services:
+  magicquant:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ../models:/app/models:ro
+      - ../results:/app/results
+    environment:
+      - PYTHONUNBUFFERED=1
+    deploy:
+      resources:
+        reservations:
+          memory: 16G

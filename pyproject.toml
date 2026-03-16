@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "magicquant"
+version = "0.1.0"
+description = "Evolutionary Tensor Search for Optimal LLM Compression"
+readme = "MagicQuant-Wiki/README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.21.0",
+]
+
+[project.scripts]
+magicquant = "magicquant.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]

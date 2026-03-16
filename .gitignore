@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+*.gguf
+output/
+.claude/
+*.log
+.env
+MagicQuant-Wiki/
