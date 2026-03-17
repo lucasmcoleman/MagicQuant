@@ -815,68 +815,77 @@ def _encode_ggml_q5_k(flat: np.ndarray) -> bytes:
 
 # ── MXFP4: 17 bytes per 32-element block (OCP MX E2M1 + shared E8M0) ─
 #
-# Block layout:
-#   uint8_t shared_exp  — E8M0 shared exponent: actual scale = 2^(exp − 127)
-#   uint8_t qs[16]      — 32 × 4-bit E2M1 values packed as nibbles
+# Block layout (matches llama.cpp's block_mxfp4):
+#   uint8_t e           — E8M0 shared exponent
+#   uint8_t qs[16]      — 32 × 4-bit E2M1 values, split-half packed:
+#                         low nibble  = elements 0..15
+#                         high nibble = elements 16..31
 #   Total: 1 + 16 = 17 bytes
 #
-# E2M1 FP4 representable unsigned values:
-#   index  bits   value
-#   0      000    0.0     (zero)
-#   1      001    0.5     (subnormal: 0.1₂ × 2^0)
-#   2      010    1.0     (1.0₂ × 2^0)
-#   3      011    1.5     (1.1₂ × 2^0)
-#   4      100    2.0     (1.0₂ × 2^1)
-#   5      101    3.0     (1.1₂ × 2^1)
-#   6      110    4.0     (1.0₂ × 2^2)
-#   7      111    6.0     (1.1₂ × 2^2)
-# With sign bit (bit 3): 16 codes total, ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}
+# The kvalues_mxfp4 lookup table (from ggml) stores E2M1 values DOUBLED:
+#   {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12}
+#   indices 0-7 = positive, 8-15 = negative (bit 3 = sign)
+#
+# Dequant: value = kvalues_mxfp4[nibble] * E8M0_TO_FP32_HALF(e)
+# where E8M0_TO_FP32_HALF(e) = 2^(e-127) / 2
+#
+# So the effective scale is halved, compensating for the doubled table.
+# This means: value = (E2M1_level * 2) * (2^(e-127) / 2) = E2M1_level * 2^(e-127)
+#
+# Exponent formula (from llama.cpp quantize_row_mxfp4_ref):
+#   e = floor(log2(amax)) - 2 + 127
 
-_E2M1_UNSIGNED = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-                           dtype=np.float32)
-# Midpoints between consecutive unsigned E2M1 levels, for nearest-level lookup
-_E2M1_MIDPOINTS = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
-                            dtype=np.float32)
+# Doubled E2M1 values (matches ggml's kvalues_mxfp4)
+_KVALUES_MXFP4 = np.array(
+    [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12],
+    dtype=np.float32,
+)
+
+# Midpoints for nearest-level search on the unsigned doubled values {0,1,2,3,4,6,8,12}
+_MXFP4_UNSIGNED_DOUBLED = np.array([0, 1, 2, 3, 4, 6, 8, 12], dtype=np.float32)
+_MXFP4_MIDPOINTS = np.array([0.5, 1.5, 2.5, 3.5, 5.0, 7.0, 10.0], dtype=np.float32)
 
 
 def _encode_ggml_mxfp4(flat: np.ndarray) -> bytes:
-    """MXFP4 (OCP MX FP4): E2M1 values with per-block E8M0 shared exponent."""
+    """MXFP4 encoder matching llama.cpp's quantize_row_mxfp4_ref exactly."""
     flat = _pad_to(flat, 32)
     n_blocks = len(flat) // 32
     blocks = flat.reshape(n_blocks, 32)
 
-    # Compute shared exponent per block.
-    # The max representable magnitude with E2M1 is 6.0 × 2^(exp−127).
-    # So exp = ceil(log2(max_abs / 6)) + 127, clamped to [0, 254].
-    # (exp=255 is reserved for special values in some specs; we avoid it.)
+    # Shared exponent: e = floor(log2(amax)) - 2 + 127
+    # (matches llama.cpp line 290)
     amax = np.max(np.abs(blocks), axis=1)  # (n_blocks,)
-    # Avoid log2(0)
     safe_amax = np.where(amax > 0, amax, 1.0)
-    raw_exp = np.ceil(np.log2(safe_amax / 6.0)) + 127.0
-    shared_exp = np.where(amax > 0, raw_exp, 0.0).clip(0, 254).astype(np.uint8)
+    raw_exp = np.floor(np.log2(safe_amax)).astype(np.int32) - 2 + 127
+    shared_exp = np.where(amax > 0, raw_exp, 0).clip(0, 254).astype(np.uint8)
 
-    # Effective scale per block: 2^(shared_exp − 127)
-    scale = np.ldexp(np.ones(n_blocks, dtype=np.float64),
-                     shared_exp.astype(np.int32) - 127).astype(np.float32)
+    # Effective scale: E8M0_TO_FP32_HALF(e) = 2^(e-127) / 2
+    # The doubled table compensates, so actual element scale = 2^(e-127)
+    # But for quantization we compare against the doubled table values,
+    # so we use the HALF scale as the per-element multiplier.
+    d = np.ldexp(np.ones(n_blocks, dtype=np.float64),
+                 shared_exp.astype(np.int32) - 127).astype(np.float32) / 2.0
 
-    # Scale elements into the E2M1 range [-6, +6]
-    inv_scale = np.where(scale > 0, 1.0 / scale, 0.0)
-    scaled = blocks * inv_scale[:, None]  # (n_blocks, 32)
+    # For each element, find the best index in kvalues_mxfp4
+    # kvalues[i] * d ≈ element  =>  element / d ≈ kvalues[i]
+    inv_d = np.where(d > 0, 1.0 / d, 0.0)
+    scaled = blocks * inv_d[:, None]  # (n_blocks, 32) — in doubled-table units
 
-    # Quantize: find nearest unsigned E2M1 level, then apply sign
-    signs = (scaled < 0).astype(np.uint8)              # (n_blocks, 32)
+    # Find nearest level: separate sign, search unsigned
+    signs = (scaled < 0).astype(np.uint8)
     abs_scaled = np.abs(scaled)
-    # searchsorted on midpoints gives the index of the nearest E2M1 level
-    unsigned_idx = np.searchsorted(_E2M1_MIDPOINTS, abs_scaled).astype(np.uint8)
-    # unsigned_idx is 0..7, sign is 0 or 1
-    codes = unsigned_idx | (signs << 3)  # 4-bit code: bit3=sign, bits0-2=level
+    unsigned_idx = np.searchsorted(_MXFP4_MIDPOINTS, abs_scaled).astype(np.uint8)
+    # Combine: bits 0-2 = unsigned index, bit 3 = sign
+    codes = unsigned_idx | (signs << 3)  # (n_blocks, 32)
 
-    # Pack 32 nibbles into 16 bytes per block
-    lo = codes[:, 0::2] & 0x0F
-    hi = codes[:, 1::2] & 0x0F
-    packed = (lo | (hi << 4)).astype(np.uint8)  # (n_blocks, 16)
+    # Split-half nibble packing (matches llama.cpp):
+    # Low nibble = first half (elements 0..15)
+    # High nibble = second half (elements 16..31)
+    first_half = codes[:, :16]   # elements 0..15
+    second_half = codes[:, 16:]  # elements 16..31
+    packed = ((first_half & 0x0F) | ((second_half & 0x0F) << 4)).astype(np.uint8)
 
-    # Assemble blocks: 1B exponent + 16B nibbles = 17B
+    # Assemble: 1B exponent + 16B packed nibbles = 17B
     result = np.empty((n_blocks, 17), dtype=np.uint8)
     result[:, 0] = shared_exp
     result[:, 1:] = packed
