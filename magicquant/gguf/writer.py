@@ -307,21 +307,38 @@ class GGUFWriter:
                 target_ggml_name = scheme_map.get(scheme, "Q4_0")
                 target_ggml_id = GGML_TYPE.get(target_ggml_name, GGML_TYPE["Q4_0"])
 
+                # 1D tensors (norms, biases) must stay at F32.  llama.cpp
+                # uses f32 binary ops (e.g. element-wise mul in RMSNorm) and
+                # does not support quantised or BF16 operands.  These tensors
+                # are tiny so keeping them at F32 has negligible size impact.
+                if n_dims <= 1 and target_ggml_name != "F32":
+                    if verbose:
+                        print(f"  [COMPAT] {name}: 1D tensor (norm/bias), keeping at F32")
+                    target_ggml_name = "F32"
+                    target_ggml_id = GGML_TYPE["F32"]
+
+                # BF16 → F16 conversion: llama.cpp has incomplete BF16
+                # support in its compute graph (binary ops, some matmuls
+                # assert sizeof(float) stride).  F16 is universally supported.
+                if target_ggml_name == "BF16":
+                    target_ggml_name = "F16"
+                    target_ggml_id = GGML_TYPE["F16"]
+
                 # Block-size compatibility check: quantized types require the
                 # contiguous row dimension (ne[0] in GGUF) to be a multiple of
                 # the block size.  The writer stores shapes in row-major order
                 # and reverses when writing, so ne[0] = shape[-1].  Fall back
-                # to BF16 for tensors that don't meet the requirement (e.g.
-                # conv1d weights with 4-element rows, SSM layers, or vision
-                # tensors with non-power-of-2 dimensions).
+                # to F32 for tensors that don't meet the requirement.  F32 is
+                # used (not F16) because some ops (SSM conv1d) assert F32
+                # operands.  These tensors are small, so F32 is negligible.
                 row_size = shape[-1] if len(shape) >= 1 else 1
                 block_size = GGML_BLOCK_SIZE.get(target_ggml_name, 1)
                 if block_size > 1 and row_size % block_size != 0:
                     if verbose:
                         print(f"  [COMPAT] {name}: row_size={row_size} not divisible by "
-                              f"{target_ggml_name} block_size={block_size}, falling back to BF16")
-                    target_ggml_name = "BF16"
-                    target_ggml_id = GGML_TYPE["BF16"]
+                              f"{target_ggml_name} block_size={block_size}, falling back to F32")
+                    target_ggml_name = "F32"
+                    target_ggml_id = GGML_TYPE["F32"]
 
                 n_elems = _tensor_n_elements(shape)
 

@@ -14,6 +14,38 @@ import re
 import numpy as np
 
 
+def _flatten_to_max_dims(shape: List[int], max_dims: int = 4) -> List[int]:
+    """Normalize tensor shape for GGUF compatibility.
+
+    1. Squeeze singleton (size-1) inner dimensions.  For example,
+       Conv1d weights [8192, 1, 4] become [8192, 4].
+    2. Merge trailing dimensions so len(shape) <= max_dims.  GGUF only
+       supports up to GGML_MAX_DIMS (4) dimensions.  For example,
+       Conv3d weights [1152, 3, 2, 16, 16] become [1152, 3, 2, 256].
+
+    The total element count is always preserved.
+    """
+    # Step 1: squeeze singleton dims (keep first and last dims intact
+    # to avoid collapsing a scalar or vector)
+    if len(shape) > 2:
+        squeezed = [shape[0]]
+        for d in shape[1:-1]:
+            if d != 1:
+                squeezed.append(d)
+        squeezed.append(shape[-1])
+        shape = squeezed
+
+    # Step 2: merge trailing dims if still > max_dims
+    if len(shape) <= max_dims:
+        return shape
+    keep = shape[:max_dims - 1]
+    merge = shape[max_dims - 1:]
+    merged = 1
+    for d in merge:
+        merged *= d
+    return keep + [merged]
+
+
 class ModelSource(ABC):
     """Abstract interface for a model source (GGUF or safetensors)."""
 
@@ -140,6 +172,11 @@ _HF_TO_GGUF_PATTERNS = [
     # QKV fused (some models)
     (r"^model\.layers\.(\d+)\.self_attn\.qkv_proj\.weight$",
      lambda m: f"blk.{m.group(1)}.attn_qkv.weight"),
+    # Attention Q/K norms (Qwen3.5 full-attention layers, also Cohere/Gemma)
+    (r"^model\.layers\.(\d+)\.self_attn\.q_norm\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_q_norm.weight"),
+    (r"^model\.layers\.(\d+)\.self_attn\.k_norm\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_k_norm.weight"),
     # Per-layer FFN
     (r"^model\.layers\.(\d+)\.mlp\.up_proj\.weight$",
      lambda m: f"blk.{m.group(1)}.ffn_up.weight"),
@@ -164,13 +201,38 @@ _HF_TO_GGUF_PATTERNS = [
      lambda m: f"blk.{m.group(1)}.ffn_gate_exps.{m.group(2)}.weight"),
     (r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\.weight$",
      lambda m: f"blk.{m.group(1)}.ffn_down_exps.{m.group(2)}.weight"),
+    # Qwen3.5 linear attention (SSM/Mamba-style) layers
+    (r"^model\.layers\.(\d+)\.linear_attn\.in_proj_qkv\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_qkv.weight"),
+    (r"^model\.layers\.(\d+)\.linear_attn\.in_proj_z\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_gate.weight"),
+    (r"^model\.layers\.(\d+)\.linear_attn\.in_proj_a\.weight$",
+     lambda m: f"blk.{m.group(1)}.ssm_alpha.weight"),
+    (r"^model\.layers\.(\d+)\.linear_attn\.in_proj_b\.weight$",
+     lambda m: f"blk.{m.group(1)}.ssm_beta.weight"),
+    (r"^model\.layers\.(\d+)\.linear_attn\.A_log$",
+     lambda m: f"blk.{m.group(1)}.ssm_a"),
+    (r"^model\.layers\.(\d+)\.linear_attn\.conv1d\.weight$",
+     lambda m: f"blk.{m.group(1)}.ssm_conv1d.weight"),
+    (r"^model\.layers\.(\d+)\.linear_attn\.dt_bias$",
+     lambda m: f"blk.{m.group(1)}.ssm_dt.bias"),
+    (r"^model\.layers\.(\d+)\.linear_attn\.norm\.weight$",
+     lambda m: f"blk.{m.group(1)}.ssm_norm.weight"),
+    (r"^model\.layers\.(\d+)\.linear_attn\.out_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.ssm_out.weight"),
 ]
 
 _HF_TO_GGUF_COMPILED = [(re.compile(p), r) for p, r in _HF_TO_GGUF_PATTERNS]
 
 
-def _hf_name_to_gguf(hf_name: str) -> str:
-    """Convert a HuggingFace tensor name to GGUF convention."""
+def _hf_name_to_gguf(hf_name: str, arch: str = "") -> str:
+    """Convert a HuggingFace tensor name to GGUF convention.
+
+    Args:
+        hf_name: The original HuggingFace tensor name.
+        arch: GGUF architecture string (e.g. "qwen35") for arch-specific
+              name adjustments.
+    """
     # Handle top-level output/lm_head directly
     if hf_name in ("output.weight", "lm_head.weight"):
         return "output.weight"
@@ -186,8 +248,14 @@ def _hf_name_to_gguf(hf_name: str) -> str:
         m = pattern.match(stripped)
         if m:
             if callable(replacement):
-                return replacement(m)
-            return replacement
+                result = replacement(m)
+            else:
+                result = replacement
+            # Architecture-specific name adjustments:
+            # Qwen3.5 uses "post_attention_norm" instead of "ffn_norm"
+            if arch in ("qwen35", "qwen35moe") and ".ffn_norm." in result:
+                result = result.replace(".ffn_norm.", ".post_attention_norm.")
+            return result
     # Fallback: keep original name
     return hf_name
 
@@ -259,7 +327,10 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
     meta["general.architecture"] = arch
     meta["general.name"] = effective.get("_name_or_path", config.get("_name_or_path", model_type))
 
-    # Map config.json fields to GGUF metadata keys
+    # Map config.json fields to GGUF metadata keys.
+    # Note: vocab_size is intentionally omitted -- llama.cpp infers it
+    # from the tokenizer token count.  Setting it explicitly causes
+    # mismatches for multimodal models with padded vocabularies.
     field_map = {
         "max_position_embeddings": f"{arch}.context_length",
         "hidden_size":             f"{arch}.embedding_length",
@@ -269,7 +340,6 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "intermediate_size":       f"{arch}.feed_forward_length",
         "rope_theta":              f"{arch}.rope.freq_base",
         "rms_norm_eps":            f"{arch}.attention.layer_norm_rms_epsilon",
-        "vocab_size":              f"{arch}.vocab_size",
     }
 
     for hf_key, gguf_key in field_map.items():
@@ -279,6 +349,66 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(val, float) and val == int(val) and "epsilon" not in hf_key and "theta" not in hf_key:
                 val = int(val)
             meta[gguf_key] = val
+
+    # ── Architecture-specific metadata ──
+    # Qwen3.5 requires several additional keys that llama.cpp checks for:
+    #   - rope.dimension_sections (MRoPE sections from rope_parameters)
+    #   - rope.freq_base, rope.dimension_count
+    #   - attention.key_length, attention.value_length
+    #   - full_attention_interval (hybrid attention pattern)
+    #   - ssm.* fields (for linear attention / Mamba-style layers)
+    if arch in ("qwen35", "qwen35moe"):
+        rope_params = effective.get("rope_parameters", {})
+
+        # MRoPE dimension sections [time, height, width, extra] -- padded to 4
+        mrope = rope_params.get("mrope_section", [])
+        if mrope:
+            sections = list(mrope)
+            while len(sections) < 4:
+                sections.append(0)
+            meta[f"{arch}.rope.dimension_sections"] = sections[:4]
+
+        # rope.freq_base from rope_parameters.rope_theta (takes priority
+        # over the generic field_map which reads the top-level rope_theta)
+        rope_theta = rope_params.get("rope_theta")
+        if rope_theta is not None:
+            meta[f"{arch}.rope.freq_base"] = float(rope_theta)
+
+        # rope.dimension_count = partial_rotary_factor * head_dim
+        head_dim = effective.get("head_dim",
+                                 effective.get("hidden_size", 0) //
+                                 max(effective.get("num_attention_heads", 1), 1))
+        partial_rotary = effective.get("partial_rotary_factor",
+                                       rope_params.get("partial_rotary_factor", 1.0))
+        rope_dim_count = int(partial_rotary * head_dim)
+        if rope_dim_count > 0:
+            meta[f"{arch}.rope.dimension_count"] = rope_dim_count
+
+        # attention key/value lengths
+        if head_dim > 0:
+            meta[f"{arch}.attention.key_length"] = head_dim
+            meta[f"{arch}.attention.value_length"] = head_dim
+
+        # full_attention_interval (hybrid attention pattern)
+        fai = effective.get("full_attention_interval")
+        if fai is not None:
+            meta[f"{arch}.full_attention_interval"] = int(fai)
+
+        # SSM / linear attention fields
+        linear_key_head_dim = effective.get("linear_key_head_dim")
+        linear_num_key_heads = effective.get("linear_num_key_heads")
+        linear_num_value_heads = effective.get("linear_num_value_heads")
+        linear_value_head_dim = effective.get("linear_value_head_dim")
+        conv_kernel = effective.get("linear_conv_kernel_dim")
+
+        if linear_key_head_dim is not None and linear_num_key_heads is not None:
+            meta[f"{arch}.ssm.state_size"] = int(linear_key_head_dim)
+            meta[f"{arch}.ssm.group_count"] = int(linear_num_key_heads)
+        if linear_num_value_heads is not None and linear_value_head_dim is not None:
+            meta[f"{arch}.ssm.inner_size"] = int(linear_num_value_heads * linear_value_head_dim)
+            meta[f"{arch}.ssm.time_step_rank"] = int(linear_num_value_heads)
+        if conv_kernel is not None:
+            meta[f"{arch}.ssm.conv_kernel"] = int(conv_kernel)
 
     return meta
 
@@ -317,6 +447,32 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
         # Sort by ID to get ordered token list
         sorted_tokens = sorted(vocab.items(), key=lambda x: x[1])
         max_id = sorted_tokens[-1][1] if sorted_tokens else 0
+
+        # Added tokens may have IDs beyond the base vocab (e.g. Qwen3.5
+        # special tokens at 248044+).  Also, config.json vocab_size may be
+        # larger still (padding for alignment).  Allocate enough room for
+        # all of them.
+        added = tok.get("added_tokens", [])
+        if added:
+            max_added_id = max(at.get("id", -1) for at in added)
+            max_id = max(max_id, max_added_id)
+
+        # If a config.json exists, use its vocab_size to pad the token
+        # list so it matches the embedding tensor dimension.
+        config_path_for_vocab = os.path.join(model_dir, "config.json")
+        if os.path.exists(config_path_for_vocab):
+            with open(config_path_for_vocab) as _f:
+                _cfg = json.load(_f)
+            # Resolve nested text_config for multimodal models
+            _eff = _cfg
+            for _sub in ("text_config", "language_config", "llm_config"):
+                if _sub in _cfg and isinstance(_cfg[_sub], dict):
+                    _eff = {**_cfg, **_cfg[_sub]}
+                    break
+            cfg_vocab_size = _eff.get("vocab_size", 0)
+            if cfg_vocab_size > max_id + 1:
+                max_id = cfg_vocab_size - 1
+
         tokens = [""] * (max_id + 1)
         scores = [0.0] * (max_id + 1)
         token_types = [0] * (max_id + 1)  # 0 = normal
@@ -325,8 +481,7 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
             if token_id < len(tokens):
                 tokens[token_id] = token_str
 
-        # Check added_tokens for special tokens
-        added = tok.get("added_tokens", [])
+        # Fill in added_tokens (special tokens with IDs beyond base vocab)
         for at in added:
             tid = at.get("id", -1)
             content = at.get("content", "")
@@ -359,6 +514,16 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
             "unk_token": "tokenizer.ggml.unknown_token_id",
         }
 
+        # Build a complete token->id lookup including added tokens
+        # (special tokens like <|im_end|> are often only in added_tokens,
+        # not in the base BPE vocab)
+        all_token_ids = dict(vocab)
+        for at in added:
+            content = at.get("content", "")
+            tid = at.get("id", -1)
+            if content and tid >= 0:
+                all_token_ids[content] = tid
+
         for hf_key, gguf_key in special_map.items():
             val = tok_cfg.get(hf_key)
             if val is None:
@@ -366,8 +531,8 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
             # Value can be a string or a dict with "content" key
             if isinstance(val, dict):
                 val = val.get("content", "")
-            if isinstance(val, str) and val in vocab:
-                meta[gguf_key] = vocab[val]
+            if isinstance(val, str) and val in all_token_ids:
+                meta[gguf_key] = all_token_ids[val]
 
         # Chat template
         chat_template = tok_cfg.get("chat_template")
@@ -435,6 +600,18 @@ class SafetensorsSource(ModelSource):
                         f"No safetensors files found in {self._model_dir}"
                     )
 
+        # Load metadata from config.json first — we need the architecture
+        # to apply arch-specific tensor name mappings.
+        config_path = os.path.join(self._model_dir, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                config = json.load(f)
+            self._metadata = _build_gguf_metadata_from_config(config)
+        else:
+            self._metadata = {"general.architecture": "llama"}
+
+        arch = self._metadata.get("general.architecture", "llama")
+
         # Parse headers from all files
         for filepath in list(self._files.keys()):
             header, data_start = self._parse_header(filepath)
@@ -443,33 +620,44 @@ class SafetensorsSource(ModelSource):
             for hf_name, info in header.items():
                 if hf_name.startswith("__"):
                     continue
-                gguf_name = _hf_name_to_gguf(hf_name)
+
+                # Strip multimodal prefixes before mapping
+                stripped = hf_name
+                for prefix in ("model.language_model.", "language_model."):
+                    if stripped.startswith(prefix):
+                        stripped = "model." + stripped[len(prefix):]
+                        break
+
+                # Skip vision encoder and MTP (multi-token prediction)
+                # tensors — vision tensors belong in a separate mmproj GGUF,
+                # and MTP tensors are not used by llama.cpp inference.
+                # Including them causes assertion failures during load.
+                if stripped.startswith("model.visual.") or hf_name.startswith("mtp."):
+                    continue
+
+                gguf_name = _hf_name_to_gguf(hf_name, arch=arch)
                 dtype = info.get("dtype", "F32")
                 shape = info.get("shape", [])
                 offsets = info.get("data_offsets", [0, 0])
+
+                # GGUF supports at most GGML_MAX_DIMS (4) dimensions.
+                # Merge trailing dims for tensors that exceed this (e.g.
+                # Conv3d patch_embed weights with shape [1152, 3, 2, 16, 16]).
+                gguf_shape = _flatten_to_max_dims(list(shape), max_dims=4)
 
                 self._tensor_map[gguf_name] = {
                     "hf_name": hf_name,
                     "gguf_name": gguf_name,
                     "dtype": dtype,
-                    "shape": list(shape),  # row-major (same as GGUFReader convention)
-                    "shape_orig": shape,
-                    "n_dims": len(shape),
+                    "shape": gguf_shape,  # row-major, at most 4-D
+                    "shape_orig": list(shape),
+                    "n_dims": len(gguf_shape),
                     "data_type": _ST_DTYPE_TO_GGML.get(dtype, 0),
                     "filepath": filepath,
                     "byte_offset": offsets[0],
                     "byte_length": offsets[1] - offsets[0],
                     "data_start": data_start,
                 }
-
-        # Load metadata from config.json
-        config_path = os.path.join(self._model_dir, "config.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                config = json.load(f)
-            self._metadata = _build_gguf_metadata_from_config(config)
-        else:
-            self._metadata = {"general.architecture": "llama"}
 
         # Load tokenizer data
         tokenizer_meta = _build_tokenizer_metadata(self._model_dir)
