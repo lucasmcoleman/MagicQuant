@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 from magicquant.quant.converters import (
     encode_to_ggml_bytes,
     ggml_tensor_data_size,
+    GGML_BLOCK_SIZE,
 )
 
 
@@ -305,6 +306,22 @@ class GGUFWriter:
                 scheme = group_schemes.get(group, base_quant)
                 target_ggml_name = scheme_map.get(scheme, "Q4_0")
                 target_ggml_id = GGML_TYPE.get(target_ggml_name, GGML_TYPE["Q4_0"])
+
+                # Block-size compatibility check: quantized types require the
+                # contiguous row dimension (ne[0] in GGUF) to be a multiple of
+                # the block size.  The writer stores shapes in row-major order
+                # and reverses when writing, so ne[0] = shape[-1].  Fall back
+                # to BF16 for tensors that don't meet the requirement (e.g.
+                # conv1d weights with 4-element rows, SSM layers, or vision
+                # tensors with non-power-of-2 dimensions).
+                row_size = shape[-1] if len(shape) >= 1 else 1
+                block_size = GGML_BLOCK_SIZE.get(target_ggml_name, 1)
+                if block_size > 1 and row_size % block_size != 0:
+                    if verbose:
+                        print(f"  [COMPAT] {name}: row_size={row_size} not divisible by "
+                              f"{target_ggml_name} block_size={block_size}, falling back to BF16")
+                    target_ggml_name = "BF16"
+                    target_ggml_id = GGML_TYPE["BF16"]
 
                 n_elems = _tensor_n_elements(shape)
 
