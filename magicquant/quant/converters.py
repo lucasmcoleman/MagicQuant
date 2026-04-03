@@ -933,11 +933,24 @@ def encode_to_ggml_bytes(weights: np.ndarray, ggml_type_name: str) -> bytes:
 
     Args:
         weights: Float32 numpy array (any shape — will be flattened).
+            Must be a floating-point dtype (float16, bfloat16, float32, float64).
+            Integer or pre-quantized dtypes are rejected to prevent silent
+            corruption.
         ggml_type_name: Target ggml type (e.g. "Q8_0", "Q4_K", "BF16").
 
     Returns:
         Raw bytes in the on-disk ggml block layout.
+
+    Raises:
+        ValueError: If weights has a non-floating dtype or the target type
+            has no encoder.
     """
+    if not np.issubdtype(weights.dtype, np.floating):
+        raise ValueError(
+            f"encode_to_ggml_bytes requires floating-point input, "
+            f"got dtype={weights.dtype}. Integer or pre-quantized tensors "
+            f"cannot be re-quantized — use a BF16/F16/F32 source model."
+        )
     encoder = _GGML_ENCODERS.get(ggml_type_name)
     if encoder is None:
         raise ValueError(

@@ -16,6 +16,7 @@ Architecture:
 """
 
 from typing import Dict, List, Any, Optional
+from pathlib import Path
 import struct
 import os
 import time
@@ -205,6 +206,16 @@ def _read_encode_worker(source, entries, result_queue):
             f32 = source.read_tensor_f32(name)
 
             if can_decode and f32 is not None:
+                # Validate dtype before quantization dispatch.
+                # Source should return float32, but guard against bugs
+                # in source implementations that could return integer or
+                # pre-quantized data, which would silently corrupt output.
+                if not np.issubdtype(f32.dtype, np.floating):
+                    raise ValueError(
+                        f"Tensor {name}: expected floating-point data from "
+                        f"source but got dtype={f32.dtype}. Source model may "
+                        f"be pre-quantized. Use a BF16/F16/F32 source."
+                    )
                 blob = encode_to_ggml_bytes(f32, target)
             elif f32 is not None:
                 blob = f32.view(np.uint8).tobytes()
@@ -412,12 +423,23 @@ class GGUFWriter:
             import json
             self.metadata["magicquant.group_schemes"] = json.dumps(group_schemes)
 
-            # Set general.file_type for llama.cpp compatibility
-            if base_quant == "MXFP4_MOE":
-                # No dedicated llama_ftype for MXFP4 hybrid; use MOSTLY_F16 as safe fallback
-                self.metadata["general.file_type"] = 1
-            else:
-                self.metadata["general.file_type"] = 1
+            # Set general.file_type for llama.cpp compatibility.
+            # llama.cpp uses this to report the quantization type. Map the dominant
+            # scheme to the closest standard llama_ftype enum value.
+            _ftype_map = {
+                "Q8_0": 7, "Q5_K": 16, "Q5_K_M": 17, "Q4_K": 12,
+                "Q4_K_M": 15, "Q6_K": 18, "Q3_K": 11, "Q2_K": 10,
+                "IQ4_NL": 20, "MXFP4": 1, "MXFP4_MOE": 1,
+                "BF16": 32, "F16": 1, "F32": 0,
+            }
+            # Use the base quant's ftype, or fall back to the most common group scheme
+            ftype = _ftype_map.get(base_quant)
+            if ftype is None:
+                from collections import Counter
+                scheme_counts = Counter(group_schemes.values())
+                most_common = scheme_counts.most_common(1)[0][0] if scheme_counts else "F16"
+                ftype = _ftype_map.get(most_common, 1)
+            self.metadata["general.file_type"] = ftype
 
             filtered_meta = {k: v for k, v in self.metadata.items() if v is not None}
 
@@ -428,7 +450,7 @@ class GGUFWriter:
                 print(f"\nWriting output: {self.output_path}")
                 print(f"Tensors: {len(tensor_entries)}")
 
-            os.makedirs(os.path.dirname(os.path.abspath(self.output_path)), exist_ok=True)
+            Path(self.output_path).resolve().parent.mkdir(parents=True, exist_ok=True)
 
             t_start = time.monotonic()
 
@@ -522,7 +544,7 @@ class GGUFWriter:
                 worker.join(timeout=5)
 
             elapsed = time.monotonic() - t_start
-            output_size_mb = os.path.getsize(self.output_path) / (1024 * 1024)
+            output_size_mb = Path(self.output_path).stat().st_size / (1024 * 1024)
             if verbose:
                 print(f"Done. {output_size_mb:.1f} MB in {elapsed:.1f}s "
                       f"({output_size_mb / max(elapsed, 0.001):.0f} MB/s)")

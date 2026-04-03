@@ -11,11 +11,15 @@ license = {text = "MIT"}
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.21.0",
+    "pydantic-settings>=2.0.0",
+    "structlog>=24.0.0",
+    "tenacity>=8.2.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
 yaml = ["pyyaml>=6.0"]
-dev = ["pytest>=7.0.0"]
+dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0"]
 
 [project.scripts]
 magicquant = "magicquant.__main__:main"

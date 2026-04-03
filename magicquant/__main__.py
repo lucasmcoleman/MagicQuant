@@ -11,17 +11,20 @@ Usage:
 
 import argparse
 import sys
-import os
 import json
+from pathlib import Path
+
+from magicquant.logging import configure_logging, get_logger
 
 
-def cmd_analyze(args):
+def cmd_analyze(args: argparse.Namespace) -> None:
     """Analyze model structure and tensor groups."""
     from magicquant.gguf.reader import GGUFReader
     from magicquant.gguf.tensor_groups import TensorGroupClassifier
 
-    print(f"Analyzing: {args.model}")
-    print()
+    log = get_logger("analyze")
+
+    log.info("Analyzing model", model=args.model)
 
     reader = GGUFReader(args.model)
     reader.open()
@@ -68,12 +71,13 @@ def cmd_analyze(args):
     reader.close()
 
 
-def cmd_probe(args):
+def cmd_probe(args: argparse.Namespace) -> None:
     """Run sensitivity probes on model."""
     from magicquant.evolution.probing import SensitivityProber, SensitivityAnalysis
 
-    print(f"Running sensitivity probes on: {args.model}")
-    print()
+    log = get_logger("probe")
+
+    log.info("Running sensitivity probes", model=args.model)
 
     baseline_ppl = args.baseline_ppl if hasattr(args, 'baseline_ppl') and args.baseline_ppl else 5.0
 
@@ -84,15 +88,16 @@ def cmd_probe(args):
         from magicquant.utils.llamacpp import LlamaCppTools
         llama_tools = LlamaCppTools(llamacpp_path)
     except Exception:
-        print("llama.cpp not found — using heuristic sensitivity estimates")
+        log.info("llama.cpp not found, using heuristic sensitivity estimates")
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     prober = SensitivityProber(
         base_model_path=args.model,
         baseline_perplexity=baseline_ppl,
         perplexity_calculator=llama_tools,
-        output_dir=os.path.join(args.output_dir, "_probes"),
+        output_dir=str(output_dir / "_probes"),
     )
 
     groups = ['E', 'H', 'Q', 'K', 'O', 'U', 'D']
@@ -116,13 +121,13 @@ def cmd_probe(args):
         print(f"  {group}: sensitivity={score:.4f}")
 
     # Save results
-    output_file = os.path.join(args.output_dir, "sensitivity.json")
-    prober.save_results(output_file)
+    output_file = output_dir / "sensitivity.json"
+    prober.save_results(str(output_file))
 
     print(f"\nSensitivity data saved to: {output_file}")
 
 
-def cmd_search(args):
+def cmd_search(args: argparse.Namespace) -> None:
     """Run evolutionary search to find optimal configurations."""
     from magicquant.orchestrator import MagicQuantOrchestrator
 
@@ -156,10 +161,11 @@ def cmd_search(args):
             verbose=True,
         )
 
-    print(f"\nResults saved to: {os.path.join(args.output_dir, 'search_results.json')}")
+    results_path = Path(args.output_dir) / "search_results.json"
+    print(f"\nResults saved to: {results_path}")
 
 
-def cmd_hybrid(args):
+def cmd_hybrid(args: argparse.Namespace) -> None:
     """Generate hybrid GGUF from a YAML config file."""
     try:
         import yaml
@@ -168,11 +174,12 @@ def cmd_hybrid(args):
         print("Install it with: pip install pyyaml")
         sys.exit(1)
 
-    if not os.path.exists(args.config):
-        print(f"Error: Config file not found: {args.config}")
+    config_path = Path(args.config)
+    if not config_path.exists():
+        print(f"Error: Config file not found: {config_path}")
         sys.exit(1)
 
-    with open(args.config) as f:
+    with open(config_path) as f:
         config = yaml.safe_load(f)
 
     model_cfg = config.get('model', {})
@@ -187,16 +194,17 @@ def cmd_hybrid(args):
         print("Error: 'model.source' is required in the config file.")
         sys.exit(1)
 
-    if not os.path.exists(source_path):
+    if not Path(source_path).exists():
         print(f"Error: Source model not found: {source_path}")
         sys.exit(1)
 
     from magicquant.utils.naming import generate_name
     from magicquant.gguf.writer import create_hybrid_gguf
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     output_filename = generate_name(model_name, base_quant, group_overrides)
-    output_path = os.path.join(args.output_dir, output_filename)
+    output_path = output_dir / output_filename
 
     print(f"Generating hybrid GGUF:")
     print(f"  Source:    {source_path}")
@@ -206,22 +214,23 @@ def cmd_hybrid(args):
     print()
 
     result = create_hybrid_gguf(
-        output_path=output_path,
+        output_path=str(output_path),
         base_model_path=source_path,
         quant_config={'base': base_quant, 'groups': group_overrides},
-        verbose=True
+        verbose=True,
     )
 
     print(f"\nCreated: {result}")
 
 
-def cmd_generate(args):
+def cmd_generate(args: argparse.Namespace) -> None:
     """Generate hybrid GGUF models from search results JSON."""
     from magicquant.orchestrator import MagicQuantOrchestrator
 
-    results_file = os.path.join(args.output_dir, "search_results.json")
+    output_dir = Path(args.output_dir)
+    results_file = output_dir / "search_results.json"
 
-    if not os.path.exists(results_file):
+    if not results_file.exists():
         print(f"Error: Search results not found at {results_file}")
         print("Please run 'magicquant search' first")
         sys.exit(1)
@@ -246,7 +255,7 @@ def cmd_generate(args):
     else:
         orchestrator.baseline_ppl = None
 
-    model_name_prefix = os.path.splitext(os.path.basename(args.model))[0]
+    model_name_prefix = Path(args.model).stem
 
     # Parse requested tiers (e.g., "Q4,Q5,Q6" or "Q4")
     tiers = [t.strip() for t in args.tiers.split(",")]
@@ -279,10 +288,88 @@ def cmd_generate(args):
         print(f"  {p}")
 
 
-def main():
+def cmd_dry_run(args: argparse.Namespace) -> None:
+    """Validate configuration and source model without running search."""
+    from magicquant.config import MagicQuantSettings
+
+    log = get_logger("dry_run")
+
+    log.info("Dry run: validating configuration")
+
+    # Build settings from CLI args (mirroring what the search command uses)
+    settings = MagicQuantSettings(
+        source_model_path=args.model,
+        output_dir=args.output_dir,
+        llamacpp_path=getattr(args, "llamacpp_path", None),
+        adapter_path=getattr(args, "adapter", None),
+        target_base_quant=getattr(args, "target_quant", "MXFP4_MOE"),
+        search_generations=getattr(args, "generations", 30),
+        population_size=getattr(args, "population", 80),
+        measurement_rounds=getattr(args, "rounds", 3),
+    )
+
+    # Validate paths
+    errors = settings.validate_paths()
+    if errors:
+        for err in errors:
+            log.error("Validation error", error=err)
+        sys.exit(1)
+
+    # Try to open the source model to verify it is readable
+    from magicquant.gguf.source import open_model_source
+    try:
+        src = open_model_source(
+            settings.source_model_path,
+            adapter_path=settings.adapter_path,
+        )
+        tensor_names = src.get_tensor_names()
+        metadata = src.get_metadata()
+        src.close()
+    except Exception as exc:
+        log.error("Failed to open source model", error=str(exc))
+        sys.exit(1)
+
+    arch = metadata.get("general.architecture", "unknown")
+    log.info(
+        "Source model validated",
+        architecture=arch,
+        tensor_count=len(tensor_names),
+        source=settings.source_model_path,
+    )
+
+    # Check llama.cpp availability
+    if settings.llamacpp_path:
+        try:
+            from magicquant.utils.llamacpp import LlamaCppTools
+            tools = LlamaCppTools(settings.llamacpp_path)
+            log.info(
+                "llama.cpp validated",
+                quantize_tool=tools.quantize_tool,
+                perplexity_tool=tools.perplexity_tool,
+            )
+        except Exception as exc:
+            log.warning("llama.cpp not available", error=str(exc))
+
+    print()
+    print("Configuration summary:")
+    print(f"  Source model:     {settings.source_model_path}")
+    print(f"  Architecture:     {arch}")
+    print(f"  Tensors:          {len(tensor_names)}")
+    print(f"  Output dir:       {settings.output_dir}")
+    print(f"  Base quant:       {settings.target_base_quant}")
+    print(f"  Generations:      {settings.search_generations}")
+    print(f"  Population:       {settings.population_size}")
+    print(f"  Rounds:           {settings.measurement_rounds}")
+    if settings.adapter_path:
+        print(f"  Adapter:          {settings.adapter_path}")
+    print()
+    print("Dry run passed. Configuration is valid.")
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
         prog="magicquant",
-        description="Evolutionary Tensor Search for Optimal LLM Compression"
+        description="Evolutionary Tensor Search for Optimal LLM Compression",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -290,7 +377,7 @@ def main():
     # ── analyze ──────────────────────────────────────────────────────────────
     analyze_parser = subparsers.add_parser(
         "analyze",
-        help="Analyze model structure and tensor groups"
+        help="Analyze model structure and tensor groups",
     )
     analyze_parser.add_argument("model", help="Path to GGUF model file")
     analyze_parser.set_defaults(func=cmd_analyze)
@@ -298,114 +385,119 @@ def main():
     # ── probe ─────────────────────────────────────────────────────────────────
     probe_parser = subparsers.add_parser(
         "probe",
-        help="Run sensitivity probes on model"
+        help="Run sensitivity probes on model",
     )
     probe_parser.add_argument("model", help="Path to GGUF model file")
     probe_parser.add_argument(
         "--baseline-ppl",
         type=float,
         default=5.0,
-        help="Baseline perplexity of uncompressed model (default: 5.0)"
+        help="Baseline perplexity of uncompressed model (default: 5.0)",
     )
     probe_parser.add_argument(
         "--output-dir",
         default="./output",
-        help="Output directory for sensitivity data (default: ./output)"
+        help="Output directory for sensitivity data (default: ./output)",
     )
     probe_parser.add_argument(
         "--llamacpp-path",
-        help="Path to llama.cpp directory (auto-detect if omitted)"
+        help="Path to llama.cpp directory (auto-detect if omitted)",
     )
     probe_parser.set_defaults(func=cmd_probe)
 
     # ── search ────────────────────────────────────────────────────────────────
     search_parser = subparsers.add_parser(
         "search",
-        help="Run evolutionary search for optimal configurations"
+        help="Run evolutionary search for optimal configurations",
     )
     search_parser.add_argument("model", help="Path to source GGUF model (BF16/F16)")
     search_parser.add_argument(
         "--output-dir",
         default="./output",
-        help="Output directory (default: ./output)"
+        help="Output directory (default: ./output)",
     )
     search_parser.add_argument(
         "--target-quant",
         default="MXFP4_MOE",
-        help="Target base quantization (default: MXFP4_MOE)"
+        help="Target base quantization (default: MXFP4_MOE)",
     )
     search_parser.add_argument(
         "--generations",
         type=int,
         default=50,
-        help="Number of generations (default: 50)"
+        help="Number of generations (default: 50)",
     )
     search_parser.add_argument(
         "--population",
         type=int,
         default=100,
-        help="Population size (default: 100)"
+        help="Population size (default: 100)",
     )
     search_parser.add_argument(
         "--llamacpp-path",
-        help="Path to llama.cpp directory (auto-detect if omitted)"
+        help="Path to llama.cpp directory (auto-detect if omitted)",
     )
     search_parser.add_argument(
         "--rounds", type=int, default=0,
-        help="Measurement rounds (0 = prediction only, 3+ = full measured search)"
+        help="Measurement rounds (0 = prediction only, 3+ = full measured search)",
     )
     search_parser.add_argument(
         "--candidates", type=int, default=4,
-        help="Candidates to build and measure per round (default: 4)"
+        help="Candidates to build and measure per round (default: 4)",
     )
     search_parser.add_argument(
         "--adapter",
-        help="Path to LoRA adapter directory"
+        help="Path to LoRA adapter directory",
+    )
+    search_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate config and source model without running the search",
     )
     search_parser.set_defaults(func=cmd_search)
 
     # ── hybrid ────────────────────────────────────────────────────────────────
     hybrid_parser = subparsers.add_parser(
         "hybrid",
-        help="Generate hybrid GGUF from YAML config"
+        help="Generate hybrid GGUF from YAML config",
     )
     hybrid_parser.add_argument("config", help="Path to configuration YAML file")
     hybrid_parser.add_argument(
         "--output-dir",
         default="./output",
-        help="Output directory (default: ./output)"
+        help="Output directory (default: ./output)",
     )
     hybrid_parser.set_defaults(func=cmd_hybrid)
 
     # ── generate ──────────────────────────────────────────────────────────────
     generate_parser = subparsers.add_parser(
         "generate",
-        help="Generate hybrid models from evolutionary search results"
+        help="Generate hybrid models from evolutionary search results",
     )
     generate_parser.add_argument("model", help="Path to source GGUF model")
     generate_parser.add_argument(
         "--output-dir",
         default="./output",
-        help="Output directory (default: ./output)"
+        help="Output directory (default: ./output)",
     )
     generate_parser.add_argument(
         "--target-quant",
         default="MXFP4_MOE",
-        help="Target base quantization (default: MXFP4_MOE)"
+        help="Target base quantization (default: MXFP4_MOE)",
     )
     generate_parser.add_argument(
         "--tiers",
         default="Q4,Q5,Q6",
-        help="Comma-separated tiers to generate (default: Q4,Q5,Q6)"
+        help="Comma-separated tiers to generate (default: Q4,Q5,Q6)",
     )
     generate_parser.add_argument(
         "--verify",
         action="store_true",
-        help="Calculate perplexity after generation"
+        help="Calculate perplexity after generation",
     )
     generate_parser.add_argument(
         "--llamacpp-path",
-        help="Path to llama.cpp directory (auto-detect if omitted)"
+        help="Path to llama.cpp directory (auto-detect if omitted)",
     )
     generate_parser.set_defaults(func=cmd_generate)
 
@@ -415,6 +507,14 @@ def main():
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    # Configure structured logging
+    configure_logging(verbose=True)
+
+    # Handle --dry-run on the search command
+    if args.command == "search" and getattr(args, "dry_run", False):
+        cmd_dry_run(args)
+        return
 
     args.func(args)
 

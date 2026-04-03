@@ -153,6 +153,43 @@ magicquant/
   __main__.py          — CLI entry point
 ```
 
+## Configuration via Environment
+
+All settings can be provided via environment variables with `MAGICQUANT_` prefix or a `.env` file:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAGICQUANT_SOURCE_MODEL_PATH` | (required) | Path to source model |
+| `MAGICQUANT_OUTPUT_DIR` | `./output` | Output directory |
+| `MAGICQUANT_LLAMACPP_PATH` | auto-detect | Path to llama.cpp |
+| `MAGICQUANT_TARGET_BASE_QUANT` | `MXFP4_MOE` | Base quantization scheme |
+| `MAGICQUANT_SEARCH_GENERATIONS` | `30` | Generations per round |
+| `MAGICQUANT_POPULATION_SIZE` | `80` | Candidates per generation |
+| `MAGICQUANT_MEASUREMENT_ROUNDS` | `3` | Build-measure-learn cycles |
+| `MAGICQUANT_TIERS` | `["Q4","Q5","Q6"]` | Compression tiers |
+
+## Docker
+
+```bash
+docker build -t magicquant:latest .
+docker run --rm -v ./output:/app/output magicquant:latest search /data/model.gguf
+```
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+make test    # Run pytest suite
+make lint    # Syntax check
+make clean   # Remove build artifacts
+```
+
+## Known Limitations
+
+- K-quant encoders use simple min/max with RMSE optimization, not llama.cpp's full importance-matrix-weighted quantization
+- Tokenizer reading only handles BPE (tokenizer.json); SentencePiece (.model) is not supported
+- Source models must be BF16/F16/F32 — pre-quantized sources are rejected with a clear error
+
 ## License
 
-This implementation is provided as-is. The MagicQuant methodology and research are credited to [magiccodingman](https://github.com/magiccodingman).
+MIT. The MagicQuant methodology and research are credited to [magiccodingman](https://github.com/magiccodingman).

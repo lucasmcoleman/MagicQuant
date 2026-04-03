@@ -5,13 +5,20 @@ llama.cpp integration - Wrapper for calling llama.cpp quantization tools.
 import subprocess
 import os
 import re
-from typing import Dict, List, Optional, Tuple
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+
+# Default timeout for subprocess calls (seconds)
+_SUBPROCESS_TIMEOUT = 600  # 10 minutes
+_QUANTIZE_TIMEOUT = 1800   # 30 minutes for large model quantization
 
 
 class LlamaCppTools:
     """Interface to llama.cpp quantization tools."""
-    
+
     def __init__(
         self,
         llamacpp_path: Optional[str] = None,
@@ -34,71 +41,74 @@ class LlamaCppTools:
         self.perplexity_tool = self._find_perplexity_tool()
         self.data_file = data_file
         self.ctx_size = ctx_size
-        
+
     def _find_llamacpp(self) -> str:
         """Auto-detect llama.cpp installation."""
-        # Check common locations
         common_paths = [
-            "C:/llama.cpp",
-            "C:/Program Files/llama.cpp",
-            os.path.expanduser("~/llama.cpp"),
-            "/usr/local/bin",
+            Path("C:/llama.cpp"),
+            Path("C:/Program Files/llama.cpp"),
+            Path.home() / "llama.cpp",
+            Path("/usr/local/bin"),
         ]
-        
-        for path in common_paths:
-            if os.path.exists(path):
-                return path
-        
+
+        for p in common_paths:
+            if p.exists():
+                return str(p)
+
         # Try to find in PATH
+        which_cmd = "where" if os.name == "nt" else "which"
         try:
             result = subprocess.run(
-                ["where" if os.name == "nt" else "which", "llama-quantize"],
+                [which_cmd, "llama-quantize"],
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                timeout=30,
             )
-            return os.path.dirname(result.stdout.strip())
-        except subprocess.CalledProcessError:
+            return str(Path(result.stdout.strip()).parent)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             raise FileNotFoundError(
                 "Could not find llama.cpp. Please install or provide path."
             )
-    
+
     def _find_quantize_tool(self) -> str:
         """Find the quantize executable."""
         possible_names = ["llama-quantize.exe", "llama-quantize", "quantize.exe", "quantize"]
+        base = Path(self.llamacpp_path)
         search_dirs = [
-            self.llamacpp_path,
-            os.path.join(self.llamacpp_path, "build", "bin"),
-            os.path.join(self.llamacpp_path, "build"),
-            os.path.join(self.llamacpp_path, "bin"),
+            base,
+            base / "build" / "bin",
+            base / "build",
+            base / "bin",
         ]
 
         for d in search_dirs:
             for name in possible_names:
-                path = os.path.join(d, name)
-                if os.path.exists(path):
-                    return path
+                candidate = d / name
+                if candidate.exists():
+                    return str(candidate)
 
         raise FileNotFoundError(f"Could not find quantize tool in {self.llamacpp_path}")
-    
+
     def _find_perplexity_tool(self) -> str:
         """Find the perplexity executable."""
         possible_names = ["llama-perplexity.exe", "llama-perplexity", "perplexity.exe", "perplexity"]
+        base = Path(self.llamacpp_path)
         search_dirs = [
-            self.llamacpp_path,
-            os.path.join(self.llamacpp_path, "build", "bin"),
-            os.path.join(self.llamacpp_path, "build"),
-            os.path.join(self.llamacpp_path, "bin"),
+            base,
+            base / "build" / "bin",
+            base / "build",
+            base / "bin",
         ]
 
         for d in search_dirs:
             for name in possible_names:
-                path = os.path.join(d, name)
-                if os.path.exists(path):
-                    return path
+                candidate = d / name
+                if candidate.exists():
+                    return str(candidate)
 
         raise FileNotFoundError(f"Could not find perplexity tool in {self.llamacpp_path}")
-    
+
     def _resolve_data_file(self, data_file: Optional[str] = None) -> Optional[str]:
         """Resolve the dataset file for perplexity evaluation.
 
@@ -112,21 +122,23 @@ class LlamaCppTools:
         """
         candidate = data_file or self.data_file
 
-        if candidate and os.path.isfile(candidate):
-            return os.path.abspath(candidate)
+        if candidate:
+            candidate_path = Path(candidate)
+            if candidate_path.is_file():
+                return str(candidate_path.resolve())
 
         # Search common locations relative to the llama.cpp directory
+        base = Path(self.llamacpp_path)
         search_paths = [
-            os.path.join(self.llamacpp_path, "wikitext-2-raw", "wiki.test.raw"),
-            os.path.join(self.llamacpp_path, "wikitext-2", "wiki.test.raw"),
-            os.path.join(self.llamacpp_path, "models", "wikitext-2-raw", "wiki.test.raw"),
-            # One level up (build dir inside llama.cpp checkout)
-            os.path.join(self.llamacpp_path, "..", "wikitext-2-raw", "wiki.test.raw"),
+            base / "wikitext-2-raw" / "wiki.test.raw",
+            base / "wikitext-2" / "wiki.test.raw",
+            base / "models" / "wikitext-2-raw" / "wiki.test.raw",
+            base.parent / "wikitext-2-raw" / "wiki.test.raw",
         ]
 
         for p in search_paths:
-            if os.path.isfile(p):
-                return os.path.abspath(p)
+            if p.is_file():
+                return str(p.resolve())
 
         # Nothing found -- print a clear message
         print(
@@ -145,17 +157,17 @@ class LlamaCppTools:
         input_path: str,
         output_path: str,
         quant_type: str,
-        verbose: bool = True
+        verbose: bool = True,
     ) -> bool:
         """
         Quantize a model using llama.cpp.
-        
+
         Args:
             input_path: Source model (BF16/F16)
             output_path: Output quantized model
             quant_type: Quantization type (Q4_K_M, Q6_K, IQ4_NL, etc.)
             verbose: Print output
-            
+
         Returns:
             True if successful
         """
@@ -163,29 +175,57 @@ class LlamaCppTools:
             self.quantize_tool,
             input_path,
             output_path,
-            quant_type
+            quant_type,
         ]
-        
+
         if verbose:
             print(f"Running: {' '.join(cmd)}")
-        
+
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                check=True
+                check=True,
+                timeout=_QUANTIZE_TIMEOUT,
             )
-            
+
             if verbose:
                 print(result.stdout)
-            
+
             return True
-            
+
         except subprocess.CalledProcessError as e:
             print(f"Quantization failed: {e.stderr}")
             return False
-    
+        except subprocess.TimeoutExpired:
+            print(f"Quantization timed out after {_QUANTIZE_TIMEOUT}s")
+            return False
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=1, max=10),
+        retry=retry_if_exception_type(subprocess.CalledProcessError),
+        reraise=True,
+    )
+    def _run_perplexity_subprocess(
+        self,
+        cmd: list[str],
+        timeout: int,
+    ) -> subprocess.CompletedProcess:
+        """Run the perplexity subprocess with retry logic.
+
+        Retries up to 3 times with exponential backoff on
+        CalledProcessError (e.g. transient GPU OOM or file lock).
+        """
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout,
+        )
+
     def calculate_perplexity(
         self,
         model_path: str,
@@ -218,41 +258,23 @@ class LlamaCppTools:
             "--ctx-size", str(effective_ctx),
             "--perplexity",
         ]
-        
+
         if verbose:
-            print(f"Calculating perplexity for {os.path.basename(model_path)}...")
-        
+            print(f"Calculating perplexity for {Path(model_path).name}...")
+
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=600  # 10 minute timeout
+            result = self._run_perplexity_subprocess(
+                cmd, timeout=_SUBPROCESS_TIMEOUT,
             )
-            
-            # Parse perplexity from output — try specific patterns first,
+
+            # Parse perplexity from output -- try specific patterns first,
             # then fall back to generic extraction.
-            ppl = None
-            for line in reversed(result.stdout.split('\n')):
-                # llama.cpp "Final estimate: PPL = 5.2345 +/- 0.0123"
-                m = re.search(r'Final estimate.*?PPL\s*=\s*(\d+\.?\d*)', line)
-                if m:
-                    ppl = float(m.group(1)); break
-                # Alternative: "perplexity = 5.2345"
-                m = re.search(r'[Pp]erplexity\s*[:=]\s*(\d+\.?\d*)', line)
-                if m:
-                    ppl = float(m.group(1)); break
-                # Last resort: any line containing "PPL" with a float
-                if 'PPL' in line:
-                    m = re.search(r'(\d+\.\d+)', line)
-                    if m:
-                        ppl = float(m.group(1)); break
+            ppl = _parse_perplexity_output(result.stdout)
 
             if ppl is not None and verbose:
                 print(f"  Perplexity: {ppl:.4f}")
             return ppl
-            
+
         except subprocess.CalledProcessError as e:
             print(f"Perplexity calculation failed: {e.stderr}")
             return None
@@ -261,15 +283,41 @@ class LlamaCppTools:
             return None
 
 
+def _parse_perplexity_output(stdout: str) -> Optional[float]:
+    """Extract perplexity value from llama-perplexity output.
+
+    Args:
+        stdout: The stdout text from llama-perplexity.
+
+    Returns:
+        The parsed perplexity float, or None if not found.
+    """
+    for line in reversed(stdout.split("\n")):
+        # llama.cpp "Final estimate: PPL = 5.2345 +/- 0.0123"
+        m = re.search(r"Final estimate.*?PPL\s*=\s*(\d+\.?\d*)", line)
+        if m:
+            return float(m.group(1))
+        # Alternative: "perplexity = 5.2345"
+        m = re.search(r"[Pp]erplexity\s*[:=]\s*(\d+\.?\d*)", line)
+        if m:
+            return float(m.group(1))
+        # Last resort: any line containing "PPL" with a float
+        if "PPL" in line:
+            m = re.search(r"(\d+\.\d+)", line)
+            if m:
+                return float(m.group(1))
+    return None
+
+
 # Quantization type mapping from MagicQuant to llama.cpp
-QUANT_TYPE_MAP = {
+QUANT_TYPE_MAP: Dict[str, str] = {
     "BF16": "BF16",  # Keep as-is
     "Q8_0": "Q8_0",
     "Q6_K": "Q6_K",
     "Q5_K": "Q5_K",
     "Q4_K_M": "Q4_K_M",
     "IQ4_NL": "IQ4_NL",
-    "MXFP4_MOE": "MXFP4"  # MagicQuant custom type (not native llama.cpp)
+    "MXFP4_MOE": "MXFP4",  # MagicQuant custom type (not native llama.cpp)
 }
 
 

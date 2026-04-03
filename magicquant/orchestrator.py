@@ -10,7 +10,6 @@ The core loop:
 6. Output the best verified survivor per tier
 """
 
-import os
 import json
 import time
 from typing import Dict, List, Optional, Tuple
@@ -23,6 +22,9 @@ from magicquant.evolution.probing import SensitivityProber
 from magicquant.gguf.tensor_groups import TensorGroupClassifier
 from magicquant.utils.naming import generate_name
 from magicquant.utils.llamacpp import LlamaCppTools, get_llamacpp_quant_type
+from magicquant.logging import get_logger
+
+log = get_logger(__name__)
 
 
 class MagicQuantOrchestrator:
@@ -65,7 +67,7 @@ class MagicQuantOrchestrator:
             try:
                 self._llama_tools = LlamaCppTools(self._llamacpp_path)
             except Exception as exc:
-                print(f"WARNING: llama.cpp not available: {exc}")
+                log.warning("llama.cpp not available", error=str(exc))
                 return None
         return self._llama_tools
 
@@ -99,15 +101,15 @@ class MagicQuantOrchestrator:
             to the best *measured* config for that tier.
         """
         if verbose:
-            print("=" * 60)
-            print("MagicQuant Measured Hybrid Search")
-            print("=" * 60)
-            print(f"Source: {self.source_model_path}")
-            if self.adapter_path:
-                print(f"Adapter: {self.adapter_path}")
-            print(f"Output: {self.output_dir}")
-            print(f"Rounds: {measurement_rounds} x {candidates_per_round} measurements")
-            print()
+            log.info(
+                "MagicQuant Measured Hybrid Search",
+                stage="init",
+                source=self.source_model_path,
+                adapter=self.adapter_path,
+                output_dir=str(self.output_dir),
+                rounds=measurement_rounds,
+                candidates_per_round=candidates_per_round,
+            )
 
         if self.llama_tools is None:
             raise RuntimeError(
@@ -117,18 +119,18 @@ class MagicQuantOrchestrator:
 
         # ── Step 1: Baseline perplexity ──
         if verbose:
-            print("Step 1: Baseline perplexity...")
+            log.info("Baseline perplexity", stage="baseline")
 
         self.baseline_ppl = self.llama_tools.calculate_perplexity(
             self.source_model_path, verbose=verbose
         )
         if self.baseline_ppl is None:
-            print("WARNING: Could not measure baseline PPL. Using default 5.0")
+            log.warning("Could not measure baseline PPL, using default", stage="baseline", default_ppl=5.0)
             self.baseline_ppl = 5.0
 
         # ── Step 2: Sensitivity probing ──
         if verbose:
-            print("\nStep 2: Sensitivity probing...")
+            log.info("Sensitivity probing", stage="probing")
 
         prober = SensitivityProber(
             base_model_path=self.source_model_path,
@@ -156,9 +158,11 @@ class MagicQuantOrchestrator:
         prober.save_results(str(self.output_dir / "sensitivity.json"))
 
         if verbose:
-            print("\nSensitivity weights:")
-            for g, w in self.sensitivity_weights.items():
-                print(f"  {g}: {w:.3f}")
+            log.info(
+                "Sensitivity weights computed",
+                stage="probing",
+                weights={g: round(w, 3) for g, w in self.sensitivity_weights.items()},
+            )
 
         # ── Step 3: Initialize predictor ──
         baseline_size_gb = self._estimate_model_size(self.source_model_path)
@@ -174,9 +178,12 @@ class MagicQuantOrchestrator:
 
         for round_idx in range(measurement_rounds):
             if verbose:
-                print(f"\n{'='*60}")
-                print(f"Measurement Round {round_idx + 1}/{measurement_rounds}")
-                print(f"{'='*60}")
+                log.info(
+                    "Measurement round starting",
+                    stage="measurement",
+                    round=round_idx + 1,
+                    total_rounds=measurement_rounds,
+                )
 
             # 4a. Run evolutionary search with current predictor
             survivor = EvolutionarySurvivor(
@@ -196,7 +203,11 @@ class MagicQuantOrchestrator:
             )
 
             if verbose:
-                print(f"\nSelected {len(to_measure)} candidates for measurement:")
+                log.info(
+                    "Candidates selected for measurement",
+                    stage="measurement",
+                    count=len(to_measure),
+                )
 
             # 4c. Build, measure, learn
             for i, candidate in enumerate(to_measure):
@@ -206,12 +217,21 @@ class MagicQuantOrchestrator:
                 # Skip if already measured
                 if config_key in self._measured:
                     if verbose:
-                        print(f"  [{i+1}/{len(to_measure)}] Already measured, skipping")
+                        log.debug(
+                            "Candidate already measured, skipping",
+                            stage="measurement",
+                            progress=f"{i+1}/{len(to_measure)}",
+                        )
                     continue
 
                 if verbose:
                     schemes = " ".join(f"{g}:{s}" for g, s in sorted(config.items()))
-                    print(f"  [{i+1}/{len(to_measure)}] Building: {schemes}")
+                    log.info(
+                        "Building candidate",
+                        stage="measurement",
+                        progress=f"{i+1}/{len(to_measure)}",
+                        schemes=schemes,
+                    )
 
                 # Build GGUF
                 model_name = f"round{round_idx+1}_candidate{i+1}"
@@ -229,6 +249,7 @@ class MagicQuantOrchestrator:
                     residual = measured_loss - predicted_loss
 
                     # Record measurement
+                    candidate_path = Path(path)
                     self._measured[config_key] = {
                         "config": config,
                         "ppl": ppl,
@@ -236,34 +257,43 @@ class MagicQuantOrchestrator:
                         "predicted_loss": predicted_loss,
                         "residual": residual,
                         "path": path,
-                        "size_gb": os.path.getsize(path) / (1024 ** 3),
+                        "size_gb": candidate_path.stat().st_size / (1024 ** 3),
                     }
 
                     # Active learning: feed residual back
                     self.predictor.record_residual(config, residual)
 
                     if verbose:
-                        print(f"    PPL: {ppl:.4f}  "
-                              f"Loss: {measured_loss:.4f} (predicted {predicted_loss:.4f})  "
-                              f"Residual: {residual:+.4f}")
+                        log.info(
+                            "Candidate measured",
+                            stage="measurement",
+                            ppl=round(ppl, 4),
+                            measured_loss=round(measured_loss, 4),
+                            predicted_loss=round(predicted_loss, 4),
+                            residual=round(residual, 4),
+                        )
                 else:
                     if verbose:
-                        print(f"    Measurement failed")
+                        log.warning("Measurement failed", stage="measurement")
 
                 # Clean up candidate GGUF to save disk (keep only final survivors)
                 # We'll rebuild the final survivors at the end
-                if os.path.exists(path):
-                    os.remove(path)
+                candidate_file = Path(path)
+                if candidate_file.exists():
+                    candidate_file.unlink()
 
             # 4d. Log round summary
             if verbose and self._measured:
-                print(f"\n  Round {round_idx + 1} summary: "
-                      f"{len(self._measured)} total measurements")
                 avg_residual = sum(
                     abs(m["residual"]) for m in self._measured.values()
                 ) / len(self._measured)
-                print(f"  Mean |residual|: {avg_residual:.4f} "
-                      f"(lower = predictor is more accurate)")
+                log.info(
+                    "Round summary",
+                    stage="measurement",
+                    round=round_idx + 1,
+                    total_measurements=len(self._measured),
+                    mean_abs_residual=round(avg_residual, 4),
+                )
 
         # ── Step 5: Select final survivors per tier ──
         tiered = self._select_final_survivors(baseline_size_gb)
@@ -272,16 +302,18 @@ class MagicQuantOrchestrator:
         self._save_results(all_configs, tiered)
 
         if verbose:
-            print(f"\n{'='*60}")
-            print("Final Verified Survivors:")
-            print(f"{'='*60}")
             for tier, info in tiered.items():
                 c = info["config"]
                 schemes = " ".join(f"{g}:{s}" for g, s in sorted(c.items()))
-                print(f"\n  {tier}: PPL={info['ppl']:.4f}  "
-                      f"Loss={info['measured_loss']:.4f}  "
-                      f"Size={info['size_gb']:.2f}GB")
-                print(f"    {schemes}")
+                log.info(
+                    "Final verified survivor",
+                    stage="results",
+                    tier=tier,
+                    ppl=round(info["ppl"], 4),
+                    measured_loss=round(info["measured_loss"], 4),
+                    size_gb=round(info["size_gb"], 2),
+                    schemes=schemes,
+                )
 
         return all_configs, tiered
 
@@ -318,8 +350,9 @@ class MagicQuantOrchestrator:
         from magicquant.gguf.writer import create_hybrid_gguf
 
         output_filename = generate_name(name, base_quant, config)
-        output_path = str(self.output_dir / "_candidates" / output_filename)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        candidates_dir = self.output_dir / "_candidates"
+        candidates_dir.mkdir(parents=True, exist_ok=True)
+        output_path = str(candidates_dir / output_filename)
 
         try:
             return create_hybrid_gguf(
@@ -330,7 +363,7 @@ class MagicQuantOrchestrator:
                 adapter_path=self.adapter_path,
             )
         except Exception as exc:
-            print(f"    Build failed: {exc}")
+            log.error("Build failed", stage="build", error=str(exc))
             return None
 
     def _select_final_survivors(self, baseline_gb: float) -> Dict[str, Dict]:
@@ -384,9 +417,8 @@ class MagicQuantOrchestrator:
             },
         }
 
-        path = str(self.output_dir / "search_results.json")
-        with open(path, "w") as f:
-            json.dump(results, f, indent=2)
+        results_path = self.output_dir / "search_results.json"
+        results_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
 
     # ------------------------------------------------------------------
     # Prediction-only search (no llama.cpp needed)
@@ -404,11 +436,11 @@ class MagicQuantOrchestrator:
         Use run_measured_search() for the full Predict->Measure->Learn loop.
         """
         if verbose:
-            print("=" * 60)
-            print("MagicQuant Prediction-Only Search")
-            print("=" * 60)
-            print(f"Source: {self.source_model_path}")
-            print()
+            log.info(
+                "MagicQuant Prediction-Only Search",
+                stage="init",
+                source=self.source_model_path,
+            )
 
         # Baseline PPL
         _llama = self.llama_tools
@@ -419,13 +451,16 @@ class MagicQuantOrchestrator:
             if self.baseline_ppl is None:
                 self.baseline_ppl = 5.0
         else:
-            print("WARNING: llama.cpp unavailable. Using default baseline PPL=5.0")
-            print("WARNING: Results are prediction-only — no real perplexity measurements.")
+            log.warning(
+                "llama.cpp unavailable, using default baseline PPL",
+                stage="baseline",
+                default_ppl=5.0,
+            )
             self.baseline_ppl = 5.0
 
         # Sensitivity probing
         if verbose:
-            print("\nSensitivity probing...")
+            log.info("Sensitivity probing", stage="probing")
         prober = SensitivityProber(
             base_model_path=self.source_model_path,
             baseline_perplexity=self.baseline_ppl,
@@ -491,9 +526,12 @@ class MagicQuantOrchestrator:
         output_filename = generate_name(model_name, base_quant, config)
         output_path = self.output_dir / output_filename
 
-        print(f"\nGenerating hybrid GGUF: {output_filename}")
-        for grp, sch in sorted(config.items()):
-            print(f"  {grp} -> {sch}")
+        log.info(
+            "Generating hybrid GGUF",
+            stage="generate",
+            filename=output_filename,
+            group_schemes={g: s for g, s in sorted(config.items())},
+        )
 
         try:
             result = create_hybrid_gguf(
@@ -503,17 +541,22 @@ class MagicQuantOrchestrator:
                 verbose=True,
                 adapter_path=self.adapter_path,
             )
-            if not os.path.isfile(result):
+            if not Path(result).is_file():
                 return None
         except Exception as exc:
-            print(f"Failed: {exc}")
+            log.error("Generation failed", stage="generate", error=str(exc))
             return None
 
         if verify and self.baseline_ppl:
             ppl = self.llama_tools.calculate_perplexity(str(output_path))
             if ppl:
                 loss = (ppl - self.baseline_ppl) / self.baseline_ppl
-                print(f"  PPL: {ppl:.4f}  Loss: {loss*100:.2f}%")
+                log.info(
+                    "Verification complete",
+                    stage="generate",
+                    ppl=round(ppl, 4),
+                    loss_pct=round(loss * 100, 2),
+                )
 
         return str(output_path)
 
@@ -528,7 +571,7 @@ class MagicQuantOrchestrator:
         generated = []
         for tier in tiers:
             if tier not in tiered:
-                print(f"\nNo config for tier {tier}, skipping")
+                log.info("No config for tier, skipping", stage="generate", tier=tier)
                 continue
 
             entry = tiered[tier]
@@ -543,12 +586,14 @@ class MagicQuantOrchestrator:
                 }.get(s, 3)
             )
 
-            print(f"\n{'='*60}")
-            print(f"Generating {tier} tier: {name}")
-            if "ppl" in entry:
-                print(f"  Measured PPL: {entry['ppl']:.4f}  "
-                      f"Loss: {entry['measured_loss']:.4f}")
-            print(f"{'='*60}")
+            log.info(
+                "Generating tier model",
+                stage="generate",
+                tier=tier,
+                name=name,
+                ppl=round(entry["ppl"], 4) if "ppl" in entry else None,
+                measured_loss=round(entry["measured_loss"], 4) if "measured_loss" in entry else None,
+            )
 
             path = self.generate_hybrid_model(
                 config=config, model_name=name,
@@ -557,7 +602,7 @@ class MagicQuantOrchestrator:
             if path:
                 generated.append(path)
             else:
-                print(f"  -> FAILED")
+                log.error("Tier generation failed", stage="generate", tier=tier)
 
         return generated
 
@@ -613,17 +658,18 @@ class MagicQuantOrchestrator:
         return result
 
     def _estimate_model_size(self, model_path: str) -> float:
-        if os.path.isfile(model_path):
-            return os.path.getsize(model_path) / (1024 ** 3)
-        # Directory (safetensors) — sum all .safetensors files
-        if os.path.isdir(model_path):
-            total = sum(
-                os.path.getsize(os.path.join(model_path, f))
-                for f in os.listdir(model_path)
-                if f.endswith(".safetensors")
-            )
+        p = Path(model_path)
+        if p.is_file():
+            return p.stat().st_size / (1024 ** 3)
+        # Directory (safetensors) -- sum all .safetensors files
+        if p.is_dir():
+            total = sum(f.stat().st_size for f in p.glob("*.safetensors"))
             return total / (1024 ** 3)
-        print(f"WARNING: Could not estimate model size for {model_path}, using default 1.0 GB")
+        log.warning(
+            "Could not estimate model size, using default",
+            model_path=model_path,
+            default_size_gb=1.0,
+        )
         return 1.0
 
 
@@ -667,9 +713,7 @@ def main():
         )
 
     # Generate final survivors
-    print("\n" + "=" * 60)
-    print("Generating Final Survivors...")
-    print("=" * 60)
+    log.info("Generating final survivors", stage="generate")
 
     orchestrator.generate_tiered_models(
         tiered=tiered,

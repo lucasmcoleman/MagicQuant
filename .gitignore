@@ -22,7 +22,12 @@ models/
 
 # Secrets / logs
 .env
+*.env.local
 *.log
+agent_logs/
 
 # Submodules / external docs
 MagicQuant-Wiki/
+
+# pytest
+.pytest_cache/
