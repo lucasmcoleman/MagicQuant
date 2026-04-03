@@ -291,6 +291,14 @@ class GGUFWriter:
             source_metadata = source.get_metadata()
             all_tensors_info = source.get_all_tensors_info()
 
+            # Pre-scan for UNKNOWN tensors so the user sees issues upfront
+            unknown_tensors = [t["name"] for t in all_tensors_info
+                               if classifier.classify_tensor(t["name"]) == "UNKNOWN"]
+            if unknown_tensors and verbose:
+                print(f"  WARNING: {len(unknown_tensors)} tensor(s) have no group classification "
+                      f"(will use base quant): {unknown_tensors[:5]}"
+                      + (f" ... and {len(unknown_tensors)-5} more" if len(unknown_tensors) > 5 else ""))
+
             # ==============================================================
             # Pass 1: Compute target types and offsets (no data reading)
             # ==============================================================

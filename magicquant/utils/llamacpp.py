@@ -66,23 +66,37 @@ class LlamaCppTools:
     def _find_quantize_tool(self) -> str:
         """Find the quantize executable."""
         possible_names = ["llama-quantize.exe", "llama-quantize", "quantize.exe", "quantize"]
-        
-        for name in possible_names:
-            path = os.path.join(self.llamacpp_path, name)
-            if os.path.exists(path):
-                return path
-        
+        search_dirs = [
+            self.llamacpp_path,
+            os.path.join(self.llamacpp_path, "build", "bin"),
+            os.path.join(self.llamacpp_path, "build"),
+            os.path.join(self.llamacpp_path, "bin"),
+        ]
+
+        for d in search_dirs:
+            for name in possible_names:
+                path = os.path.join(d, name)
+                if os.path.exists(path):
+                    return path
+
         raise FileNotFoundError(f"Could not find quantize tool in {self.llamacpp_path}")
     
     def _find_perplexity_tool(self) -> str:
         """Find the perplexity executable."""
         possible_names = ["llama-perplexity.exe", "llama-perplexity", "perplexity.exe", "perplexity"]
-        
-        for name in possible_names:
-            path = os.path.join(self.llamacpp_path, name)
-            if os.path.exists(path):
-                return path
-        
+        search_dirs = [
+            self.llamacpp_path,
+            os.path.join(self.llamacpp_path, "build", "bin"),
+            os.path.join(self.llamacpp_path, "build"),
+            os.path.join(self.llamacpp_path, "bin"),
+        ]
+
+        for d in search_dirs:
+            for name in possible_names:
+                path = os.path.join(d, name)
+                if os.path.exists(path):
+                    return path
+
         raise FileNotFoundError(f"Could not find perplexity tool in {self.llamacpp_path}")
     
     def _resolve_data_file(self, data_file: Optional[str] = None) -> Optional[str]:

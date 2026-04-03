@@ -36,15 +36,18 @@ class TensorGroupClassifier:
         'N': [r'_norm\.weight$', r'layernorm', r'_norm\.bias$',
               r'q_norm\.weight$', r'k_norm\.weight$'],
         'E': [r'token_embd\.weight'],
-        'H': [r'output\.weight', r'lm_head\.weight', r'mtp\.'],
-        'X': [r'ffn.*expert'],
-        'R': [r'ffn_gate_inp', r'router'],
+        'H': [r'^output\.weight$', r'lm_head\.weight', r'mtp\.'],
+        'X': [r'ffn.*expert', r'ffn_gate_up_exps', r'ffn_down_exps',
+              r'block_sparse_moe\.(input|output)_linear'],
+        'R': [r'ffn_gate_inp', r'router', r'block_sparse_moe\.router'],
         'Q': [r'attn_q\.weight', r'attn_qkv\.weight'],
         'K': [r'attn_k\.weight', r'attn_v\.weight'],
         'O': [r'attn_output\.weight'],
-        'S': [r'linear_attn\.', r'mamba\.', r'ssm\.'],
-        'U': [r'ffn_up', r'ffn_gate'],
-        'D': [r'ffn_down'],
+        'S': [r'linear_attn\.', r'mamba\.', r'ssm\.', r'ssm_'],
+        'U': [r'ffn_up', r'ffn_gate(?!_inp)', r'ffn_up_shared',
+              r'shared_mlp\.input_linear'],
+        'D': [r'ffn_down(?!_exps)', r'ffn_down_shared',
+              r'shared_mlp\.output_linear'],
     }
     
     def __init__(self):
@@ -53,24 +56,51 @@ class TensorGroupClassifier:
             for group, patterns in self.GROUP_PATTERNS.items()
         }
     
+    # Heuristic keywords for fallback classification when explicit patterns miss.
+    # Maps substrings found in tensor names to groups. Checked only if no
+    # explicit pattern matched — prevents wack-a-mole with new architectures.
+    _HEURISTIC_KEYWORDS = {
+        'N': ['norm', 'layernorm', 'rmsnorm'],
+        'E': ['embed', 'embd', 'wte'],
+        'H': ['lm_head'],
+        'R': ['router', 'gate_inp', 'gating'],
+        'X': ['expert', 'moe'],
+        'S': ['ssm', 'mamba', 'conv1d', 'dt_bias', 'a_log', 'recurrence'],
+        'Q': ['q_proj', 'query'],
+        'K': ['k_proj', 'v_proj', 'key', 'value'],
+        'O': ['o_proj', 'out_proj', 'attn_output', 'attn_out'],
+        'U': ['up_proj', 'gate_proj', 'input_linear', 'in_proj',
+              'ffn_up', 'ffn_gate', 'w1', 'w3'],
+        'D': ['down_proj', 'output_linear', 'ffn_down', 'w2'],
+        'V': ['visual', 'vision', 'image'],
+    }
+
     def classify_tensor(self, tensor_name: str) -> str:
         """
         Classify a single tensor into its functional group.
-        
-        Args:
-            tensor_name: The full name of the tensor from GGUF
-            
+
+        Uses explicit regex patterns first, then falls back to keyword
+        heuristics so new architectures get reasonable defaults without
+        needing pattern updates for every model.
+
         Returns:
-            Single character group identifier (E, H, Q, K, O, U, D, X, R)
+            Single character group identifier (E, H, Q, K, O, U, D, X, R, S, N, V)
             or 'UNKNOWN' if no match found
         """
         tensor_lower = tensor_name.lower()
-        
+
+        # Pass 1: explicit patterns (high confidence)
         for group, patterns in self.patterns.items():
             for pattern in patterns:
                 if pattern.search(tensor_lower):
                     return group
-        
+
+        # Pass 2: keyword heuristics (reasonable defaults)
+        for group, keywords in self._HEURISTIC_KEYWORDS.items():
+            for kw in keywords:
+                if kw in tensor_lower:
+                    return group
+
         return 'UNKNOWN'
     
     def classify_tensors(self, tensors: List[str]) -> Dict[str, List[str]]:
