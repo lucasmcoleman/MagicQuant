@@ -424,21 +424,29 @@ class GGUFWriter:
             self.metadata["magicquant.group_schemes"] = json.dumps(group_schemes)
 
             # Set general.file_type for llama.cpp compatibility.
-            # llama.cpp uses this to report the quantization type. Map the dominant
-            # scheme to the closest standard llama_ftype enum value.
+            # llama.cpp and HuggingFace use this to report the quantization type.
+            # For hybrid models, determine the dominant scheme by counting actual
+            # parameter elements per scheme across all tensors (after Pass 1).
             _ftype_map = {
                 "Q8_0": 7, "Q5_K": 16, "Q5_K_M": 17, "Q4_K": 12,
                 "Q4_K_M": 15, "Q6_K": 18, "Q3_K": 11, "Q2_K": 10,
-                "IQ4_NL": 20, "MXFP4": 1, "MXFP4_MOE": 1,
-                "BF16": 32, "F16": 1, "F32": 0,
+                "IQ4_NL": 20, "BF16": 32, "F16": 1, "F32": 0,
             }
-            # Use the base quant's ftype, or fall back to the most common group scheme
-            ftype = _ftype_map.get(base_quant)
-            if ftype is None:
-                from collections import Counter
-                scheme_counts = Counter(group_schemes.values())
-                most_common = scheme_counts.most_common(1)[0][0] if scheme_counts else "F16"
-                ftype = _ftype_map.get(most_common, 1)
+            from collections import Counter
+            # Count elements per actual target ggml type from tensor_entries
+            scheme_elements = Counter()
+            for entry in tensor_entries:
+                scheme_elements[entry["_target_ggml_name"]] += entry["_n_elems"]
+            # Pick the scheme with the most parameters, preferring quantized
+            # types over uncompressed (F16/F32/BF16) for display purposes
+            quantized_types = {s for s in scheme_elements if s in _ftype_map and s not in ("F16", "F32", "BF16")}
+            if quantized_types:
+                dominant = max(quantized_types, key=lambda s: scheme_elements[s])
+            elif scheme_elements:
+                dominant = scheme_elements.most_common(1)[0][0]
+            else:
+                dominant = base_quant
+            ftype = _ftype_map.get(dominant, _ftype_map.get(base_quant, 1))
             self.metadata["general.file_type"] = ftype
 
             filtered_meta = {k: v for k, v in self.metadata.items() if v is not None}
