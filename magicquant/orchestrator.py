@@ -109,6 +109,12 @@ class MagicQuantOrchestrator:
             print(f"Rounds: {measurement_rounds} x {candidates_per_round} measurements")
             print()
 
+        if self.llama_tools is None:
+            raise RuntimeError(
+                "run_measured_search requires llama.cpp. Install it or use "
+                "prediction-only mode (--rounds 0)."
+            )
+
         # ── Step 1: Baseline perplexity ──
         if verbose:
             print("Step 1: Baseline perplexity...")
@@ -132,6 +138,19 @@ class MagicQuantOrchestrator:
         )
 
         groups = ["E", "H", "Q", "K", "O", "U", "D"]
+        # Add MoE/SSM groups if present in the model
+        classifier = TensorGroupClassifier()
+        from magicquant.gguf.source import open_model_source
+        _src = open_model_source(self.source_model_path)
+        try:
+            tensor_names = _src.get_tensor_names()
+        finally:
+            _src.close()
+        if any(classifier.classify_tensor(t) in ("X", "R") for t in tensor_names):
+            groups.extend(["X", "R"])
+        if any(classifier.classify_tensor(t) == "S" for t in tensor_names):
+            groups.append("S")
+
         prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
         self.sensitivity_weights = prober.get_normalized_weights()
         prober.save_results(str(self.output_dir / "sensitivity.json"))
@@ -414,6 +433,19 @@ class MagicQuantOrchestrator:
             output_dir=str(self.output_dir / "_probes"),
         )
         groups = ["E", "H", "Q", "K", "O", "U", "D"]
+        # Add MoE/SSM groups if present in the model
+        classifier = TensorGroupClassifier()
+        from magicquant.gguf.source import open_model_source
+        _src = open_model_source(self.source_model_path)
+        try:
+            tensor_names = _src.get_tensor_names()
+        finally:
+            _src.close()
+        if any(classifier.classify_tensor(t) in ("X", "R") for t in tensor_names):
+            groups.extend(["X", "R"])
+        if any(classifier.classify_tensor(t) == "S" for t in tensor_names):
+            groups.append("S")
+
         prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
         self.sensitivity_weights = prober.get_normalized_weights()
         prober.save_results(str(self.output_dir / "sensitivity.json"))
@@ -591,6 +623,7 @@ class MagicQuantOrchestrator:
                 if f.endswith(".safetensors")
             )
             return total / (1024 ** 3)
+        print(f"WARNING: Could not estimate model size for {model_path}, using default 1.0 GB")
         return 1.0
 
 

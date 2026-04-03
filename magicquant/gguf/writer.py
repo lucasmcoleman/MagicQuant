@@ -211,19 +211,26 @@ def _read_encode_worker(source, entries, result_queue):
             else:
                 blob = b"\x00" * expected
 
-            # Pad/trim to exact size
+            # Validate blob size against expected
             if len(blob) != expected:
-                logger.warning(
-                    "Tensor %s: encoded blob size %d != expected %d "
-                    "(target type %s, %d elements); %s to fit",
-                    name, len(blob), expected, target,
-                    entry["_n_elems"],
-                    "padding" if len(blob) < expected else "trimming",
-                )
-            if len(blob) < expected:
-                blob = blob + b"\x00" * (expected - len(blob))
-            elif len(blob) > expected:
-                blob = blob[:expected]
+                if target in ("F32", "F16", "BF16"):
+                    # Safe to pad/trim uncompressed formats
+                    logger.warning(
+                        "Tensor %s: encoded blob size %d != expected %d "
+                        "(target type %s, %d elements); %s to fit",
+                        name, len(blob), expected, target,
+                        entry["_n_elems"],
+                        "padding" if len(blob) < expected else "trimming",
+                    )
+                    if len(blob) < expected:
+                        blob = blob + b"\x00" * (expected - len(blob))
+                    else:
+                        blob = blob[:expected]
+                else:
+                    raise RuntimeError(
+                        f"Tensor {name}: encoder produced {len(blob)} bytes "
+                        f"but expected {expected} for type {target}"
+                    )
 
             result_queue.put((entry, blob))
     except Exception as exc:
@@ -406,9 +413,9 @@ class GGUFWriter:
             self.metadata["magicquant.group_schemes"] = json.dumps(group_schemes)
 
             # Set general.file_type for llama.cpp compatibility
-            # 25 = LLAMA_FTYPE_MOSTLY_MXFP4 if MXFP4 is the base scheme, else 1 (MOSTLY_F16)
             if base_quant == "MXFP4_MOE":
-                self.metadata["general.file_type"] = 25
+                # No dedicated llama_ftype for MXFP4 hybrid; use MOSTLY_F16 as safe fallback
+                self.metadata["general.file_type"] = 1
             else:
                 self.metadata["general.file_type"] = 1
 
@@ -472,6 +479,14 @@ class GGUFWriter:
                     if item is None:
                         break
                     if isinstance(item, Exception):
+                        # Drain queue so worker thread can finish
+                        import queue as _queue_mod
+                        while True:
+                            try:
+                                result_q.get_nowait()
+                            except _queue_mod.Empty:
+                                break
+                        worker.join(timeout=5)
                         raise item
 
                     entry, blob = item
@@ -480,6 +495,12 @@ class GGUFWriter:
                     # Write alignment padding
                     current_pos = f.tell() - data_section_start
                     padding = aligned_offset - current_pos
+                    if padding < 0:
+                        raise RuntimeError(
+                            f"Tensor {entry['name']}: file position {current_pos} "
+                            f"exceeds expected offset {aligned_offset} by {-padding} bytes. "
+                            f"GGUF is corrupt."
+                        )
                     if padding > 0:
                         f.write(b"\x00" * padding)
 

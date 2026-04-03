@@ -632,6 +632,7 @@ class SafetensorsSource(ModelSource):
         # Load metadata from config.json first — we need the architecture
         # to apply arch-specific tensor name mappings.
         config_path = os.path.join(self._model_dir, "config.json")
+        config = {}
         if os.path.exists(config_path):
             with open(config_path) as f:
                 config = json.load(f)
@@ -687,6 +688,14 @@ class SafetensorsSource(ModelSource):
                     "byte_length": offsets[1] - offsets[0],
                     "data_start": data_start,
                 }
+
+        # Handle tied weights: if output.weight is missing and embeddings are tied,
+        # create a reference to token_embd.weight
+        if "output.weight" not in self._tensor_map and "token_embd.weight" in self._tensor_map:
+            if config.get("tie_word_embeddings", True):
+                ref = dict(self._tensor_map["token_embd.weight"])
+                ref["gguf_name"] = "output.weight"
+                self._tensor_map["output.weight"] = ref
 
         # Load tokenizer data
         tokenizer_meta = _build_tokenizer_metadata(self._model_dir)
