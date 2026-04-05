@@ -334,7 +334,7 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "falcon_mamba": "mamba", "gemma": "gemma", "gemma2": "gemma2",
         "gemma3": "gemma3", "glm4": "glm4", "gpt2": "gpt2",
         "gpt_neox": "gptneox", "granite": "granite",
-        "granitemoe": "granitemoe", "granitemoehybrid": "granitemoehybrid",
+        "granitemoe": "granitemoe", "granitemoehybrid": "granitehybrid",
         "grok": "grok",
         "internlm2": "internlm2", "internlm3": "llama",
         "jamba": "jamba", "llama": "llama", "llama4": "llama4",
