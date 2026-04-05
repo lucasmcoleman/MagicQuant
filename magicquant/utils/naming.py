@@ -33,59 +33,55 @@ GROUP_CODES = {
 }
 
 
+# Map MagicQuant tier labels to HuggingFace-recognized quant strings.
+# HuggingFace parses filenames with a regex to generate the quant badge;
+# only exact matches from GGMLFileQuantizationType enum names are recognized.
+_TIER_TO_HF_LABEL = {
+    "Q3": "Q3_K_M",
+    "Q4": "Q4_K_M",
+    "Q5": "Q5_K_M",
+    "Q6": "Q6_K",
+    "Q8": "Q8_0",
+    "IQ4": "IQ4_NL",
+}
+
+
 def generate_name(
     model_name: str,
     base_quant: str,
     overrides: Optional[Dict[str, str]] = None
 ) -> str:
     """
-    Generate a MagicQuant hybrid model name.
-    
+    Generate a clean MagicQuant hybrid model filename.
+
+    The per-group quantization details are stored in GGUF metadata
+    (magicquant.group_schemes), so the filename only carries the model
+    name and compression tier.
+
+    The tier portion of model_name (e.g. "Q5" at the end) is expanded
+    to an HF-recognized quant string (e.g. "Q5_K_M") so HuggingFace
+    shows the correct badge on the model page.
+
     Args:
-        model_name: Base model name (e.g., "Qwen3-4B-Instruct")
-        base_quant: Base quantization scheme (e.g., "MXFP4_MOE", "IQ4_NL")
-        overrides: Dict of group codes -> quant schemes that differ from base
-        
+        model_name: Base model name with tier suffix (e.g., "Qwen3-4B-Q5")
+        base_quant: Base quantization scheme (kept for API compat)
+        overrides: Group overrides (kept for API compat)
+
     Returns:
-        Complete filename with extension (e.g., "Qwen3-4B-MXFP4-EH-B16-QKO-IQ4NL.gguf")
-        
-    Example:
-        generate_name(
-            model_name="Qwen3-4B-Instruct",
-            base_quant="MXFP4_MOE",
-            overrides={"E": "BF16", "H": "BF16", "Q": "IQ4_NL"}
-        )
-        Returns: "Qwen3-4B-MXFP4-EH-B16-Q-IQ4NL.gguf"
+        Filename like "Qwen3-4B-Q5_K_M.gguf"
     """
-    # Clean model name for filename
-    clean_name = model_name.replace(" ", "-").replace("_", "-")
-    
-    # Build override blocks
-    if not overrides:
-        return f"{clean_name}-{base_quant}.gguf"
-    
-    # Group overrides by quant scheme for compact representation
-    scheme_to_groups: Dict[str, List[str]] = {}
-    for group, scheme in overrides.items():
-        if scheme not in scheme_to_groups:
-            scheme_to_groups[scheme] = []
-        scheme_to_groups[scheme].append(group)
-    
-    # Sort groups within each scheme alphabetically for consistency
-    for scheme in scheme_to_groups:
-        scheme_to_groups[scheme].sort()
-    
-    # Build override string
-    override_parts = []
-    for scheme, groups in scheme_to_groups.items():
-        group_str = ''.join(groups)  # e.g., "EH" or "QKO"
-        # Normalize scheme name for filename (remove underscores for readability)
-        scheme_clean = scheme.replace("_", "")
-        override_parts.append(f"{group_str}-{scheme_clean}")
-    
-    override_str = "-".join(override_parts)
-    
-    return f"{clean_name}-{base_quant}-{override_str}.gguf"
+    clean_name = model_name.replace(" ", "-")
+    if clean_name.lower().endswith(".gguf"):
+        clean_name = clean_name[:-5]
+
+    # Expand tier suffix to HF-recognized quant label
+    # e.g. "Model-Q5" -> "Model-Q5_K_M"
+    for tier, hf_label in _TIER_TO_HF_LABEL.items():
+        if clean_name.endswith(f"-{tier}"):
+            clean_name = clean_name[: -len(tier)] + hf_label
+            break
+
+    return f"{clean_name}.gguf"
 
 
 def parse_name(name: str) -> Dict:
