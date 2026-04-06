@@ -636,13 +636,17 @@ class MagicQuantOrchestrator:
         if baseline_gb <= 0:
             return "Q4"
         ratio = size_gb / baseline_gb
-        if ratio > 0.55:
+        # Tighter boundaries: Q6 targets 45-65% of BF16 (not open-ended)
+        # Configs above 65% are over-protected and wasteful
+        if 0.45 < ratio <= 0.65:
             return "Q6"
-        elif ratio > 0.40:
+        elif 0.33 < ratio <= 0.45:
             return "Q5"
-        elif ratio > 0.28:
+        elif 0.22 < ratio <= 0.33:
             return "Q4"
-        return "Q3"
+        elif ratio <= 0.22:
+            return "Q3"
+        return "Q8"  # ratio > 0.65 — barely compressed, separate tier
 
     @staticmethod
     def _pick_best_per_tier(configs: List[Dict], baseline_gb: float) -> Dict[str, Dict]:
