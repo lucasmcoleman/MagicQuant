@@ -662,10 +662,37 @@ class MagicQuantOrchestrator:
         return result
 
     def _estimate_model_size(self, model_path: str) -> float:
+        """Compute BF16 baseline size in GB from the total parameter count.
+
+        Using ``parameter_count * 2`` bytes gives the true BF16 baseline
+        regardless of the source format (which could be a pre-quantized GGUF
+        with a smaller on-disk size).
+        """
+        from magicquant.gguf.source import open_model_source
+        try:
+            src = open_model_source(model_path)
+            try:
+                total_elements = 0
+                for info in src.get_all_tensors_info():
+                    n = 1
+                    for d in info["shape"]:
+                        n *= d
+                    total_elements += n
+                if total_elements > 0:
+                    return (total_elements * 2) / (1024 ** 3)
+            finally:
+                src.close()
+        except Exception as exc:
+            log.warning(
+                "Could not count parameters for baseline size",
+                model_path=model_path,
+                error=str(exc),
+            )
+
+        # Last-resort fallback: file size (may be wrong for pre-quantized)
         p = Path(model_path)
         if p.is_file():
             return p.stat().st_size / (1024 ** 3)
-        # Directory (safetensors) -- sum all .safetensors files
         if p.is_dir():
             total = sum(f.stat().st_size for f in p.glob("*.safetensors"))
             return total / (1024 ** 3)

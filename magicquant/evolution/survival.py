@@ -219,28 +219,17 @@ class EvolutionarySurvivor:
         return population
 
     def _classify_into_tiers(self, predictions: List[Dict]) -> Dict[str, List[Dict]]:
-        """Classify into tiers using size RATIO to baseline, not absolute GB."""
+        """Classify into tiers using the canonical tier boundaries from
+        ``MagicQuantOrchestrator._classify_tier`` to ensure consistency
+        between evolutionary search and final survivor selection."""
+        from magicquant.orchestrator import MagicQuantOrchestrator
+
         baseline_gb = self.predictor.baseline_size_gb
         tier_assignment: Dict[str, List[Dict]] = {}
 
         for pred in predictions:
             size_gb = pred.get('predicted_size_gb', 1.0)
-
-            if baseline_gb > 0:
-                ratio = size_gb / baseline_gb
-            else:
-                # Without baseline, use predicted_size_gb as a proxy
-                ratio = size_gb / max(size_gb, 1.0)
-
-            # Tier by compression ratio relative to BF16 baseline
-            if ratio > 0.55:
-                tier = "Q6"
-            elif ratio > 0.40:
-                tier = "Q5"
-            elif ratio > 0.28:
-                tier = "Q4"    # MXFP4-heavy configs land here
-            else:
-                tier = "Q3"
+            tier = MagicQuantOrchestrator._classify_tier(size_gb, baseline_gb)
 
             if tier not in tier_assignment:
                 tier_assignment[tier] = []

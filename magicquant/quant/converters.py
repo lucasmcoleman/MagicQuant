@@ -689,7 +689,7 @@ def _encode_ggml_q4_k(flat: np.ndarray) -> bytes:
     sub = blocks.reshape(n_blocks, 8, 32)  # (n_blocks, 8, 32)
     sub_min = np.min(sub, axis=2)   # (n_blocks, 8)
     sub_max = np.max(sub, axis=2)   # (n_blocks, 8)
-    sub_mins = np.where(sub_min < 0, -sub_min, 0.0).astype(np.float32)  # (n_blocks, 8)
+    sub_mins = (-sub_min).astype(np.float32)  # (n_blocks, 8) — always use actual min (llama.cpp convention)
     rng = sub_max + sub_mins  # (n_blocks, 8)
     naive_scales = np.where(rng > 0, rng / 15.0, 0.0).astype(np.float32)
     # RMSE-optimized scale selection
@@ -753,7 +753,7 @@ def _encode_ggml_q5_k(flat: np.ndarray) -> bytes:
     sub = blocks.reshape(n_blocks, 8, 32)  # (n_blocks, 8, 32)
     sub_min_vals = np.min(sub, axis=2)   # (n_blocks, 8)
     sub_max_vals = np.max(sub, axis=2)   # (n_blocks, 8)
-    sub_mins = np.where(sub_min_vals < 0, -sub_min_vals, 0.0).astype(np.float32)
+    sub_mins = (-sub_min_vals).astype(np.float32)  # always use actual min (llama.cpp convention)
     rng = sub_max_vals + sub_mins
     naive_scales = np.where(rng > 0, rng / 31.0, 0.0).astype(np.float32)
     # RMSE-optimized scale selection

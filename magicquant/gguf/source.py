@@ -9,9 +9,12 @@ from typing import Dict, List, Any, Optional, Tuple
 from abc import ABC, abstractmethod
 import struct
 import json
+import logging
 import os
 import re
 import numpy as np
+
+_log = logging.getLogger(__name__)
 
 
 def _flatten_to_max_dims(shape: List[int], max_dims: int = 4) -> List[int]:
@@ -116,15 +119,26 @@ class GGUFSource(ModelSource):
     def get_source_type_name(self, tensor_name: str) -> str:
         info = self._reader.get_tensor_info(tensor_name)
         if info is None:
-            return "F16"
-        return self._TYPE_NAME.get(info["data_type"], "F16")
+            _log.warning("Tensor '%s' not found in GGUF source", tensor_name)
+            return "UNKNOWN"
+        type_name = self._TYPE_NAME.get(info["data_type"])
+        if type_name is None:
+            _log.warning(
+                "Tensor '%s' has unknown ggml type id %d — cannot decode",
+                tensor_name, info["data_type"],
+            )
+            return f"UNKNOWN({info['data_type']})"
+        return type_name
 
     def read_tensor_f32(self, tensor_name: str) -> Optional[np.ndarray]:
         from magicquant.quant.converters import ggml_tensor_data_size
         info = self._reader.get_tensor_info(tensor_name)
         if info is None:
             return None
-        type_name = self._TYPE_NAME.get(info["data_type"], "")
+        type_name = self._TYPE_NAME.get(info["data_type"])
+        if type_name is None:
+            # Unknown ggml type — cannot decode
+            return None
         n_elems = 1
         for d in info["shape"]:
             n_elems *= d
@@ -350,7 +364,15 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "stablelm": "stablelm", "starcoder": "starcoder",
         "starcoder2": "starcoder2",
     }
-    arch = arch_map.get(model_type, "llama")
+    arch = arch_map.get(model_type)
+    if arch is None:
+        _log.warning(
+            "Unknown model_type '%s' not in arch_map — defaulting to 'llama'. "
+            "GGUF metadata keys may be wrong; consider adding a mapping or "
+            "using a pre-converted GGUF source.",
+            model_type,
+        )
+        arch = "llama"
 
     meta: Dict[str, Any] = {}
     meta["general.architecture"] = arch

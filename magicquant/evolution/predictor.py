@@ -101,7 +101,6 @@ class PredictiveScorer:
         """
         total_loss = 0.0
         high_sensitivity_groups = ['E', 'H', 'O', 'R']
-        compressed_sensitive_count = 0
 
         for group, scheme in group_schemes.items():
             sens_weight = self.sensitivity_weights.get(
@@ -110,15 +109,15 @@ class PredictiveScorer:
             noise_factor = self.QUANT_NOISE_FACTORS.get(scheme, 3.0)
             total_loss += sens_weight * noise_factor
 
-            if group in high_sensitivity_groups and scheme != "BF16":
-                compressed_sensitive_count += 1
-
-        if compressed_sensitive_count >= 2:
-            collapse_penalty = (
-                total_loss * self.collapse_penalty_alpha +
-                self.collapse_penalty_beta
-            )
-            total_loss *= (1 + collapse_penalty)
+        # Additive collapse penalty: penalise compressing sensitive groups
+        # proportionally to how many are compressed, without quadratic
+        # self-amplification (old formula was total_loss *= 1+1.5*total_loss).
+        compressed_sensitive = sum(
+            1 for g in group_schemes
+            if g in high_sensitivity_groups and group_schemes[g] != "BF16"
+        )
+        if compressed_sensitive > 0:
+            total_loss += self.collapse_penalty_beta * compressed_sensitive
 
         config_key = self._make_config_key(group_schemes)
         if config_key in self.residual_cache:
@@ -172,13 +171,26 @@ class PredictiveScorer:
 
         return self.baseline_tps * min(total_weighted_speed / total_weight, 4.0)
 
-    def _estimate_simple_tps(self, group_schemes: Dict[str, str]) -> float:
-        """TPS estimation without parameter counts."""
-        # Approximate parameter distribution for a dense transformer
-        param_dist = {
+    def _compute_param_dist(self, groups: List[str]) -> Dict[str, float]:
+        """Compute parameter distribution from actual tensor group sizes.
+
+        Falls back to a dense-transformer heuristic when parameter_counts
+        are unavailable or zero.
+        """
+        if self.parameter_counts:
+            total = sum(self.parameter_counts.get(g, 0) for g in groups)
+            if total > 0:
+                return {g: self.parameter_counts.get(g, 0) / total for g in groups}
+        # Fallback: dense transformer approximation
+        _DEFAULT = {
             'E': 0.04, 'H': 0.04, 'Q': 0.12, 'K': 0.12,
             'O': 0.06, 'U': 0.31, 'D': 0.31,
         }
+        return {g: _DEFAULT.get(g, 0.05) for g in groups}
+
+    def _estimate_simple_tps(self, group_schemes: Dict[str, str]) -> float:
+        """TPS estimation without parameter counts."""
+        param_dist = self._compute_param_dist(list(group_schemes.keys()))
 
         total_weighted_speed = 0.0
         total_weight = 0.0
@@ -204,11 +216,7 @@ class PredictiveScorer:
         if not self.baseline_size_gb:
             return 1.0
 
-        # Approximate parameter distribution for a dense transformer (sums to 1.0)
-        param_dist = {
-            'E': 0.04, 'H': 0.04, 'Q': 0.12, 'K': 0.12,
-            'O': 0.06, 'U': 0.31, 'D': 0.31,
-        }
+        param_dist = self._compute_param_dist(list(group_schemes.keys()))
 
         # Compute weighted average bpw, then scale baseline size
         total_weighted_bpw = 0.0
@@ -251,10 +259,13 @@ class PredictiveScorer:
         # Normalize loss: 0 (all BF16) to ~5 (heavy quant).
         loss_score = max(0, 1 - predicted_loss / 5.0)
 
+        # size_score: smaller predicted size relative to baseline = better.
+        # 1.0 - (predicted / baseline) gives 0.0 for no compression and
+        # approaches 1.0 for heavy compression, discriminating between tiers.
         if self.baseline_size_gb > 0:
-            size_score = min(1, self.baseline_size_gb / max(predicted_size, 0.01))
+            size_score = max(0.0, 1.0 - predicted_size / self.baseline_size_gb)
         else:
-            size_score = min(1, 1.0 / max(predicted_size, 0.01))
+            size_score = max(0.0, 1.0 - predicted_size)
 
         if self.baseline_tps > 0:
             tps_score = min(1, predicted_tps / self.baseline_tps)
@@ -291,24 +302,13 @@ class PredictiveScorer:
 
 
 class TierClassifier:
-    """Classify hybrids into standard tiers based on size ratio to baseline."""
+    """Classify hybrids into standard tiers based on size ratio to baseline.
 
-    TIER_BOUNDARIES = {
-        "Q8": (0.95, float('inf')),
-        "Q7": (0.80, 0.95),
-        "Q6": (0.65, 0.80),
-        "Q5": (0.50, 0.65),
-        "Q4": (0.35, 0.50),
-        "Q3": (0.20, 0.35),
-        "Q2": (0.10, 0.20),
-    }
+    Delegates to ``MagicQuantOrchestrator._classify_tier`` so that a single
+    set of tier boundaries is used everywhere.
+    """
 
     @staticmethod
     def classify_by_size(size_gb: float, baseline_size_gb: float) -> str:
-        ratio = size_gb / baseline_size_gb
-        for tier, (low, high) in TierClassifier.TIER_BOUNDARIES.items():
-            if low < ratio <= high:
-                return tier
-        if ratio > 1.0:
-            return "Q8+"
-        return "Q2-"
+        from magicquant.orchestrator import MagicQuantOrchestrator
+        return MagicQuantOrchestrator._classify_tier(size_gb, baseline_size_gb)

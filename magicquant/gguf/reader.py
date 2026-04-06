@@ -234,15 +234,14 @@ class GGUFReader:
         return 'unknown'
     
     def get_parameter_count(self) -> int:
-        """Estimate total parameter count from tensor shapes."""
+        """Total element count across all tensors (including 1-D norms/biases)."""
         total = 0
         for tensor in self.tensors:
             shape = tensor['shape']
-            if len(shape) >= 2:  # Weight matrices have at least 2 dims
-                params = 1
-                for dim in shape:
-                    params *= dim
-                total += params
+            params = 1
+            for dim in shape:
+                params *= dim
+            total += params
         return total
     
     def get_file_size_gb(self) -> float:
