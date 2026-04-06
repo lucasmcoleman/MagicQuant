@@ -374,7 +374,7 @@ class MagicQuantOrchestrator:
             by_tier[tier].append(info)
 
         result = {}
-        for tier in ["Q6", "Q5", "Q4", "Q3"]:
+        for tier in ["Q8", "Q6", "Q5", "Q4", "Q3"]:
             if tier in by_tier:
                 # Best = lowest measured loss within the tier
                 best = min(by_tier[tier], key=lambda x: x["measured_loss"])
@@ -566,7 +566,7 @@ class MagicQuantOrchestrator:
     ) -> List[str]:
         """Generate one hybrid GGUF per compression tier."""
         if tiers is None:
-            tiers = ["Q6", "Q5", "Q4"]
+            tiers = ["Q8", "Q6", "Q5", "Q4"]
 
         generated = []
         for tier in tiers:
@@ -656,7 +656,7 @@ class MagicQuantOrchestrator:
             tier = MagicQuantOrchestrator._classify_tier(size_gb, baseline_gb)
             by_tier[tier].append(cfg)
         result = {}
-        for tier in ["Q6", "Q5", "Q4", "Q3"]:
+        for tier in ["Q8", "Q6", "Q5", "Q4", "Q3"]:
             if tier in by_tier:
                 result[tier] = max(by_tier[tier], key=lambda x: x.get('composite_score', 0))
         return result
@@ -749,7 +749,7 @@ def main():
     orchestrator.generate_tiered_models(
         tiered=tiered,
         model_name_prefix=Path(args.source_model).stem,
-        tiers=["Q4", "Q5", "Q6"],
+        tiers=["Q4", "Q5", "Q6", "Q8"],
         verify=False,
     )
 
