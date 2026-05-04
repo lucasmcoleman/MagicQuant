@@ -23,7 +23,7 @@
 | Decision | Choice | Rationale |
 |---|---|---|
 | Scope | C — full K-quant + IQ-quant set (16 new schemes) + retrofit existing 7 | Tool's premise is finding optimal hybrids; partial palettes undermine that |
-| Verification | B — loadable + dequant-within-tolerance vs `llama-quantize` | Catches bit-layout bugs without requiring full byte parity |
+| Verification | A — byte-for-byte parity vs `llama-quantize` | Trivially achievable under ctypes pivot (same underlying C function); simpler and stricter than dequant-within-tolerance |
 | Architecture | A — refactor first as separate PR, then add encoders | Refactor has independent value; cleaner per-encoder PRs |
 | Calibration | A — empirical bench, one-time | 2 hr upfront, amortized across all future runs |
 | Phasing | B — K-quant batch → legacy Q-quants → IQ-quants → imatrix | Tier-floor fix ships fastest; IQ complexity isolated |
@@ -262,16 +262,29 @@ def reference_tensor():
     return rng.normal(0, 0.02, size=(2048, 2048)).astype(np.float32)
 
 @pytest.mark.parametrize("scheme", ALL_QUANTIZED_SCHEMES)
-def test_encoder_round_trip_within_format_tolerance(scheme, reference_tensor):
-    """Encode → dequantize via ggml's dequantize_row_<type> → compare to source."""
+def test_encoder_byte_for_byte_matches_llama_quantize(scheme, reference_tensor, tmp_path):
+    """Build tiny F32 GGUF; quantize via MagicQuant's ctypes binding and via
+    llama-quantize subprocess; assert output bytes are identical.
+
+    This is the primary correctness test. Both code paths call the same
+    underlying ggml C function, so any mismatch indicates a binding bug
+    (wrong type_id, wrong nrows/n_per_row, non-contiguous memory, etc.)."""
 
 @pytest.mark.parametrize("scheme", ALL_QUANTIZED_SCHEMES)
-def test_magicquant_output_matches_llama_quantize(scheme, reference_tensor, tmp_path):
-    """Build tiny F32 GGUF; quantize via MagicQuant and via llama-quantize subprocess;
-    dequant both; assert agreement within format tolerance."""
+def test_encoder_round_trip_within_format_tolerance(scheme, reference_tensor):
+    """Encode via ctypes → dequantize via ggml's dequantize_row_<type> →
+    assert max-error <= scheme's format-defined tolerance (~1.5x format LSB).
+
+    Sanity check that the format produces meaningful approximations of the
+    input. Catches issues like all-zeros output, NaN propagation, or
+    extreme quantization noise that the byte-parity test wouldn't surface
+    (since it just verifies we agree with llama-quantize, which could in
+    principle also be broken in the same way)."""
 ```
 
 The harness needs a tiny 1-tensor F32 GGUF fixture, generated once with the `gguf` package and committed under `tests/fixtures/`.
+
+**Note on byte parity:** because MagicQuant and `llama-quantize` both invoke the same `ggml_quantize_chunk` function from the same compiled `libggml-cpu.so`, byte-identical output is the natural expectation, not a stretch goal. The only way they diverge is via different code paths or arguments — exactly what we want the test to catch.
 
 ### Layer 3 — Smoke (`tests/integration/test_smoke_full_pipeline.py`, NEW)
 
