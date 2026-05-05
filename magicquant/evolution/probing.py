@@ -17,6 +17,8 @@ import json
 import tempfile
 import numpy as np
 
+from magicquant.quant.schemes import get_scheme_by_name
+
 
 class SensitivityProber:
     """
@@ -261,19 +263,18 @@ class SensitivityProber:
             "X": 0.5,   # MoE experts — robust
         }
 
-        # Scheme aggressiveness (relative noise, aligned with predictor)
-        _SCHEME_NOISE = {
-            "BF16": 0.0,
-            "Q8_0": 0.2,
-            "Q6_K": 0.5,
-            "Q5_K": 0.7,
-            "IQ4_NL": 0.85,    # non-linear levels, best ~4-bit quality
-            "MXFP4_MOE": 0.9,  # FP4 levels, better than integer Q4
-            "Q4_K_M": 1.0,     # integer 4-bit baseline
-        }
+        # Scheme aggressiveness scaled to the heuristic's [0, 1] range.
+        # Registry's noise_factor uses Q8_0=1.0 anchor; we rescale here so
+        # Q4_K_M=1.0 maps to "max heuristic aggressiveness". This preserves
+        # the original heuristic's behavior pre-refactor.
+        try:
+            registry_noise = get_scheme_by_name(scheme).noise_factor
+            # Q4_K_M (registry noise=4.5) maps to 1.0; linearly scale others.
+            noise = registry_noise / 4.5
+        except ValueError:
+            noise = 1.0
 
         sensitivity = _GROUP_SENSITIVITY.get(group, 1.0)
-        noise = _SCHEME_NOISE.get(scheme, 1.0)
 
         ppl_increase_pct = sensitivity * noise * 0.05  # ~5% per unit at baseline
         return self.baseline_ppl * (1 + ppl_increase_pct)
