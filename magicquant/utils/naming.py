@@ -18,6 +18,8 @@ Example: Qwen3-4B-MXFP4-EH-B16-QKO-IQ4NL.gguf
 from typing import Dict, List, Optional, Tuple
 import re
 
+from magicquant.quant.schemes import get_scheme_by_name
+
 
 # Group code definitions
 GROUP_CODES = {
@@ -228,18 +230,10 @@ def calculate_expected_size(
 
 def get_scheme_bits(scheme_name: str) -> float:
     """Get the bits per weight for a quantization scheme."""
-    # Actual bpw from ggml block format: (block_bytes * 8) / block_elements
-    SCHEME_BITS = {
-        "BF16": 16.0,
-        "Q8_0": 8.5,
-        "Q6_K": 6.5625,
-        "Q5_K": 5.5,
-        "IQ4_NL": 4.5,
-        "MXFP4_MOE": 4.25,
-        "Q4_K_M": 4.5,
-    }
-    
-    return SCHEME_BITS.get(scheme_name, 8.0)
+    try:
+        return get_scheme_by_name(scheme_name).bits_per_weight
+    except ValueError:
+        return 8.0
 
 
 if __name__ == "__main__":
