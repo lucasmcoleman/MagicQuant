@@ -19,6 +19,8 @@ from typing import Dict, List, Tuple, Optional
 import struct
 import numpy as np
 
+from magicquant.quant.ggml_binding import ggml_encode, GGML_TYPE_IDS
+
 
 # ---------------------------------------------------------------------------
 # ggml block format constants
@@ -925,18 +927,24 @@ _GGML_ENCODERS = {
 }
 
 
-def encode_to_ggml_bytes(weights: np.ndarray, ggml_type_name: str) -> bytes:
+def encode_to_ggml_bytes(
+    weights: np.ndarray,
+    ggml_type_name: str,
+    imatrix: Optional[np.ndarray] = None,
+) -> bytes:
     """
     Quantize a float32 weight array into ggml block-format bytes.
 
-    This is the public entry point that the GGUF writer calls.
+    Quantized formats route through ggml_encode (libggml ctypes binding),
+    producing byte-identical output to llama.cpp's llama-quantize.
+    Float-format passthroughs (BF16, F16, F32) stay native — no need for
+    the C path.
 
     Args:
         weights: Float32 numpy array (any shape — will be flattened).
-            Must be a floating-point dtype (float16, bfloat16, float32, float64).
-            Integer or pre-quantized dtypes are rejected to prevent silent
-            corruption.
+            Must be a floating-point dtype.
         ggml_type_name: Target ggml type (e.g. "Q8_0", "Q4_K", "BF16").
+        imatrix: Optional importance matrix (used by IQ-quants in PR4).
 
     Returns:
         Raw bytes in the on-disk ggml block layout.
@@ -951,11 +959,20 @@ def encode_to_ggml_bytes(weights: np.ndarray, ggml_type_name: str) -> bytes:
             f"got dtype={weights.dtype}. Integer or pre-quantized tensors "
             f"cannot be re-quantized — use a BF16/F16/F32 source model."
         )
-    encoder = _GGML_ENCODERS.get(ggml_type_name)
-    if encoder is None:
+    flat = weights.astype(np.float32).flatten()
+
+    # Float passthroughs — native (no C call needed)
+    if ggml_type_name == "BF16":
+        return _encode_f32_to_bf16(flat)
+    if ggml_type_name == "F16":
+        return _encode_f32_to_f16(flat)
+    if ggml_type_name == "F32":
+        return _encode_f32_to_f32(flat)
+
+    # All quantized formats route to libggml
+    if ggml_type_name not in GGML_TYPE_IDS:
         raise ValueError(
             f"No ggml encoder for type '{ggml_type_name}'. "
-            f"Available: {sorted(_GGML_ENCODERS)}"
+            f"Available: {sorted(GGML_TYPE_IDS)}"
         )
-    flat = weights.astype(np.float32).flatten()
-    return encoder(flat)
+    return ggml_encode(flat, ggml_type_name, imatrix=imatrix)
