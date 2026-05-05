@@ -15,6 +15,10 @@ dependencies = [
     "structlog>=24.0.0",
     "tenacity>=8.2.0",
     "python-dotenv>=1.0.0",
+    # llama-cpp-python ships libggml-base.so + libggml-cpu.so in its wheel,
+    # used by magicquant.quant.ggml_binding for all quantized encoders.
+    # Discovery prefers system llama.cpp if available; falls back to this.
+    "llama-cpp-python>=0.3.0",
 ]
 
 [project.optional-dependencies]
