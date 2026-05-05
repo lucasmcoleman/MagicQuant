@@ -144,7 +144,40 @@ Q4_K_M = QuantizationScheme(
     speed_multiplier=3.4,
     category="k_quant",
     upgrade_neighbor="MXFP4_MOE",
-    downgrade_neighbor=None,  # bottom of current registry; PR1 adds Q3_K
+    downgrade_neighbor="Q3_K",
+)
+
+
+# ── New schemes added in PR1 ─────────────────────────────────────────
+# Q3_K and Q2_K make the Q3 tier band reachable. Q2_K bpw=2.625 lands
+# at ratio 0.164 — just outside the Q2 band (≤0.16); full Q2 band
+# coverage requires sub-Q2 IQ-quants from PR3.
+#
+# noise_factor values are placeholders pending the calibration bench
+# in this PR; tools/calibrate_noise_factors.py overwrites them.
+
+Q3_K = QuantizationScheme(
+    name="Q3_K",
+    ggml_type_name="Q3_K",
+    ggml_type_id=11,
+    bits_per_weight=3.4375,   # 110B * 8 / 256 = 3.4375
+    noise_factor=8.0,         # placeholder; calibrated below
+    speed_multiplier=4.0,     # ggml SIMD encoders are fast
+    category="k_quant",
+    upgrade_neighbor="Q4_K_M",
+    downgrade_neighbor="Q2_K",
+)
+
+Q2_K = QuantizationScheme(
+    name="Q2_K",
+    ggml_type_name="Q2_K",
+    ggml_type_id=10,
+    bits_per_weight=2.625,    # 84B * 8 / 256 = 2.625
+    noise_factor=15.0,        # placeholder; calibrated below
+    speed_multiplier=4.5,     # smallest blocks → fastest dispatch
+    category="k_quant",
+    upgrade_neighbor="Q3_K",
+    downgrade_neighbor=None,  # bottom of current registry; PR3 adds IQ-quants below
 )
 
 
@@ -156,6 +189,8 @@ _REGISTRY: Dict[str, QuantizationScheme] = {
     "Q4_K_M": Q4_K_M,
     "IQ4_NL": IQ4_NL,
     "MXFP4_MOE": MXFP4_MOE,
+    "Q3_K": Q3_K,
+    "Q2_K": Q2_K,
 }
 
 # Group-class floors: minimum acceptable scheme per group class.

@@ -3,7 +3,7 @@ Quant Module - Quantization schemes and conversions.
 """
 
 from magicquant.quant.schemes import (
-    BF16, Q8_0, Q6_K, Q5_K, IQ4_NL, MXFP4_MOE, Q4_K_M,
+    BF16, Q8_0, Q6_K, Q5_K, IQ4_NL, MXFP4_MOE, Q4_K_M, Q3_K, Q2_K,
     QuantizationScheme,
     get_scheme_by_name,
     get_all_schemes,
@@ -13,6 +13,7 @@ from magicquant.quant.schemes import (
 
 __all__ = [
     "BF16", "Q8_0", "Q6_K", "Q5_K", "IQ4_NL", "MXFP4_MOE", "Q4_K_M",
+    "Q3_K", "Q2_K",
     "QuantizationScheme",
     "get_scheme_by_name",
     "get_all_schemes",
