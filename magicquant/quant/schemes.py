@@ -14,7 +14,7 @@ heuristic values; PR1 will replace them with empirically-benched values
 from tools/calibrate_noise_factors.py.)
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional
 
 
@@ -39,7 +39,6 @@ class QuantizationScheme:
     category: SchemeCategory = "k_quant"
     is_moe_optimized: bool = False
     requires_imatrix: bool = False    # IQ-quants benefit from importance matrices
-    min_for_group_class: Dict[str, str] = field(default_factory=dict)
     upgrade_neighbor: Optional[str] = None    # name of next-better scheme
     downgrade_neighbor: Optional[str] = None  # name of next-smaller scheme
 
