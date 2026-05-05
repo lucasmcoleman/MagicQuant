@@ -187,24 +187,80 @@ class EvolutionarySurvivor:
 
         return population[:self.population_size]
 
-    def _generate_random_config(self, groups: List[str]) -> Dict[str, str]:
-        """Generate a random config biased toward MXFP4 for FFN and
-        higher precision for brain layers."""
-        config = {}
+    # Sampling weights per group class, indexed by scheme category.
+    # Each value is the relative probability mass for picking ANY scheme
+    # in that category. Within a category, we further weight inversely by
+    # noise_factor so higher-quality variants are preferred slightly over
+    # lower-quality ones in the same category.
+    #
+    # _BRAIN_CLASS_WEIGHTS: for high-sensitivity groups (E, H, O, R) —
+    #   biased toward float and high-precision schemes.
+    # _ATTENTION_CLASS_WEIGHTS: for moderate-sensitivity groups (Q, K) —
+    #   middle-ground spread.
+    # _FFN_CLASS_WEIGHTS: for robust groups (U, D, X) —
+    #   biased toward maximum compression.
+    _BRAIN_CLASS_WEIGHTS = {
+        "float":    0.30,   # BF16
+        "legacy_q": 0.30,   # Q8_0
+        "k_quant":  0.30,   # Q6_K, Q5_K, Q4_K_M, Q3_K, Q2_K
+        "iq_quant": 0.05,   # IQ4_NL (and any IQ-quants added later)
+        "mxfp4":    0.05,   # MXFP4_MOE
+    }
+    _ATTENTION_CLASS_WEIGHTS = {
+        "float":    0.05,
+        "legacy_q": 0.15,
+        "k_quant":  0.45,
+        "iq_quant": 0.20,
+        "mxfp4":    0.15,
+    }
+    _FFN_CLASS_WEIGHTS = {
+        "float":    0.02,
+        "legacy_q": 0.05,
+        "k_quant":  0.30,
+        "iq_quant": 0.30,
+        "mxfp4":    0.33,
+    }
 
-        # Weights per scheme:          BF16 Q8_0 Q6_K Q5_K IQ4NL MXFP4 Q4KM
-        brain_weights =               [0.30, 0.30, 0.20, 0.10, 0.05, 0.03, 0.02]
-        attention_weights =            [0.05, 0.15, 0.25, 0.20, 0.15, 0.10, 0.10]
-        ffn_weights =                  [0.02, 0.05, 0.08, 0.10, 0.15, 0.35, 0.25]
+    def _generate_random_config(self, groups: List[str]) -> Dict[str, str]:
+        """Generate a random config biased toward compression for FFN and
+        higher precision for brain layers.
+
+        Weights are category-indexed (not positional) so adding new schemes
+        to the registry doesn't require updating positional arrays.
+        """
+        from magicquant.quant.schemes import get_all_schemes
+
+        config: Dict[str, str] = {}
+        all_schemes = get_all_schemes()
 
         for g in groups:
             if g in self._HIGH_SENSITIVITY:
-                w = brain_weights
+                class_weights = self._BRAIN_CLASS_WEIGHTS
             elif g in self._LOW_SENSITIVITY:
-                w = ffn_weights
+                class_weights = self._FFN_CLASS_WEIGHTS
             else:
-                w = attention_weights
-            config[g] = random.choices(self.AVAILABLE_SCHEMES, weights=w)[0]
+                class_weights = self._ATTENTION_CLASS_WEIGHTS
+
+            # Build per-scheme weights: start with the class weight, then
+            # divide it across all schemes in that category, inversely
+            # weighted by noise_factor (cleaner schemes preferred).
+            scheme_weights = []
+            for s in all_schemes:
+                cat_weight = class_weights.get(s.category, 0.0)
+                # Within a category, give cleaner (lower noise) schemes more weight.
+                # noise_factor=0 (BF16) gets factor 2.0; high-noise gets factor near 0.
+                # Normalize within a category later.
+                scheme_weights.append(cat_weight * (1.0 / (1.0 + s.noise_factor)))
+
+            # Avoid all-zeros pathology
+            if sum(scheme_weights) == 0:
+                scheme_weights = [1.0] * len(all_schemes)
+
+            picked = random.choices(
+                [s.name for s in all_schemes],
+                weights=scheme_weights,
+            )[0]
+            config[g] = picked
         return config
 
     # ------------------------------------------------------------------
