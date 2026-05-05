@@ -8,18 +8,20 @@ and employs evolutionary search to find optimal mixed-precision configurations.
 __version__ = "0.1.0"
 
 from magicquant.quant.schemes import (
-    Q8_0, Q6_K, Q5_K, Q4_K_M, IQ4_NL, MXFP4_MOE, BF16
+    BF16, Q8_0, Q6_K, Q5_K, IQ4_NL, MXFP4_MOE, Q4_K_M,
+    QuantizationScheme,
+    get_scheme_by_name,
+    get_all_schemes,
+    get_schemes_by_category,
 )
 
 from magicquant.gguf.tensor_groups import TensorGroupClassifier
 
 __all__ = [
-    "Q8_0", 
-    "Q6_K", 
-    "Q5_K", 
-    "Q4_K_M", 
-    "IQ4_NL", 
-    "MXFP4_MOE", 
-    "BF16",
-    "TensorGroupClassifier"
+    "BF16", "Q8_0", "Q6_K", "Q5_K", "IQ4_NL", "MXFP4_MOE", "Q4_K_M",
+    "QuantizationScheme",
+    "get_scheme_by_name",
+    "get_all_schemes",
+    "get_schemes_by_category",
+    "TensorGroupClassifier",
 ]
