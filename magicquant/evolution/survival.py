@@ -17,13 +17,14 @@ from typing import Dict, List, Tuple, Optional
 import random
 import copy
 
+from magicquant.quant.schemes import (
+    get_all_schemes, get_scheme_by_name, get_floor_for_group_class
+)
 
-# Ordered from highest quality to most compressed.
-# MXFP4_MOE is the sweet spot: best compression of the ~4-bit schemes
-# with lower noise than integer Q4 due to FP4 non-linear levels.
-SCHEME_QUALITY_ORDER = [
-    "BF16", "Q8_0", "Q6_K", "Q5_K", "IQ4_NL", "MXFP4_MOE", "Q4_K_M"
-]
+
+# Ordered from highest quality (lowest noise) to most compressed (highest noise).
+# Derived from the canonical scheme registry — see magicquant.quant.schemes.
+SCHEME_QUALITY_ORDER: List[str] = [s.name for s in get_all_schemes()]
 
 
 class EvolutionarySurvivor:
@@ -44,25 +45,21 @@ class EvolutionarySurvivor:
 
     DEFAULT_GROUPS = ['E', 'H', 'Q', 'K', 'O', 'U', 'D']
 
-    # Upgrade: move toward higher quality (less compression)
-    _UPGRADE = {
-        "Q4_K_M":    "MXFP4_MOE",
-        "MXFP4_MOE": "IQ4_NL",
-        "IQ4_NL":    "Q5_K",
-        "Q5_K":      "Q6_K",
-        "Q6_K":      "Q8_0",
-        "Q8_0":      "BF16",
-    }
+    @staticmethod
+    def _upgrade(scheme: str) -> Optional[str]:
+        """Return the next-better scheme, or None if at the top."""
+        try:
+            return get_scheme_by_name(scheme).upgrade_neighbor
+        except ValueError:
+            return None
 
-    # Downgrade: move toward more compression (less quality)
-    _DOWNGRADE = {
-        "BF16":      "Q8_0",
-        "Q8_0":      "Q6_K",
-        "Q6_K":      "Q5_K",
-        "Q5_K":      "IQ4_NL",
-        "IQ4_NL":    "MXFP4_MOE",
-        "MXFP4_MOE": "Q4_K_M",
-    }
+    @staticmethod
+    def _downgrade(scheme: str) -> Optional[str]:
+        """Return the next-smaller scheme, or None if at the bottom."""
+        try:
+            return get_scheme_by_name(scheme).downgrade_neighbor
+        except ValueError:
+            return None
 
     # Groups that are sensitive to quantization ("brain" layers)
     _HIGH_SENSITIVITY = {'E', 'H', 'O', 'R'}
@@ -70,11 +67,13 @@ class EvolutionarySurvivor:
     # Groups that are robust to quantization (FFN / experts)
     _LOW_SENSITIVITY = {'U', 'D', 'X'}
 
-    # Floor: minimum acceptable scheme for each group type
-    _MIN_SCHEME = {
-        'sensitive': "Q8_0",      # brain layers shouldn't go below Q8_0
-        'robust':    "Q4_K_M",    # FFN can go all the way down
-    }
+    # Floor for each group class — read from registry helper so the
+    # values stay consistent if the registry's bottom scheme changes.
+    @staticmethod
+    def _min_scheme_for_class(group_class: str) -> str:
+        """Get the minimum acceptable scheme for a group class
+        ("sensitive" or "robust")."""
+        return get_floor_for_group_class(group_class)
 
     def __init__(
         self,
@@ -270,7 +269,7 @@ class EvolutionarySurvivor:
             # Protector: upgrade the most sensitive unprotected brain layer
             target = self._find_protector_target(config, groups)
             if target:
-                new_scheme = self._UPGRADE.get(target['scheme'])
+                new_scheme = self._upgrade(target['scheme'])
                 if new_scheme and new_scheme != target['scheme']:
                     c = config.copy()
                     c[target['group']] = new_scheme
@@ -279,7 +278,7 @@ class EvolutionarySurvivor:
             # Crusher: downgrade the most robust high-precision FFN layer
             target = self._find_crusher_target(config, groups)
             if target:
-                new_scheme = self._DOWNGRADE.get(target['scheme'])
+                new_scheme = self._downgrade(target['scheme'])
                 if new_scheme and new_scheme != target['scheme']:
                     c = config.copy()
                     c[target['group']] = new_scheme
@@ -322,8 +321,8 @@ class EvolutionarySurvivor:
             if g not in self._LOW_SENSITIVITY:
                 continue
             scheme = config.get(g, "MXFP4_MOE")
-            # Can we push it lower?
-            if scheme in self._DOWNGRADE and scheme != "Q4_K_M":
+            # Can we push it lower? (Skip if already at the bottom of registry)
+            if self._downgrade(scheme) is not None and scheme != self._min_scheme_for_class('robust'):
                 sensitivity = self.predictor.sensitivity_weights.get(g, 0.5)
                 candidates.append({
                     'group': g, 'scheme': scheme, 'sensitivity': sensitivity
