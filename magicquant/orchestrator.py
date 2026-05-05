@@ -23,6 +23,7 @@ from magicquant.gguf.tensor_groups import TensorGroupClassifier
 from magicquant.utils.naming import generate_name
 from magicquant.utils.llamacpp import LlamaCppTools, get_llamacpp_quant_type
 from magicquant.logging import get_logger
+from magicquant.quant.schemes import get_scheme_by_name
 
 log = get_logger(__name__)
 
@@ -578,13 +579,14 @@ class MagicQuantOrchestrator:
             config = entry["config"]
             name = f"{model_name_prefix}-{tier}"
 
-            base_quant = max(
-                set(config.values()),
-                key=lambda s: {
-                    "BF16": 0, "Q8_0": 1, "Q6_K": 2, "Q5_K": 3,
-                    "IQ4_NL": 4, "MXFP4_MOE": 5, "Q4_K_M": 6
-                }.get(s, 3)
-            )
+            # base_quant: pick the scheme with highest bpw (least compressed) as
+            # the "label" for this hybrid. Reads bpw from the canonical registry.
+            def _bpw_or_default(s: str) -> float:
+                try:
+                    return get_scheme_by_name(s).bits_per_weight
+                except ValueError:
+                    return 4.5  # mid-range default for unknown schemes
+            base_quant = max(set(config.values()), key=_bpw_or_default)
 
             log.info(
                 "Generating tier model",
