@@ -32,6 +32,7 @@ from magicquant.quant.converters import (
     ggml_tensor_data_size,
     GGML_BLOCK_SIZE,
 )
+from magicquant.quant.schemes import get_all_schemes
 
 
 # ggml_type enum values used in GGUF tensor info
@@ -88,19 +89,11 @@ _GGUF_TYPE_FLOAT64 = 12
 ALIGNMENT = 32
 
 # Map MagicQuant scheme names to the ggml_type name we write into the file.
-# MXFP4_MOE defaults to Q4_0 for llama.cpp compatibility.
-# Use native_mxfp4=True to write the custom type 100 (requires compatible runtime).
-SCHEME_TO_GGML = {
-    "BF16":      "BF16",
-    "F16":       "F16",
-    "F32":       "F32",
-    "Q8_0":      "Q8_0",
-    "Q6_K":      "Q6_K",
-    "Q5_K":      "Q5_K",
-    "Q4_K_M":    "Q4_K",
-    "IQ4_NL":    "IQ4_NL",
-    "MXFP4_MOE": "MXFP4",  # native llama.cpp support (ggml_type 39)
-}
+# Built from the canonical scheme registry; F16/F32 added as passthrough
+# entries for source tensors that bypass quantization.
+SCHEME_TO_GGML: Dict[str, str] = {s.name: s.ggml_type_name for s in get_all_schemes()}
+SCHEME_TO_GGML["F16"] = "F16"
+SCHEME_TO_GGML["F32"] = "F32"
 
 
 # ---------------------------------------------------------------------------
