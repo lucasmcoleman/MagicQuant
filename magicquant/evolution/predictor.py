@@ -16,6 +16,8 @@ Compression ratios are derived from actual ggml block format byte sizes.
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 
+from magicquant.quant.schemes import get_scheme_by_name
+
 
 class PredictiveScorer:
     """
@@ -30,46 +32,8 @@ class PredictiveScorer:
     sensitive layers are compressed simultaneously.
     """
 
-    # Noise factors calibrated from llama.cpp perplexity benchmarks.
-    # Lower = less quantization noise = better quality.
-    #
-    # Key insight: non-linear schemes (IQ4_NL, MXFP4) produce lower noise
-    # than integer schemes at comparable bpw because their quantization
-    # levels better match the Gaussian-like weight distribution of
-    # transformers.
-    QUANT_NOISE_FACTORS = {
-        "BF16":      0.0,
-        "Q8_0":      1.0,
-        "Q6_K":      2.2,
-        "Q5_K":      3.0,
-        "IQ4_NL":    3.8,   # non-linear lookup table, best ~4-bit quality
-        "MXFP4_MOE": 4.0,   # FP4 levels, better than integer Q4
-        "Q4_K_M":    4.5,   # integer 4-bit with sub-block scales
-    }
-
-    # Compression ratios from actual ggml block format:
-    # ratio = 16.0 / (block_bytes * 8 / block_elements)
-    QUANT_COMPRESSION = {
-        "BF16":      1.0,    # 16.0 bpw
-        "Q8_0":      1.88,   # 8.5 bpw
-        "Q6_K":      2.44,   # 6.5625 bpw
-        "Q5_K":      2.91,   # 5.5 bpw
-        "IQ4_NL":    3.56,   # 4.5 bpw
-        "MXFP4_MOE": 3.76,   # 4.25 bpw — best compression of the ~4-bit schemes
-        "Q4_K_M":    3.56,   # 4.5 bpw
-    }
-
-    # Relative speed multipliers (vs BF16).
-    # MXFP4 is fast due to simple block format (shared exponent + nibbles).
-    QUANT_SPEED = {
-        "BF16":      1.0,
-        "Q8_0":      1.75,
-        "Q6_K":      2.2,
-        "Q5_K":      2.7,
-        "IQ4_NL":    3.2,
-        "Q4_K_M":    3.4,
-        "MXFP4_MOE": 3.8,
-    }
+    # Scheme attributes (noise_factor, compression_ratio, speed_multiplier)
+    # are read from the scheme registry — see magicquant.quant.schemes.
 
     def __init__(
         self,
@@ -106,7 +70,7 @@ class PredictiveScorer:
             sens_weight = self.sensitivity_weights.get(
                 group, 1.0 / max(len(group_schemes), 1)
             )
-            noise_factor = self.QUANT_NOISE_FACTORS.get(scheme, 3.0)
+            noise_factor = self._noise_factor_for(scheme)
             total_loss += sens_weight * noise_factor
 
         # Additive collapse penalty: penalise compressing sensitive groups
@@ -135,7 +99,7 @@ class PredictiveScorer:
 
         for group, scheme in group_schemes.items():
             params_in_group = self.parameter_counts.get(group, 0)
-            compression = self.QUANT_COMPRESSION.get(scheme, 2.0)
+            compression = self._compression_for(scheme)
             bits = 16.0 / compression
             total_weighted_bits += params_in_group * bits
 
@@ -155,7 +119,7 @@ class PredictiveScorer:
 
         for group, scheme in group_schemes.items():
             params_in_group = self.parameter_counts.get(group, 0)
-            speed_mult = self.QUANT_SPEED.get(scheme, 1.5)
+            speed_mult = self._speed_for(scheme)
 
             # FFN layers dominate inference time
             if group in ['U', 'D', 'X']:
@@ -197,7 +161,7 @@ class PredictiveScorer:
 
         for group, scheme in group_schemes.items():
             dist = param_dist.get(group, 0.05)
-            speed_mult = self.QUANT_SPEED.get(scheme, 1.5)
+            speed_mult = self._speed_for(scheme)
             weight = dist * (2 if group in ['U', 'D', 'X'] else 1)
             total_weighted_speed += weight * speed_mult
             total_weight += weight
@@ -224,7 +188,7 @@ class PredictiveScorer:
 
         for group, scheme in group_schemes.items():
             dist = param_dist.get(group, 0.05)
-            compression = self.QUANT_COMPRESSION.get(scheme, 2.0)
+            compression = self._compression_for(scheme)
             bpw = 16.0 / compression
             total_weighted_bpw += dist * bpw
             total_dist += dist
@@ -238,6 +202,30 @@ class PredictiveScorer:
 
     def _make_config_key(self, group_schemes: Dict[str, str]) -> str:
         return "|".join(f"{g}:{group_schemes[g]}" for g in sorted(group_schemes))
+
+    @staticmethod
+    def _noise_factor_for(scheme: str) -> float:
+        """Look up noise_factor from registry; fallback to 3.0 if unknown."""
+        try:
+            return get_scheme_by_name(scheme).noise_factor
+        except ValueError:
+            return 3.0
+
+    @staticmethod
+    def _compression_for(scheme: str) -> float:
+        """Look up compression_ratio from registry; fallback to 2.0 if unknown."""
+        try:
+            return get_scheme_by_name(scheme).compression_ratio
+        except ValueError:
+            return 2.0
+
+    @staticmethod
+    def _speed_for(scheme: str) -> float:
+        """Look up speed_multiplier from registry; fallback to 1.5 if unknown."""
+        try:
+            return get_scheme_by_name(scheme).speed_multiplier
+        except ValueError:
+            return 1.5
 
     def score_hybrid(
         self,
