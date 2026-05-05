@@ -1,0 +1,110 @@
+[
+  {
+    "E": "MXFP4_MOE",
+    "H": "MXFP4_MOE",
+    "Q": "MXFP4_MOE",
+    "K": "MXFP4_MOE",
+    "O": "MXFP4_MOE",
+    "U": "MXFP4_MOE",
+    "D": "MXFP4_MOE"
+  },
+  {
+    "E": "IQ4_NL",
+    "H": "MXFP4_MOE",
+    "Q": "MXFP4_MOE",
+    "K": "MXFP4_MOE",
+    "O": "MXFP4_MOE",
+    "U": "MXFP4_MOE",
+    "D": "MXFP4_MOE"
+  },
+  {
+    "E": "MXFP4_MOE",
+    "H": "MXFP4_MOE",
+    "Q": "MXFP4_MOE",
+    "K": "MXFP4_MOE",
+    "O": "MXFP4_MOE",
+    "U": "Q4_K_M",
+    "D": "MXFP4_MOE"
+  },
+  {
+    "E": "IQ4_NL",
+    "H": "IQ4_NL",
+    "Q": "IQ4_NL",
+    "K": "IQ4_NL",
+    "O": "IQ4_NL",
+    "U": "IQ4_NL",
+    "D": "IQ4_NL"
+  },
+  {
+    "E": "Q5_K",
+    "H": "Q6_K",
+    "Q": "MXFP4_MOE",
+    "K": "IQ4_NL",
+    "O": "Q8_0",
+    "U": "Q4_K_M",
+    "D": "IQ4_NL"
+  },
+  {
+    "E": "BF16",
+    "H": "IQ4_NL",
+    "Q": "MXFP4_MOE",
+    "K": "Q6_K",
+    "O": "Q6_K",
+    "U": "IQ4_NL",
+    "D": "Q4_K_M"
+  },
+  {
+    "E": "BF16",
+    "H": "Q5_K",
+    "Q": "MXFP4_MOE",
+    "K": "Q6_K",
+    "O": "Q6_K",
+    "U": "IQ4_NL",
+    "D": "Q4_K_M"
+  },
+  {
+    "E": "Q5_K",
+    "H": "Q5_K",
+    "Q": "MXFP4_MOE",
+    "K": "Q5_K",
+    "O": "Q5_K",
+    "U": "Q5_K",
+    "D": "Q5_K"
+  },
+  {
+    "E": "BF16",
+    "H": "BF16",
+    "Q": "MXFP4_MOE",
+    "K": "MXFP4_MOE",
+    "O": "Q8_0",
+    "U": "MXFP4_MOE",
+    "D": "MXFP4_MOE"
+  },
+  {
+    "E": "Q5_K",
+    "H": "Q5_K",
+    "Q": "Q5_K",
+    "K": "Q5_K",
+    "O": "Q5_K",
+    "U": "Q5_K",
+    "D": "Q5_K"
+  },
+  {
+    "E": "BF16",
+    "H": "Q8_0",
+    "Q": "BF16",
+    "K": "Q6_K",
+    "O": "Q8_0",
+    "U": "Q8_0",
+    "D": "Q5_K"
+  },
+  {
+    "E": "Q6_K",
+    "H": "Q8_0",
+    "Q": "Q6_K",
+    "K": "Q5_K",
+    "O": "Q5_K",
+    "U": "BF16",
+    "D": "Q4_K_M"
+  }
+]
