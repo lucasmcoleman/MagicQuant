@@ -152,6 +152,7 @@ def _settings_from_args(args: argparse.Namespace):
     _maybe("population_size", "population")
     _maybe("measurement_rounds", "rounds")
     _maybe("candidates_per_round", "candidates")
+    _maybe("patience", "patience")
 
     # MagicQuantSettings() reads env/.env first; explicit kwargs (CLI) win.
     return MagicQuantSettings(**overrides)
@@ -181,6 +182,7 @@ def cmd_search(args: argparse.Namespace) -> None:
             measurement_rounds=rounds,
             candidates_per_round=settings.candidates_per_round,
             verbose=settings.verbose,
+            patience=settings.patience,
         )
     else:
         # Prediction-only search (fast, no llama.cpp required)
@@ -189,6 +191,7 @@ def cmd_search(args: argparse.Namespace) -> None:
             max_generations=settings.search_generations,
             population_size=settings.population_size,
             verbose=settings.verbose,
+            patience=settings.patience,
         )
 
     results_path = Path(settings.output_dir) / "search_results.json"
@@ -228,10 +231,19 @@ def cmd_hybrid(args: argparse.Namespace) -> None:
         print(f"Error: Source model not found: {source_path}")
         sys.exit(1)
 
+    # Route the output directory through MagicQuantSettings so MAGICQUANT_*
+    # env / .env config and the --output-dir CLI override apply uniformly with
+    # the other commands. The model source / base quant come from the YAML.
+    from magicquant.config import MagicQuantSettings
+    settings_overrides = {"source_model_path": source_path}
+    if getattr(args, "output_dir", None) is not None:
+        settings_overrides["output_dir"] = args.output_dir
+    settings = MagicQuantSettings(**settings_overrides)
+
     from magicquant.utils.naming import generate_name
     from magicquant.gguf.writer import create_hybrid_gguf
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(settings.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_filename = generate_name(model_name, base_quant, group_overrides)
     output_path = output_dir / output_filename
@@ -257,7 +269,13 @@ def cmd_generate(args: argparse.Namespace) -> None:
     """Generate hybrid GGUF models from search results JSON."""
     from magicquant.orchestrator import MagicQuantOrchestrator
 
-    output_dir = Path(args.output_dir)
+    # Route through MagicQuantSettings so env / .env config and CLI overrides
+    # apply uniformly (same helper as cmd_search / cmd_dry_run). argparse
+    # defaults are None -> the settings value (env / .env / config default)
+    # wins unless the flag was passed explicitly on the CLI.
+    settings = _settings_from_args(args)
+
+    output_dir = Path(settings.output_dir)
     results_file = output_dir / "search_results.json"
 
     if not results_file.exists():
@@ -273,22 +291,29 @@ def cmd_generate(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     orchestrator = MagicQuantOrchestrator(
-        source_model_path=args.model,
-        output_dir=args.output_dir,
-        llamacpp_path=args.llamacpp_path,
+        source_model_path=settings.source_model_path,
+        output_dir=settings.output_dir,
+        llamacpp_path=settings.llamacpp_path,
+        adapter_path=settings.adapter_path,
     )
 
-    if args.verify:
+    verify = args.verify if getattr(args, "verify", None) else settings.verify
+
+    if verify:
         orchestrator.baseline_ppl = orchestrator.llama_tools.calculate_perplexity(
-            args.model, verbose=True,
+            settings.source_model_path, verbose=True,
         )
     else:
         orchestrator.baseline_ppl = None
 
-    model_name_prefix = Path(args.model).stem
+    model_name_prefix = Path(settings.source_model_path).stem
 
-    # Parse requested tiers (e.g., "Q4,Q5,Q6" or "Q4")
-    tiers = [t.strip() for t in args.tiers.split(",")]
+    # Parse requested tiers. The --tiers flag (comma string) overrides the
+    # settings.tiers list (which honors MAGICQUANT_TIERS env / .env).
+    if getattr(args, "tiers", None):
+        tiers = [t.strip() for t in args.tiers.split(",")]
+    else:
+        tiers = list(settings.tiers)
 
     # Load tiered results
     tiered = results.get("tiered", {})
@@ -301,8 +326,8 @@ def cmd_generate(args: argparse.Namespace) -> None:
             results=all_results,
             top_n=len(tiers),
             model_name_prefix=model_name_prefix,
-            base_quant=args.target_quant,
-            verify=args.verify,
+            base_quant=settings.target_base_quant,
+            verify=verify,
         )
     else:
         print(f"\nGenerating best config for tiers: {', '.join(tiers)}")
@@ -310,7 +335,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
             tiered=tiered,
             model_name_prefix=model_name_prefix,
             tiers=tiers,
-            verify=args.verify,
+            verify=verify,
         )
 
     print(f"\nDone. {len(generated)} models generated successfully.")
@@ -513,6 +538,11 @@ def main() -> None:
              "(default: MAGICQUANT_CANDIDATES_PER_ROUND or 4)",
     )
     search_parser.add_argument(
+        "--patience", type=int, default=None,
+        help="Early-stop the search after this many generations with no "
+             "improvement (default: MAGICQUANT_PATIENCE or off = full budget)",
+    )
+    search_parser.add_argument(
         "--adapter",
         help="Path to LoRA adapter directory",
     )
@@ -529,10 +559,12 @@ def main() -> None:
         help="Generate hybrid GGUF from YAML config",
     )
     hybrid_parser.add_argument("config", help="Path to configuration YAML file")
+    # Default None so MAGICQUANT_OUTPUT_DIR (env / .env) is honored; an explicit
+    # --output-dir always overrides it.
     hybrid_parser.add_argument(
         "--output-dir",
-        default="./output",
-        help="Output directory (default: ./output)",
+        default=None,
+        help="Output directory (default: MAGICQUANT_OUTPUT_DIR or ./output)",
     )
     hybrid_parser.set_defaults(func=cmd_hybrid)
 
@@ -542,29 +574,40 @@ def main() -> None:
         help="Generate hybrid models from evolutionary search results",
     )
     generate_parser.add_argument("model", help="Path to source GGUF model")
+    # Defaults are None so env / .env (MAGICQUANT_*) is honored via
+    # MagicQuantSettings; an explicit CLI value always overrides it.
     generate_parser.add_argument(
         "--output-dir",
-        default="./output",
-        help="Output directory (default: ./output)",
+        default=None,
+        help="Output directory (default: MAGICQUANT_OUTPUT_DIR or ./output)",
     )
     generate_parser.add_argument(
         "--target-quant",
-        default="MXFP4_MOE",
-        help="Target base quantization (default: MXFP4_MOE)",
+        default=None,
+        help="Target base quantization "
+             "(default: MAGICQUANT_TARGET_BASE_QUANT or MXFP4_MOE)",
     )
     generate_parser.add_argument(
         "--tiers",
-        default="Q4,Q5,Q6",
-        help="Comma-separated tiers to generate (default: Q4,Q5,Q6)",
+        default=None,
+        help="Comma-separated tiers to generate "
+             "(default: MAGICQUANT_TIERS or Q4,Q5,Q6)",
     )
     generate_parser.add_argument(
         "--verify",
         action="store_true",
+        default=None,
         help="Calculate perplexity after generation",
     )
     generate_parser.add_argument(
         "--llamacpp-path",
+        default=None,
         help="Path to llama.cpp directory (auto-detect if omitted)",
+    )
+    generate_parser.add_argument(
+        "--adapter",
+        default=None,
+        help="Path to LoRA adapter directory",
     )
     generate_parser.set_defaults(func=cmd_generate)
 
