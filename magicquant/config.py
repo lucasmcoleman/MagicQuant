@@ -28,6 +28,9 @@ class MagicQuantSettings(BaseSettings):
     population_size: int = 80
     measurement_rounds: int = 3
     candidates_per_round: int = 4
+    # Early-stopping patience for the evolutionary search. None (default)
+    # disables early-stop so the full generation budget runs.
+    patience: Optional[int] = None
     tiers: list[str] = ["Q4", "Q5", "Q6"]
     verify: bool = False
     verbose: bool = True

@@ -93,6 +93,7 @@ class MagicQuantOrchestrator:
         measurement_rounds: int = 3,
         candidates_per_round: int = 4,
         verbose: bool = True,
+        patience: Optional[int] = None,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run the full Predict -> Measure -> Learn loop.
@@ -210,7 +211,7 @@ class MagicQuantOrchestrator:
             )
 
             round_configs = survivor.run_evolution(
-                groups=self._search_groups, verbose=verbose
+                groups=self._search_groups, verbose=verbose, patience=patience
             )
             all_configs.extend(round_configs)
 
@@ -447,6 +448,7 @@ class MagicQuantOrchestrator:
         max_generations: int = 50,
         population_size: int = 100,
         verbose: bool = True,
+        patience: Optional[int] = None,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run prediction-only evolutionary search (no real measurements).
@@ -524,7 +526,7 @@ class MagicQuantOrchestrator:
         )
 
         best_configs = survivor.run_evolution(
-            groups=self._search_groups, verbose=verbose
+            groups=self._search_groups, verbose=verbose, patience=patience
         )
         tiered = self._pick_best_per_tier(best_configs, baseline_size_gb)
 

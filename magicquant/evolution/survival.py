@@ -95,8 +95,24 @@ class EvolutionarySurvivor:
     def run_evolution(
         self,
         groups: Optional[List[str]] = None,
-        verbose: bool = True
+        verbose: bool = True,
+        patience: Optional[int] = None,
+        min_improvement: float = 1e-4,
     ) -> List[Dict]:
+        """Run the evolutionary search.
+
+        Args:
+            groups: tensor-group keys to vary (defaults to DEFAULT_GROUPS).
+            verbose: print per-generation progress.
+            patience: if set, stop early when the best composite_score does not
+                improve by more than ``min_improvement`` for this many
+                consecutive generations. ``None`` (the default) disables
+                early-stopping so the full ``max_generations`` budget runs —
+                this preserves the historical behavior and keeps the
+                seed-pinned refactor-regression fixture stable.
+            min_improvement: minimum increase in the best composite_score that
+                counts as progress for the patience counter.
+        """
         if groups is None:
             groups = self.DEFAULT_GROUPS
 
@@ -107,6 +123,9 @@ class EvolutionarySurvivor:
 
         best_configs = []
         seen_keys = set()  # O(1) membership instead of O(n*m) re-serialization
+
+        best_score_so_far = float("-inf")
+        gens_without_improvement = 0
 
         for generation in range(self.max_generations):
             predictions = self._predict_population(population)
@@ -122,6 +141,25 @@ class EvolutionarySurvivor:
                 if config_key not in seen_keys:
                     seen_keys.add(config_key)
                     best_configs.append(winner)
+
+            # Early-stopping: track the best composite_score this generation and
+            # stop if it plateaus for `patience` generations. Disabled by
+            # default (patience is None) to keep the full-budget behavior.
+            if patience is not None:
+                gen_best = max(
+                    (w.get('composite_score', float("-inf")) for w in winners),
+                    default=float("-inf"),
+                )
+                if gen_best > best_score_so_far + min_improvement:
+                    best_score_so_far = gen_best
+                    gens_without_improvement = 0
+                else:
+                    gens_without_improvement += 1
+                    if gens_without_improvement >= patience:
+                        if verbose:
+                            print(f"Early stop at gen {generation+1}: no "
+                                  f"improvement for {patience} generations")
+                        break
 
             # Mutation: Protector upgrades brain layers, Crusher downgrades FFN
             mutants = self._mutate_winners(winners, groups)
