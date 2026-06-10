@@ -13,7 +13,7 @@ with the evolutionary pressure finding which tensor groups can tolerate
 MXFP4 and which need protection at higher precision.
 """
 
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 import random
 import copy
 
@@ -106,6 +106,7 @@ class EvolutionarySurvivor:
             print(f"Initialized population of {len(population)} candidates")
 
         best_configs = []
+        seen_keys = set()  # O(1) membership instead of O(n*m) re-serialization
 
         for generation in range(self.max_generations):
             predictions = self._predict_population(population)
@@ -118,7 +119,8 @@ class EvolutionarySurvivor:
 
             for winner in winners:
                 config_key = str(sorted(winner['config'].items()))
-                if config_key not in [str(sorted(c['config'].items())) for c in best_configs]:
+                if config_key not in seen_keys:
+                    seen_keys.add(config_key)
                     best_configs.append(winner)
 
             # Mutation: Protector upgrades brain layers, Crusher downgrades FFN
@@ -260,6 +262,22 @@ class EvolutionarySurvivor:
                 [s.name for s in all_schemes],
                 weights=scheme_weights,
             )[0]
+
+            # Enforce the sensitive-group floor (Q8_0): high-sensitivity
+            # "brain" groups (E, H, O, R) must never be sampled below the
+            # floor. The class weights still allow low-bit picks (mxfp4/k_quant
+            # in _BRAIN_CLASS_WEIGHTS), so clamp here rather than silently
+            # producing a sub-floor sensitive config the Protector can't fix.
+            if g in self._HIGH_SENSITIVITY:
+                floor = self._min_scheme_for_class('sensitive')
+                try:
+                    picked_bpw = get_scheme_by_name(picked).bits_per_weight
+                    floor_bpw = get_scheme_by_name(floor).bits_per_weight
+                    if picked_bpw < floor_bpw:
+                        picked = floor
+                except ValueError:
+                    pass
+
             config[g] = picked
         return config
 
@@ -275,16 +293,16 @@ class EvolutionarySurvivor:
 
     def _classify_into_tiers(self, predictions: List[Dict]) -> Dict[str, List[Dict]]:
         """Classify into tiers using the canonical tier boundaries from
-        ``MagicQuantOrchestrator._classify_tier`` to ensure consistency
+        ``magicquant.quant.tiers.classify_tier`` to ensure consistency
         between evolutionary search and final survivor selection."""
-        from magicquant.orchestrator import MagicQuantOrchestrator
+        from magicquant.quant.tiers import classify_tier
 
         baseline_gb = self.predictor.baseline_size_gb
         tier_assignment: Dict[str, List[Dict]] = {}
 
         for pred in predictions:
             size_gb = pred.get('predicted_size_gb', 1.0)
-            tier = MagicQuantOrchestrator._classify_tier(size_gb, baseline_gb)
+            tier = classify_tier(size_gb, baseline_gb)
 
             if tier not in tier_assignment:
                 tier_assignment[tier] = []
@@ -402,20 +420,3 @@ class EvolutionarySurvivor:
 
     def get_discovered_configs(self, limit: int = 20) -> List[Dict]:
         return self.history[:limit]
-
-
-class HybridValidator:
-    """Validate that hybrids meet MagicQuant quality standards."""
-
-    MAX_ACCEPTABLE_LOSS = 0.05  # 5% precision loss
-
-    @staticmethod
-    def validate_config(
-        config: Dict[str, str],
-        scores: Dict,
-        max_loss: float = MAX_ACCEPTABLE_LOSS
-    ) -> Tuple[bool, List[str]]:
-        reasons = []
-        if scores.get('predicted_loss', 0) > max_loss:
-            reasons.append(f"Loss {scores['predicted_loss']:.4f} exceeds {max_loss}")
-        return len(reasons) == 0, reasons

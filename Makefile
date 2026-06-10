@@ -7,14 +7,10 @@ test:
 	python -m pytest tests/ -v
 
 lint:
-	python -m py_compile magicquant/__init__.py
-	python -m py_compile magicquant/__main__.py
-	python -m py_compile magicquant/orchestrator.py
-	python -m py_compile magicquant/gguf/writer.py
-	python -m py_compile magicquant/quant/converters.py
+	ruff check magicquant/ tests/
 
 format:
-	@echo "No formatter configured — add ruff or black to dev deps"
+	ruff format magicquant/ tests/
 
 build:
 	python -m build

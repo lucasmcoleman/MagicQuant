@@ -15,9 +15,12 @@ from typing import Dict, List, Tuple, Optional
 import os
 import json
 import tempfile
+import logging
 import numpy as np
 
 from magicquant.quant.schemes import get_scheme_by_name
+
+_log = logging.getLogger(__name__)
 
 
 class SensitivityProber:
@@ -227,7 +230,25 @@ class SensitivityProber:
 
             return ppl
 
+        except ValueError as exc:
+            # ValueErrors come from the writer's contract guards (pre-quantized
+            # source, UNKNOWN tensor type, dtype mismatch, LoRA shape). These
+            # are real build bugs / bad inputs, not transient measurement
+            # failures — surface them instead of masking with a fabricated
+            # heuristic PPL.
+            _log.error(
+                "Probe build failed for group '%s' (writer contract error) — "
+                "re-raising rather than falling back to heuristic",
+                group, exc_info=exc,
+            )
+            raise
         except Exception as exc:
+            # Other failures (subprocess / measurement) fall back to heuristic,
+            # but always log the full traceback so the cause is visible.
+            _log.warning(
+                "Probe failed for group '%s' (%s) — using heuristic estimate",
+                group, exc, exc_info=exc,
+            )
             if verbose:
                 print(f"    Probe failed ({exc}), using heuristic")
             return self._heuristic_probe(group, scheme)

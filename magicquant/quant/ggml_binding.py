@@ -285,6 +285,17 @@ class _LibggmlHandle:
         type_id = GGML_TYPE_IDS[ggml_type]
         out_size = _expected_size(ggml_type, flat.size)
 
+        # Bound the output allocation so a corrupt/absurd element count can't
+        # request a multi-terabyte ctypes buffer (raise cleanly instead of
+        # crashing the interpreter). 16 GiB is generous for any single tensor.
+        _MAX_OUT_BYTES = 16 * 1024 ** 3
+        if out_size <= 0 or out_size > _MAX_OUT_BYTES:
+            raise ValueError(
+                f"Refusing to encode: computed output size {out_size} bytes "
+                f"(type={ggml_type}, n_elements={n_per_row}) is out of bounds "
+                f"(0, {_MAX_OUT_BYTES}]. Tensor element count is likely corrupt."
+            )
+
         dst_buf = (ctypes.c_uint8 * out_size)()
 
         imat_ptr = None

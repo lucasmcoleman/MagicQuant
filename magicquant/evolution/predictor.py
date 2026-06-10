@@ -145,11 +145,23 @@ class PredictiveScorer:
             total = sum(self.parameter_counts.get(g, 0) for g in groups)
             if total > 0:
                 return {g: self.parameter_counts.get(g, 0) / total for g in groups}
-        # Fallback: dense transformer approximation
-        _DEFAULT = {
-            'E': 0.04, 'H': 0.04, 'Q': 0.12, 'K': 0.12,
-            'O': 0.06, 'U': 0.31, 'D': 0.31,
-        }
+        # Fallback distribution when no real parameter_counts are available.
+        # If MoE groups (X/R) are present, use a MoE-leaning approximation
+        # where experts hold the bulk of the weights; otherwise use the dense
+        # transformer split. This only matters when parameter_counts is empty
+        # (the real fix is passing actual counts from _estimate_model_size).
+        is_moe = 'X' in groups or 'R' in groups
+        if is_moe:
+            _DEFAULT = {
+                'E': 0.02, 'H': 0.02, 'Q': 0.04, 'K': 0.04,
+                'O': 0.02, 'U': 0.05, 'D': 0.05, 'X': 0.70,
+                'R': 0.01, 'S': 0.05,
+            }
+        else:
+            _DEFAULT = {
+                'E': 0.04, 'H': 0.04, 'Q': 0.12, 'K': 0.12,
+                'O': 0.06, 'U': 0.31, 'D': 0.31, 'S': 0.10,
+            }
         return {g: _DEFAULT.get(g, 0.05) for g in groups}
 
     def _estimate_simple_tps(self, group_schemes: Dict[str, str]) -> float:
@@ -287,16 +299,3 @@ class PredictiveScorer:
 
     def update_sensitivity_weights(self, new_weights: Dict[str, float]):
         self.sensitivity_weights = new_weights
-
-
-class TierClassifier:
-    """Classify hybrids into standard tiers based on size ratio to baseline.
-
-    Delegates to ``MagicQuantOrchestrator._classify_tier`` so that a single
-    set of tier boundaries is used everywhere.
-    """
-
-    @staticmethod
-    def classify_by_size(size_gb: float, baseline_size_gb: float) -> str:
-        from magicquant.orchestrator import MagicQuantOrchestrator
-        return MagicQuantOrchestrator._classify_tier(size_gb, baseline_size_gb)

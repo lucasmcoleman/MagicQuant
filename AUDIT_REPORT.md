@@ -1,3 +1,11 @@
+> **SUPERSEDED — pre-libggml binding (April 2026).** The audited commit
+> predates the May 2026 ctypes refactor that replaced all numpy K-quant
+> encoders with a direct `libggml` binding (byte-identical to llama.cpp). The
+> encoder CRITICAL/HIGH items here (collapse penalty, K-quant clamping, MSE
+> gap, three tier systems, dtype guard/timeout, file-size baseline) are all
+> fixed at HEAD. See `AUDIT_2026-06-09.md` / `AUDIT_FIXPLAN_2026-06-09.md` for
+> the current state. Kept for historical reference only.
+
 # MagicQuant Audit Report
 
 **Date:** 2026-04-03

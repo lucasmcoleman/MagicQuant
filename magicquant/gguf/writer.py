@@ -122,6 +122,15 @@ def _write_string(f, s: str):
 
 
 def _write_metadata_value(f, value: Any):
+    # Normalize numpy scalars (np.int64, np.float32, np.bool_) and 0-d arrays
+    # to native Python types so the isinstance ladder below tags them
+    # correctly. Without this, np.int64 fails `isinstance(value, int)` and
+    # falls through to the STRING branch, writing e.g. head_count as text.
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        value = value.item()
+    elif isinstance(value, np.generic):
+        value = value.item()
+
     if isinstance(value, bool):
         f.write(struct.pack("<I", _GGUF_TYPE_BOOL))
         f.write(struct.pack("<?", value))
@@ -147,26 +156,53 @@ def _write_metadata_value(f, value: Any):
             f.write(struct.pack("<I", _GGUF_TYPE_UINT32))
             f.write(struct.pack("<Q", 0))
         else:
-            first = value[0]
+            # Normalize numpy scalars in the list so type detection works.
+            norm = [
+                v.item() if isinstance(v, (np.generic,)) else v
+                for v in value
+            ]
+            first = norm[0]
             if isinstance(first, str):
                 f.write(struct.pack("<I", _GGUF_TYPE_STRING))
-                f.write(struct.pack("<Q", len(value)))
-                for item in value:
+                f.write(struct.pack("<Q", len(norm)))
+                for item in norm:
                     _write_string(f, str(item))
+            elif isinstance(first, bool):
+                # bool is a subclass of int — handle before the int branch.
+                f.write(struct.pack("<I", _GGUF_TYPE_BOOL))
+                f.write(struct.pack("<Q", len(norm)))
+                for item in norm:
+                    f.write(struct.pack("<?", bool(item)))
             elif isinstance(first, float):
                 f.write(struct.pack("<I", _GGUF_TYPE_FLOAT32))
-                f.write(struct.pack("<Q", len(value)))
-                for item in value:
+                f.write(struct.pack("<Q", len(norm)))
+                for item in norm:
                     f.write(struct.pack("<f", float(item)))
             elif isinstance(first, int):
-                f.write(struct.pack("<I", _GGUF_TYPE_INT32))
-                f.write(struct.pack("<Q", len(value)))
-                for item in value:
-                    f.write(struct.pack("<i", int(item)))
+                # Pick the narrowest tag that fits ALL items so values >= 2^31
+                # don't raise struct.error. Prefer UINT32 for non-negative
+                # arrays, fall back to INT32, then INT64.
+                ints = [int(item) for item in norm]
+                lo, hi = min(ints), max(ints)
+                if lo >= 0 and hi <= 0xFFFFFFFF:
+                    f.write(struct.pack("<I", _GGUF_TYPE_UINT32))
+                    f.write(struct.pack("<Q", len(ints)))
+                    for item in ints:
+                        f.write(struct.pack("<I", item))
+                elif -(2 ** 31) <= lo and hi <= 2 ** 31 - 1:
+                    f.write(struct.pack("<I", _GGUF_TYPE_INT32))
+                    f.write(struct.pack("<Q", len(ints)))
+                    for item in ints:
+                        f.write(struct.pack("<i", item))
+                else:
+                    f.write(struct.pack("<I", _GGUF_TYPE_INT64))
+                    f.write(struct.pack("<Q", len(ints)))
+                    for item in ints:
+                        f.write(struct.pack("<q", item))
             else:
                 f.write(struct.pack("<I", _GGUF_TYPE_STRING))
-                f.write(struct.pack("<Q", len(value)))
-                for item in value:
+                f.write(struct.pack("<Q", len(norm)))
+                for item in norm:
                     _write_string(f, str(item))
     elif isinstance(value, dict):
         import json
@@ -259,13 +295,15 @@ class GGUFWriter:
     def __init__(self, output_path: str):
         self.output_path = output_path
         self.metadata: Dict[str, Any] = {}
+        # One-time warning flag for the BF16 -> F16 on-disk downgrade.
+        self._bf16_downgrade_warned = False
 
     def create_hybrid_gguf(
         self,
         base_model_path: str,
         quant_config: Dict,
         verbose: bool = True,
-        adapter_path: str = None,
+        adapter_path: Optional[str] = None,
     ) -> str:
         """
         Create a hybrid GGUF from any supported source format.
@@ -339,7 +377,16 @@ class GGUFWriter:
                 # BF16 → F16 conversion: llama.cpp has incomplete BF16
                 # support in its compute graph (binary ops, some matmuls
                 # assert sizeof(float) stride).  F16 is universally supported.
+                # This is a deliberate compatibility tradeoff — make it
+                # non-silent by warning once per writer instance.
                 if target_ggml_name == "BF16":
+                    if not self._bf16_downgrade_warned:
+                        logger.warning(
+                            "BF16-designated group(s) written as F16 on disk "
+                            "(llama.cpp BF16 compute-graph limitation). Out-of-F16-"
+                            "range values may become Inf/0."
+                        )
+                        self._bf16_downgrade_warned = True
                     target_ggml_name = "F16"
                     target_ggml_id = GGML_TYPE["F16"]
 
@@ -364,8 +411,20 @@ class GGUFWriter:
                 source_type_name = source.get_source_type_name(name)
                 can_decode = source_type_name in ("F32", "F16", "BF16")
                 if not can_decode:
+                    # The source tensor is not decodable to F32 (pre-quantized
+                    # or an unrecognized type). We pass it through verbatim, so
+                    # the target ggml type IS the source type. UNKNOWN source
+                    # types are a hard error (caught in the bad_tensors pass
+                    # below); never silently default to F32 (id 0), which would
+                    # produce a zero-filled blob masquerading as valid F32.
                     target_ggml_name = source_type_name
-                    target_ggml_id = GGML_TYPE.get(source_type_name, 0)
+                    if source_type_name in GGML_TYPE:
+                        target_ggml_id = GGML_TYPE[source_type_name]
+                    else:
+                        # Unknown / undecodable source type — flag with a
+                        # sentinel id; the bad_tensors pass raises before any
+                        # data is written.
+                        target_ggml_id = -1
 
                 expected_size = ggml_tensor_data_size(target_ggml_name, n_elems)
                 aligned_offset = _align(data_offset)
@@ -386,17 +445,40 @@ class GGUFWriter:
 
                 data_offset = aligned_offset + expected_size
 
-            # ── Validate: detect pre-quantized sources that can't be re-quantized ──
+            # ── Validate: detect pre-quantized / undecodable sources ──
+            # Two distinct failure modes:
+            #   1. UNKNOWN source type — the source could not even identify the
+            #      tensor's format. This is ALWAYS a hard error (it would
+            #      otherwise produce a zero-filled blob with a bogus type id).
+            #   2. A recognized pre-quantized type (e.g. Q4_K) that the user
+            #      asked to re-quantize to a different scheme — also an error,
+            #      since MagicQuant requires high-precision source weights.
             bad_tensors = []
+            unknown_tensors = []
             for entry in tensor_entries:
                 if not entry["_can_decode"]:
                     source_type = entry["_source_type_name"]
-                    # Check if the user wanted a different type than the source
+                    if source_type.startswith("UNKNOWN"):
+                        unknown_tensors.append((entry["name"], source_type))
+                        continue
+                    # Recognized but pre-quantized: error only if the user
+                    # wanted a different type than the source already is.
                     group = entry["_group"]
                     scheme = group_schemes.get(group, base_quant)
                     desired_ggml_name = scheme_map.get(scheme, "Q4_0")
                     if desired_ggml_name != source_type:
                         bad_tensors.append((entry["name"], source_type, desired_ggml_name))
+
+            if unknown_tensors:
+                count = len(unknown_tensors)
+                first_name, first_type = unknown_tensors[0]
+                raise ValueError(
+                    f"Cannot encode {count} tensor(s) with an UNKNOWN/undecodable "
+                    f"source type. First: '{first_name}' (source type '{first_type}'). "
+                    f"The source model has tensors whose ggml type could not be "
+                    f"identified or decoded to F32. MagicQuant requires BF16, F16, "
+                    f"or F32 source weights."
+                )
 
             if bad_tensors:
                 count = len(bad_tensors)
@@ -420,10 +502,20 @@ class GGUFWriter:
             # llama.cpp and HuggingFace use this to report the quantization type.
             # For hybrid models, determine the dominant scheme by counting actual
             # parameter elements per scheme across all tensors (after Pass 1).
+            # Aligned to llama.cpp's LLAMA_FTYPE enum. This is a cosmetic,
+            # human-readable badge only (each tensor carries its own ggml_type,
+            # so inference is unaffected). Generic "Q4_K"/"Q5_K" map to the _M
+            # variant. Previous values (Q4_K->12, Q5_K->16, IQ4_NL->20) were
+            # wrong (12=MOSTLY_Q4_1_SOME_F16-era, 16=Q5_K_S, 20=MOSTLY_IQ2_XS).
             _ftype_map = {
-                "Q8_0": 7, "Q5_K": 16, "Q5_K_M": 17, "Q4_K": 12,
-                "Q4_K_M": 15, "Q6_K": 18, "Q3_K": 11, "Q2_K": 10,
-                "IQ4_NL": 20, "BF16": 32, "F16": 1, "F32": 0,
+                "F32": 0, "F16": 1, "BF16": 32,
+                "Q8_0": 7,
+                "Q6_K": 18,
+                "Q5_K": 17, "Q5_K_M": 17, "Q5_K_S": 16,
+                "Q4_K": 15, "Q4_K_M": 15, "Q4_K_S": 14,
+                "Q3_K": 12, "Q3_K_M": 12,
+                "Q2_K": 10,
+                "IQ4_NL": 25, "IQ4_XS": 30,
             }
             from collections import Counter
             # Count elements per actual target ggml type from tensor_entries
@@ -455,94 +547,26 @@ class GGUFWriter:
 
             t_start = time.monotonic()
 
-            with open(self.output_path, "wb") as f:
-                f.write(struct.pack("<I", 0x46554747))  # magic
-                f.write(struct.pack("<I", 3))            # version
-                f.write(struct.pack("<Q", len(tensor_entries)))
-                f.write(struct.pack("<Q", len(filtered_meta)))
-
-                for key, value in filtered_meta.items():
-                    _write_string(f, key)
-                    _write_metadata_value(f, value)
-
-                for entry in tensor_entries:
-                    _write_string(f, entry["name"])
-                    f.write(struct.pack("<I", entry["n_dims"]))
-                    for dim in reversed(entry["shape"]):
-                        f.write(struct.pack("<Q", dim))
-                    f.write(struct.pack("<I", entry["ggml_type"]))
-                    f.write(struct.pack("<Q", entry["offset"]))
-
-                header_end = f.tell()
-                aligned_header = _align(header_end)
-                if aligned_header > header_end:
-                    f.write(b"\x00" * (aligned_header - header_end))
-
-                # ==========================================================
-                # Pass 2: Pipelined read+encode -> write
-                # ==========================================================
-                data_section_start = f.tell()
-                total = len(tensor_entries)
-                bytes_written = 0
-
-                # Start background read+encode thread
-                result_q: queue.Queue = queue.Queue(maxsize=2)
-                worker = threading.Thread(
-                    target=_read_encode_worker,
-                    args=(source, tensor_entries, result_q),
-                    daemon=True,
+            # Crash-safety: write to a sibling temp file and atomically rename
+            # only after a fully-successful write. A worker exception (dtype
+            # guard, size mismatch, OOM) or a hung encoder thread must leave NO
+            # file at output_path and NO stray .partial behind.
+            tmp_path = self.output_path + ".partial"
+            try:
+                self._write_gguf_body(
+                    tmp_path, filtered_meta, tensor_entries, source,
+                    t_start, verbose,
                 )
-                worker.start()
+            except BaseException:
+                # Remove the partially-written temp file before propagating.
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
 
-                idx = 0
-                while True:
-                    item = result_q.get()
-
-                    # Check for sentinel (done) or exception
-                    if item is None:
-                        break
-                    if isinstance(item, Exception):
-                        # Drain queue so worker thread can finish
-                        import queue as _queue_mod
-                        while True:
-                            try:
-                                result_q.get_nowait()
-                            except _queue_mod.Empty:
-                                break
-                        worker.join(timeout=5)
-                        raise item
-
-                    entry, blob = item
-                    aligned_offset = entry["offset"]
-
-                    # Write alignment padding
-                    current_pos = f.tell() - data_section_start
-                    padding = aligned_offset - current_pos
-                    if padding < 0:
-                        raise RuntimeError(
-                            f"Tensor {entry['name']}: file position {current_pos} "
-                            f"exceeds expected offset {aligned_offset} by {-padding} bytes. "
-                            f"GGUF is corrupt."
-                        )
-                    if padding > 0:
-                        f.write(b"\x00" * padding)
-
-                    f.write(blob)
-                    bytes_written += len(blob)
-                    idx += 1
-
-                    if verbose:
-                        elapsed = time.monotonic() - t_start
-                        speed = bytes_written / (1024**2) / max(elapsed, 0.001)
-                        eta = (elapsed / idx) * (total - idx) if idx > 0 else 0
-                        print(
-                            f"  [{idx}/{total}] {entry['name']}: "
-                            f"{entry['_source_type_name']} -> {entry['_target_ggml_name']} "
-                            f"({entry['_group']})  "
-                            f"{speed:.0f} MB/s  ETA {eta:.0f}s",
-                        )
-
-                worker.join(timeout=5)
+            # Atomic publish (same directory -> os.replace is atomic).
+            os.replace(tmp_path, self.output_path)
 
             elapsed = time.monotonic() - t_start
             output_size_mb = Path(self.output_path).stat().st_size / (1024 * 1024)
@@ -555,6 +579,111 @@ class GGUFWriter:
         finally:
             source.close()
 
+    def _write_gguf_body(
+        self, tmp_path, filtered_meta, tensor_entries, source, t_start, verbose,
+    ) -> None:
+        """Write the full GGUF (header + pipelined data) to ``tmp_path``.
+
+        Raises on any worker error or a hung encoder thread; the caller is
+        responsible for unlinking ``tmp_path`` on failure and renaming it into
+        place on success.
+        """
+        with open(tmp_path, "wb") as f:
+            f.write(struct.pack("<I", 0x46554747))  # magic
+            f.write(struct.pack("<I", 3))            # version
+            f.write(struct.pack("<Q", len(tensor_entries)))
+            f.write(struct.pack("<Q", len(filtered_meta)))
+
+            for key, value in filtered_meta.items():
+                _write_string(f, key)
+                _write_metadata_value(f, value)
+
+            for entry in tensor_entries:
+                _write_string(f, entry["name"])
+                f.write(struct.pack("<I", entry["n_dims"]))
+                for dim in reversed(entry["shape"]):
+                    f.write(struct.pack("<Q", dim))
+                f.write(struct.pack("<I", entry["ggml_type"]))
+                f.write(struct.pack("<Q", entry["offset"]))
+
+            header_end = f.tell()
+            aligned_header = _align(header_end)
+            if aligned_header > header_end:
+                f.write(b"\x00" * (aligned_header - header_end))
+
+            # ==========================================================
+            # Pass 2: Pipelined read+encode -> write
+            # ==========================================================
+            data_section_start = f.tell()
+            total = len(tensor_entries)
+            bytes_written = 0
+
+            # Start background read+encode thread
+            result_q: queue.Queue = queue.Queue(maxsize=2)
+            worker = threading.Thread(
+                target=_read_encode_worker,
+                args=(source, tensor_entries, result_q),
+                daemon=True,
+            )
+            worker.start()
+
+            idx = 0
+            while True:
+                item = result_q.get()
+
+                # Check for sentinel (done) or exception
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    # Drain queue so worker thread can finish
+                    import queue as _queue_mod
+                    while True:
+                        try:
+                            result_q.get_nowait()
+                        except _queue_mod.Empty:
+                            break
+                    worker.join(timeout=5)
+                    raise item
+
+                entry, blob = item
+                aligned_offset = entry["offset"]
+
+                # Write alignment padding
+                current_pos = f.tell() - data_section_start
+                padding = aligned_offset - current_pos
+                if padding < 0:
+                    raise RuntimeError(
+                        f"Tensor {entry['name']}: file position {current_pos} "
+                        f"exceeds expected offset {aligned_offset} by {-padding} bytes. "
+                        f"GGUF is corrupt."
+                    )
+                if padding > 0:
+                    f.write(b"\x00" * padding)
+
+                f.write(blob)
+                bytes_written += len(blob)
+                idx += 1
+
+                if verbose:
+                    elapsed = time.monotonic() - t_start
+                    speed = bytes_written / (1024**2) / max(elapsed, 0.001)
+                    eta = (elapsed / idx) * (total - idx) if idx > 0 else 0
+                    print(
+                        f"  [{idx}/{total}] {entry['name']}: "
+                        f"{entry['_source_type_name']} -> {entry['_target_ggml_name']} "
+                        f"({entry['_group']})  "
+                        f"{speed:.0f} MB/s  ETA {eta:.0f}s",
+                    )
+
+            # Wait for the worker to finish. If it didn't (hung encode),
+            # raise so a truncated file is never renamed into place.
+            worker.join(timeout=30)
+            if worker.is_alive():
+                raise RuntimeError(
+                    "Encoder worker thread did not finish within 30s; "
+                    "aborting to avoid writing a truncated GGUF."
+                )
+
     def set_metadata(self, key: str, value: Any):
         self.metadata[key] = value
 
@@ -565,7 +694,7 @@ class GGUFWriter:
 def create_hybrid_gguf(
     output_path: str, base_model_path: str,
     quant_config: Dict, verbose: bool = True,
-    adapter_path: str = None,
+    adapter_path: Optional[str] = None,
 ) -> str:
     """Convenience function to create a hybrid GGUF model."""
     writer = GGUFWriter(output_path)

@@ -837,6 +837,15 @@ class LoRAMergedSource(ModelSource):
 
         self._base = open_model_source(base_path)
 
+        # Capture the base model's architecture so LoRA tensor-name mapping
+        # picks up arch-specific adjustments (e.g. Qwen3.5 ffn_norm renaming).
+        try:
+            self._base_arch = self._base.get_metadata().get(
+                "general.architecture", ""
+            )
+        except Exception:
+            self._base_arch = ""
+
         # Load adapter config
         if os.path.isdir(adapter_path):
             adapter_dir = adapter_path
@@ -889,15 +898,36 @@ class LoRAMergedSource(ModelSource):
                     base_name = base_name[len("base_model.model."):]
                 elif base_name.startswith("base_model."):
                     base_name = base_name[len("base_model."):]
-                # Convert to GGUF name
-                gguf_name = _hf_name_to_gguf(base_name)
+                # Convert to GGUF name (arch-aware, matching the base source).
+                gguf_name = _hf_name_to_gguf(base_name, arch=self._base_arch)
                 self._lora_map[gguf_name] = (a_key, b_key)
 
     def _read_adapter_tensor(self, key: str) -> np.ndarray:
         info = self._adapter_tensors[key]
+        byte_offset = info["byte_offset"]
+        byte_length = info["byte_length"]
+        data_start = info["data_start"]
+
+        # Bounds-validate against the actual file size before reading so a
+        # malformed/malicious safetensors header can't drive an out-of-range
+        # read (or a short read that silently reshapes garbage).
+        if byte_offset < 0 or byte_length < 0:
+            raise ValueError(
+                f"Adapter tensor '{key}' has negative byte_offset/byte_length "
+                f"({byte_offset}/{byte_length})."
+            )
+        file_size = os.path.getsize(info["filepath"])
+        end = data_start + byte_offset + byte_length
+        if end > file_size:
+            raise ValueError(
+                f"Adapter tensor '{key}' would read past EOF: "
+                f"data_start({data_start}) + byte_offset({byte_offset}) + "
+                f"byte_length({byte_length}) = {end} > file size {file_size}."
+            )
+
         with open(info["filepath"], "rb") as f:
-            f.seek(info["data_start"] + info["byte_offset"])
-            buf = f.read(info["byte_length"])
+            f.seek(data_start + byte_offset)
+            buf = f.read(byte_length)
         dtype = info["dtype"]
         if dtype == "BF16":
             raw = np.frombuffer(buf, dtype=np.uint16)
@@ -936,6 +966,17 @@ class LoRAMergedSource(ModelSource):
         # fan_in_fan_out: transpose delta for Conv1D-based models (GPT-2 style)
         if self._fan_in_fan_out:
             delta = delta.T
+
+        # Shape guard: a mismatched delta would silently corrupt the merge
+        # (reshape could broadcast/raise obscurely). Fail loud, naming the
+        # tensor and both shapes.
+        if base_f32.size != delta.size:
+            raise ValueError(
+                f"LoRA merge shape mismatch for tensor '{tensor_name}': "
+                f"base has {base_f32.size} elements but delta (B@A) has "
+                f"{delta.size} (delta shape {delta.shape}). Check the adapter's "
+                f"rank/target_modules or fan_in_fan_out setting."
+            )
         base_f32 = base_f32.reshape(delta.shape) + delta
 
         return base_f32.flatten()
@@ -971,13 +1012,22 @@ def open_model_source(
         if os.path.exists(adapter_cfg) and adapter_path is None:
             with open(adapter_cfg) as f:
                 cfg = json.load(f)
+            # base_model_name_or_path comes from an untrusted file. We only
+            # follow it if it resolves to an EXISTING LOCAL DIRECTORY (never a
+            # HF repo id / URL — those would require an explicit override).
             base_model = cfg.get("base_model_name_or_path", "")
-            if base_model and os.path.isdir(base_model):
+            if base_model and os.path.isabs(base_model) and os.path.isdir(base_model):
                 return LoRAMergedSource(base_path=base_model, adapter_path=path)
+            # Relative paths are resolved against the adapter directory, not the
+            # CWD, to avoid surprising lookups.
+            if base_model and not os.path.isabs(base_model):
+                candidate = os.path.normpath(os.path.join(path, base_model))
+                if os.path.isdir(candidate):
+                    return LoRAMergedSource(base_path=candidate, adapter_path=path)
             raise ValueError(
                 f"LoRA adapter detected at {path} but base model "
-                f"'{base_model}' not found locally. Download it first or "
-                f"pass the base model path explicitly."
+                f"'{base_model}' could not be resolved to a local directory. "
+                f"Download it first or pass the base model path explicitly."
             )
 
     # Explicit adapter

@@ -4,17 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "magicquant"
-version = "0.1.0"
+version = "0.3.0"
 description = "Evolutionary Tensor Search for Optimal LLM GGUF Hybrid Quantization"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.21.0",
+    # pydantic-settings loads .env internally, so python-dotenv is not needed.
     "pydantic-settings>=2.0.0",
     "structlog>=24.0.0",
     "tenacity>=8.2.0",
-    "python-dotenv>=1.0.0",
     # llama-cpp-python ships libggml-base.so + libggml-cpu.so in its wheel,
     # used by magicquant.quant.ggml_binding for all quantized encoders.
     # Discovery prefers system llama.cpp if available; falls back to this.
@@ -23,7 +23,11 @@ dependencies = [
 
 [project.optional-dependencies]
 yaml = ["pyyaml>=6.0"]
-dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0"]
+# huggingface_hub is only needed for `magicquant card --upload`.
+hf = ["huggingface_hub>=0.20.0"]
+# `gguf` is needed by tests/integration/test_encoder_parity.py to write/read
+# reference GGUFs; without it the parity test skips (not fails).
+dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0", "gguf>=0.10.0", "ruff>=0.5.0"]
 
 [project.scripts]
 magicquant = "magicquant.__main__:main"

@@ -13,40 +13,35 @@ Public API:
 from typing import Dict, Optional
 import numpy as np
 
-from magicquant.quant.ggml_binding import ggml_encode, GGML_TYPE_IDS
+from magicquant.quant.ggml_binding import (
+    ggml_encode,
+    GGML_TYPE_IDS,
+    _GGML_BLOCK_SIZE,
+    _GGML_TYPE_SIZE,
+)
 
 
 # ---------------------------------------------------------------------------
 # ggml block format constants (used by callers for offset/size math).
-# Source of truth for sizes is magicquant.quant.ggml_binding._GGML_TYPE_SIZE;
-# these tables are kept here for backward compatibility with imports.
+#
+# Single source of truth: magicquant.quant.ggml_binding._GGML_BLOCK_SIZE /
+# _GGML_TYPE_SIZE. We derive these tables from the binding so the two can
+# never drift (the previous duplicate hand-maintained tables had IQ4_XS wrong:
+# block=32/size=18 — those are IQ4_NL's values — while the binding correctly
+# had block=256/size=136, causing corrupt Pass-1 offsets the moment PR3
+# registers IQ4_XS). Extra integer/float passthrough types not in the binding
+# are added below for backward-compatible imports.
 # ---------------------------------------------------------------------------
 
-GGML_BLOCK_SIZE = {
-    "F32": 1, "F16": 1, "BF16": 1, "F64": 1,
-    "I8": 1, "I16": 1, "I32": 1, "I64": 1,
-    "Q4_0": 32, "Q4_1": 32, "Q5_0": 32, "Q5_1": 32,
-    "Q8_0": 32, "Q8_1": 32,
-    "Q2_K": 256, "Q3_K": 256, "Q4_K": 256, "Q5_K": 256,
-    "Q6_K": 256, "Q8_K": 256,
-    "IQ2_XXS": 256, "IQ2_XS": 256, "IQ3_XXS": 256,
-    "IQ1_S": 256, "IQ4_NL": 32, "IQ3_S": 256,
-    "IQ2_S": 256, "IQ4_XS": 32, "IQ1_M": 256,
-    "MXFP4": 32,
-}
+GGML_BLOCK_SIZE = dict(_GGML_BLOCK_SIZE)
+GGML_BLOCK_SIZE.update({
+    "F64": 1, "I8": 1, "I16": 1, "I32": 1, "I64": 1,
+})
 
-GGML_TYPE_SIZE = {
-    "F32": 4, "F16": 2, "BF16": 2, "F64": 8,
-    "I8": 1, "I16": 2, "I32": 4, "I64": 8,
-    "Q4_0": 18, "Q4_1": 20, "Q5_0": 22, "Q5_1": 24,
-    "Q8_0": 34, "Q8_1": 36,
-    "Q2_K": 84, "Q3_K": 110, "Q4_K": 144, "Q5_K": 176,
-    "Q6_K": 210, "Q8_K": 292,
-    "IQ2_XXS": 66, "IQ2_XS": 74, "IQ3_XXS": 98,
-    "IQ1_S": 50, "IQ4_NL": 18, "IQ3_S": 110,
-    "IQ2_S": 82, "IQ4_XS": 18, "IQ1_M": 56,
-    "MXFP4": 17,
-}
+GGML_TYPE_SIZE = dict(_GGML_TYPE_SIZE)
+GGML_TYPE_SIZE.update({
+    "F64": 8, "I8": 1, "I16": 2, "I32": 4, "I64": 8,
+})
 
 
 def ggml_tensor_data_size(ggml_type_name: str, n_elements: int) -> int:

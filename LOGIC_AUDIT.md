@@ -1,3 +1,10 @@
+> **SUPERSEDED — pre-libggml binding (April 2026).** This audit predates the
+> May 2026 ctypes refactor (numpy K-quant encoders replaced by a direct
+> `libggml` binding, byte-identical to llama.cpp). Its encoder findings are
+> fixed at HEAD. The still-valid structural items (S/X/R search gap,
+> GGUF-version reader gap, tied_word_embeddings default) were carried into
+> `AUDIT_2026-06-09.md`. Kept for historical reference only.
+
 # MagicQuant Deep Logic Audit
 
 Audited: every `.py` file under `magicquant/`

@@ -61,6 +61,15 @@ class MagicQuantOrchestrator:
         # Track all measured configs across rounds
         self._measured: Dict[str, Dict] = {}  # config_key -> {config, ppl, loss, path}
 
+        # Per-group parameter counts, populated by _estimate_model_size and
+        # fed to PredictiveScorer so MoE size/speed predictions use the real
+        # (mostly-experts) distribution instead of the dense fallback.
+        self._param_counts: Dict[str, int] = {}
+
+        # Detected search groups (includes X/R/S when present), populated by
+        # the search methods and passed to run_evolution.
+        self._search_groups: List[str] = list(EvolutionarySurvivor.DEFAULT_GROUPS)
+
     @property
     def llama_tools(self) -> Optional[LlamaCppTools]:
         """Lazily initialize LlamaCppTools on first access."""
@@ -68,7 +77,7 @@ class MagicQuantOrchestrator:
             try:
                 self._llama_tools = LlamaCppTools(self._llamacpp_path)
             except Exception as exc:
-                log.warning("llama.cpp not available", error=str(exc))
+                log.warning("llama.cpp not available", error=str(exc), exc_info=exc)
                 return None
         return self._llama_tools
 
@@ -153,6 +162,9 @@ class MagicQuantOrchestrator:
             groups.extend(["X", "R"])
         if any(classifier.classify_tensor(t) == "S" for t in tensor_names):
             groups.append("S")
+        # Remember the full detected group set so run_evolution actually
+        # varies X/R/S (otherwise it falls back to DEFAULT_GROUPS).
+        self._search_groups = groups
 
         prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
         self.sensitivity_weights = prober.get_normalized_weights()
@@ -166,10 +178,12 @@ class MagicQuantOrchestrator:
             )
 
         # ── Step 3: Initialize predictor ──
+        # (_estimate_model_size also populates self._param_counts per group.)
         baseline_size_gb = self._estimate_model_size(self.source_model_path)
 
         self.predictor = PredictiveScorer(
             sensitivity_weights=self.sensitivity_weights,
+            parameter_counts=self._param_counts,
             baseline_size_gb=baseline_size_gb,
             baseline_tps=360,
         )
@@ -195,7 +209,9 @@ class MagicQuantOrchestrator:
                 epsilon=0.2,
             )
 
-            round_configs = survivor.run_evolution(verbose=verbose)
+            round_configs = survivor.run_evolution(
+                groups=self._search_groups, verbose=verbose
+            )
             all_configs.extend(round_configs)
 
             # 4b. Pick candidates to measure: tier winners + epsilon picks
@@ -364,7 +380,7 @@ class MagicQuantOrchestrator:
                 adapter_path=self.adapter_path,
             )
         except Exception as exc:
-            log.error("Build failed", stage="build", error=str(exc))
+            log.error("Build failed", stage="build", error=str(exc), exc_info=exc)
             return None
 
     def _select_final_survivors(self, baseline_gb: float) -> Dict[str, Dict]:
@@ -481,15 +497,20 @@ class MagicQuantOrchestrator:
             groups.extend(["X", "R"])
         if any(classifier.classify_tensor(t) == "S" for t in tensor_names):
             groups.append("S")
+        # Remember the full detected group set so run_evolution actually
+        # varies X/R/S (otherwise it falls back to DEFAULT_GROUPS).
+        self._search_groups = groups
 
         prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
         self.sensitivity_weights = prober.get_normalized_weights()
         prober.save_results(str(self.output_dir / "sensitivity.json"))
 
+        # (_estimate_model_size also populates self._param_counts per group.)
         baseline_size_gb = self._estimate_model_size(self.source_model_path)
 
         self.predictor = PredictiveScorer(
             sensitivity_weights=self.sensitivity_weights,
+            parameter_counts=self._param_counts,
             baseline_size_gb=baseline_size_gb,
             baseline_tps=360,
         )
@@ -502,7 +523,9 @@ class MagicQuantOrchestrator:
             epsilon=0.2,
         )
 
-        best_configs = survivor.run_evolution(verbose=verbose)
+        best_configs = survivor.run_evolution(
+            groups=self._search_groups, verbose=verbose
+        )
         tiered = self._pick_best_per_tier(best_configs, baseline_size_gb)
 
         for cfg in best_configs:
@@ -545,7 +568,7 @@ class MagicQuantOrchestrator:
             if not Path(result).is_file():
                 return None
         except Exception as exc:
-            log.error("Generation failed", stage="generate", error=str(exc))
+            log.error("Generation failed", stage="generate", error=str(exc), exc_info=exc)
             return None
 
         if verify and self.baseline_ppl:
@@ -565,7 +588,14 @@ class MagicQuantOrchestrator:
         self, tiered: Dict[str, Dict], model_name_prefix: str = "Model",
         tiers: Optional[List[str]] = None, verify: bool = False,
     ) -> List[str]:
-        """Generate one hybrid GGUF per compression tier."""
+        """Generate one hybrid GGUF per compression tier.
+
+        NOTE: the Q2 tier (size ratio <= 0.16) is currently UNREACHABLE — the
+        smallest registered scheme is Q2_K (bpw=2.625 -> ratio ~0.164, just
+        outside the band). It will log "No config for tier, skipping" until
+        PR3 adds sub-Q2 IQ-quants. Q2 is kept in the default list (and now has
+        an HF filename label) so it fills automatically once PR3 lands.
+        """
         if tiers is None:
             tiers = ["Q8", "Q6", "Q5", "Q4", "Q2"]
 
@@ -635,22 +665,11 @@ class MagicQuantOrchestrator:
 
     @staticmethod
     def _classify_tier(size_gb: float, baseline_gb: float) -> str:
-        if baseline_gb <= 0:
-            return "Q4"
-        ratio = size_gb / baseline_gb
-        # Tighter boundaries: Q6 targets 45-65% of BF16 (not open-ended)
-        # Configs above 65% are over-protected and wasteful
-        if 0.45 < ratio <= 0.65:
-            return "Q6"
-        elif 0.33 < ratio <= 0.45:
-            return "Q5"
-        elif 0.22 < ratio <= 0.33:
-            return "Q4"
-        elif 0.16 < ratio <= 0.22:
-            return "Q3"
-        elif ratio <= 0.16:
-            return "Q2"
-        return "Q8"  # ratio > 0.65 — barely compressed, separate tier
+        # Delegates to the leaf module magicquant.quant.tiers so a single set
+        # of boundaries is used everywhere (and leaf modules need not import
+        # this orchestrator).
+        from magicquant.quant.tiers import classify_tier
+        return classify_tier(size_gb, baseline_gb)
 
     @staticmethod
     def _pick_best_per_tier(configs: List[Dict], baseline_gb: float) -> Dict[str, Dict]:
@@ -671,17 +690,31 @@ class MagicQuantOrchestrator:
         Using ``parameter_count * 2`` bytes gives the true BF16 baseline
         regardless of the source format (which could be a pre-quantized GGUF
         with a smaller on-disk size).
+
+        Side effect: populates ``self._param_counts`` with per-group element
+        counts (classified via TensorGroupClassifier) so the predictor can use
+        the real parameter distribution — critical for MoE models where the
+        experts group X holds the bulk of the weights.
         """
         from magicquant.gguf.source import open_model_source
         try:
             src = open_model_source(model_path)
             try:
+                classifier = TensorGroupClassifier()
+                param_counts: Dict[str, int] = defaultdict(int)
                 total_elements = 0
                 for info in src.get_all_tensors_info():
                     n = 1
                     for d in info["shape"]:
                         n *= d
                     total_elements += n
+                    group = classifier.classify_tensor(info["name"])
+                    param_counts[group] += n
+                # Store for the predictor (drop UNKNOWN so it doesn't skew
+                # group-relative shares; its weights still count toward size).
+                self._param_counts = {
+                    g: c for g, c in param_counts.items() if g != "UNKNOWN"
+                }
                 if total_elements > 0:
                     return (total_elements * 2) / (1024 ** 3)
             finally:

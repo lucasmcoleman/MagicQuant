@@ -37,7 +37,10 @@ class TensorGroupClassifier:
               r'q_norm\.weight$', r'k_norm\.weight$'],
         'E': [r'token_embd\.weight'],
         'H': [r'^output\.weight$', r'lm_head\.weight', r'mtp\.'],
-        'X': [r'ffn.*expert', r'ffn_gate_up_exps', r'ffn_down_exps',
+        # MoE experts. GGUF names them ffn_{up,gate,down}_exps — the prior
+        # `ffn.*expert` (literal "expert") missed them, so ffn_up_exps/ffn_gate_exps
+        # fell through to dense group U. ffn_gate_up_exps (fused) needs its own pattern.
+        'X': [r'ffn_(up|gate|down)_exps', r'ffn_gate_up_exps', r'ffn.*expert',
               r'block_sparse_moe\.(input|output)_linear'],
         'R': [r'ffn_gate_inp', r'router', r'block_sparse_moe\.router'],
         'Q': [r'attn_q\.weight', r'attn_qkv\.weight'],

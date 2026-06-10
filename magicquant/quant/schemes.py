@@ -8,10 +8,13 @@ should hold parallel scheme dicts.
 Bits-per-weight values are computed from the actual ggml block format:
   bpw = (block_bytes * 8) / block_elements
 
-Noise factors are calibrated against published perplexity benchmarks
-across Llama / Qwen / Mistral architectures. (PR0 keeps the existing
-heuristic values; PR1 will replace them with empirically-benched values
-from tools/calibrate_noise_factors.py.)
+Noise factors are HEURISTIC values, ordered to match the published
+perplexity ranking across Llama / Qwen / Mistral architectures. They are
+NOT yet empirically calibrated: running tools/calibrate_noise_factors.py
+(requires llama.cpp + a calibration model, ~2 hr compute) produces
+tools/calibration_results.json, after which these values should be replaced
+with the measured ppl_loss ratios and the refactor-regression fixture
+regenerated (it is seed-pinned to the exact noise values here).
 """
 
 from dataclasses import dataclass
@@ -32,7 +35,7 @@ class QuantizationScheme:
 
     name: str                         # MagicQuant identifier ("Q4_K_M", "MXFP4_MOE", ...)
     ggml_type_name: str               # ggml block type ("Q4_K", "MXFP4", ...)
-    ggml_type_id: int                 # numeric ggml type enum (used by ctypes binding in PR1+)
+    ggml_type_id: int                 # numeric ggml type enum (used by the ctypes binding)
     bits_per_weight: float            # actual storage bpw from ggml block format
     noise_factor: float               # relative quantization noise (lower = better quality)
     speed_multiplier: float = 1.0     # relative inference speed vs BF16
@@ -52,8 +55,8 @@ class QuantizationScheme:
 
 
 # ── Registry ─────────────────────────────────────────────────────────
-# NOTE: ggml_type_id values verified against ggml.h. PR1 adds the ctypes
-# binding that uses these IDs.
+# NOTE: ggml_type_id values are verified against ggml.h and cross-checked at
+# startup by ggml_binding._verify_type_ids (the ctypes binding uses these IDs).
 
 BF16 = QuantizationScheme(
     name="BF16",
@@ -148,20 +151,20 @@ Q4_K_M = QuantizationScheme(
 )
 
 
-# ── New schemes added in PR1 ─────────────────────────────────────────
+# ── Q3_K / Q2_K ──────────────────────────────────────────────────────
 # Q3_K and Q2_K make the Q3 tier band reachable. Q2_K bpw=2.625 lands
-# at ratio 0.164 — just outside the Q2 band (≤0.16); full Q2 band
+# at ratio 0.164 — just outside the Q2 band (<=0.16); full Q2 band
 # coverage requires sub-Q2 IQ-quants from PR3.
 #
-# noise_factor values are placeholders pending the calibration bench
-# in this PR; tools/calibrate_noise_factors.py overwrites them.
+# noise_factor values are HEURISTIC (ordered above Q4_K_M), not yet
+# calibrated — see the module docstring and tools/calibrate_noise_factors.py.
 
 Q3_K = QuantizationScheme(
     name="Q3_K",
     ggml_type_name="Q3_K",
     ggml_type_id=11,
     bits_per_weight=3.4375,   # 110B * 8 / 256 = 3.4375
-    noise_factor=8.0,         # placeholder; calibrated below
+    noise_factor=8.0,         # heuristic; calibration pending
     speed_multiplier=4.0,     # ggml SIMD encoders are fast
     category="k_quant",
     upgrade_neighbor="Q4_K_M",
@@ -173,7 +176,7 @@ Q2_K = QuantizationScheme(
     ggml_type_name="Q2_K",
     ggml_type_id=10,
     bits_per_weight=2.625,    # 84B * 8 / 256 = 2.625
-    noise_factor=15.0,        # placeholder; calibrated below
+    noise_factor=15.0,        # heuristic; calibration pending
     speed_multiplier=4.5,     # smallest blocks → fastest dispatch
     category="k_quant",
     upgrade_neighbor="Q3_K",

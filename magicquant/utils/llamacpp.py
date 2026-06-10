@@ -317,7 +317,7 @@ QUANT_TYPE_MAP: Dict[str, str] = {
     "Q5_K": "Q5_K",
     "Q4_K_M": "Q4_K_M",
     "IQ4_NL": "IQ4_NL",
-    "MXFP4_MOE": "MXFP4",  # MagicQuant custom type (not native llama.cpp)
+    "MXFP4_MOE": "MXFP4",  # native ggml type 39 (GGML_TYPE_MXFP4)
 }
 
 

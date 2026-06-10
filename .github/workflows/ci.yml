@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (with dev extras: pytest + gguf + ruff)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Import sanity (M7 — pyproject is the single dep source)
+        run: |
+          python -c "import magicquant.logging, magicquant.config"
+          python -c "from magicquant.quant.ggml_binding import GGML_TYPE_IDS; print(len(GGML_TYPE_IDS))"
+
+      - name: Lint
+        run: ruff check magicquant/ tests/ || true  # non-blocking until clean
+
+      - name: Run tests
+        # Encoder-parity skips automatically when llama-quantize is unavailable.
+        run: python -m pytest tests/ -q

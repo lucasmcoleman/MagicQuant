@@ -127,41 +127,71 @@ def cmd_probe(args: argparse.Namespace) -> None:
     print(f"\nSensitivity data saved to: {output_file}")
 
 
+def _settings_from_args(args: argparse.Namespace):
+    """Build MagicQuantSettings, honoring env/.env, then override with any
+    explicitly-provided CLI values (argparse default None == not provided).
+
+    This unifies the previously-divergent argparse defaults (50/100) with the
+    pydantic config defaults (30/80) into a single source of truth: config.py.
+    """
+    from magicquant.config import MagicQuantSettings
+
+    # Map argparse names -> settings fields. The model path is required.
+    overrides = {"source_model_path": args.model}
+
+    def _maybe(field, attr):
+        val = getattr(args, attr, None)
+        if val is not None:
+            overrides[field] = val
+
+    _maybe("output_dir", "output_dir")
+    _maybe("llamacpp_path", "llamacpp_path")
+    _maybe("adapter_path", "adapter")
+    _maybe("target_base_quant", "target_quant")
+    _maybe("search_generations", "generations")
+    _maybe("population_size", "population")
+    _maybe("measurement_rounds", "rounds")
+    _maybe("candidates_per_round", "candidates")
+
+    # MagicQuantSettings() reads env/.env first; explicit kwargs (CLI) win.
+    return MagicQuantSettings(**overrides)
+
+
 def cmd_search(args: argparse.Namespace) -> None:
     """Run evolutionary search to find optimal configurations."""
     from magicquant.orchestrator import MagicQuantOrchestrator
 
-    adapter = getattr(args, "adapter", None)
+    settings = _settings_from_args(args)
+
     orchestrator = MagicQuantOrchestrator(
-        source_model_path=args.model,
-        output_dir=args.output_dir,
-        llamacpp_path=args.llamacpp_path,
-        adapter_path=adapter,
+        source_model_path=settings.source_model_path,
+        output_dir=settings.output_dir,
+        llamacpp_path=settings.llamacpp_path,
+        adapter_path=settings.adapter_path,
     )
 
-    rounds = getattr(args, "rounds", 0)
+    rounds = settings.measurement_rounds
 
     if rounds > 0:
         # Full measured search: Predict -> Build -> Measure -> Learn
-        candidates = getattr(args, "candidates", 4)
         all_configs, tiered = orchestrator.run_measured_search(
-            target_base_quant=args.target_quant,
-            search_generations=args.generations,
-            population_size=args.population,
+            target_base_quant=settings.target_base_quant,
+            search_generations=settings.search_generations,
+            population_size=settings.population_size,
             measurement_rounds=rounds,
-            candidates_per_round=candidates,
-            verbose=True,
+            candidates_per_round=settings.candidates_per_round,
+            verbose=settings.verbose,
         )
     else:
         # Prediction-only search (fast, no llama.cpp required)
         all_configs, tiered = orchestrator.run_full_search(
-            target_base_quant=args.target_quant,
-            max_generations=args.generations,
-            population_size=args.population,
-            verbose=True,
+            target_base_quant=settings.target_base_quant,
+            max_generations=settings.search_generations,
+            population_size=settings.population_size,
+            verbose=settings.verbose,
         )
 
-    results_path = Path(args.output_dir) / "search_results.json"
+    results_path = Path(settings.output_dir) / "search_results.json"
     print(f"\nResults saved to: {results_path}")
 
 
@@ -288,25 +318,57 @@ def cmd_generate(args: argparse.Namespace) -> None:
         print(f"  {p}")
 
 
+def cmd_card(args: argparse.Namespace) -> None:
+    """Generate a HuggingFace model card from search_results.json (local-only)."""
+    from magicquant.utils.model_card import generate_model_card
+
+    output_dir = Path(args.output_dir)
+    results_file = output_dir / "search_results.json"
+    if not results_file.exists():
+        print(f"Error: Search results not found at {results_file}")
+        print("Please run 'magicquant search' first")
+        sys.exit(1)
+
+    with open(results_file) as f:
+        results = json.load(f)
+
+    base_name = args.base_model or Path(args.model).stem if getattr(args, "model", None) else (args.base_model or "model")
+    card = generate_model_card(results, base_model_name=base_name)
+
+    card_path = output_dir / "README.md"
+    card_path.write_text(card, encoding="utf-8")
+    print(f"Model card written to: {card_path}")
+
+    if getattr(args, "upload", False):
+        repo = getattr(args, "repo", None)
+        if not repo:
+            print("Error: --upload requires --repo <owner/name>")
+            sys.exit(1)
+        try:
+            from huggingface_hub import upload_file
+        except ImportError:
+            print("Error: --upload requires huggingface_hub "
+                  "(pip install 'magicquant[hf]').")
+            sys.exit(1)
+        upload_file(
+            path_or_fileobj=str(card_path),
+            path_in_repo="README.md",
+            repo_id=repo,
+            repo_type="model",
+        )
+        print(f"Uploaded model card to https://huggingface.co/{repo}")
+
+
 def cmd_dry_run(args: argparse.Namespace) -> None:
     """Validate configuration and source model without running search."""
-    from magicquant.config import MagicQuantSettings
-
     log = get_logger("dry_run")
 
     log.info("Dry run: validating configuration")
 
-    # Build settings from CLI args (mirroring what the search command uses)
-    settings = MagicQuantSettings(
-        source_model_path=args.model,
-        output_dir=args.output_dir,
-        llamacpp_path=getattr(args, "llamacpp_path", None),
-        adapter_path=getattr(args, "adapter", None),
-        target_base_quant=getattr(args, "target_quant", "MXFP4_MOE"),
-        search_generations=getattr(args, "generations", 30),
-        population_size=getattr(args, "population", 80),
-        measurement_rounds=getattr(args, "rounds", 3),
-    )
+    # Build settings the same way cmd_search does so the dry run reflects the
+    # actual resolved configuration (env/.env + CLI overrides; unified 30/80
+    # defaults from config.py).
+    settings = _settings_from_args(args)
 
     # Validate paths
     errors = settings.validate_paths()
@@ -421,29 +483,34 @@ def main() -> None:
         default="MXFP4_MOE",
         help="Target base quantization (default: MXFP4_MOE)",
     )
+    # Defaults are None so we can detect "not provided on CLI" and fall back to
+    # MagicQuantSettings (env / .env / config defaults: 30 generations, 80
+    # population). An explicit CLI value always overrides the settings value.
     search_parser.add_argument(
         "--generations",
         type=int,
-        default=50,
-        help="Number of generations (default: 50)",
+        default=None,
+        help="Number of generations (default: MAGICQUANT_SEARCH_GENERATIONS or 30)",
     )
     search_parser.add_argument(
         "--population",
         type=int,
-        default=100,
-        help="Population size (default: 100)",
+        default=None,
+        help="Population size (default: MAGICQUANT_POPULATION_SIZE or 80)",
     )
     search_parser.add_argument(
         "--llamacpp-path",
         help="Path to llama.cpp directory (auto-detect if omitted)",
     )
     search_parser.add_argument(
-        "--rounds", type=int, default=0,
-        help="Measurement rounds (0 = prediction only, 3+ = full measured search)",
+        "--rounds", type=int, default=None,
+        help="Measurement rounds (0 = prediction only, 3+ = full measured search; "
+             "default: MAGICQUANT_MEASUREMENT_ROUNDS or 3)",
     )
     search_parser.add_argument(
-        "--candidates", type=int, default=4,
-        help="Candidates to build and measure per round (default: 4)",
+        "--candidates", type=int, default=None,
+        help="Candidates to build and measure per round "
+             "(default: MAGICQUANT_CANDIDATES_PER_ROUND or 4)",
     )
     search_parser.add_argument(
         "--adapter",
@@ -500,6 +567,30 @@ def main() -> None:
         help="Path to llama.cpp directory (auto-detect if omitted)",
     )
     generate_parser.set_defaults(func=cmd_generate)
+
+    # ── card ──────────────────────────────────────────────────────────────────
+    card_parser = subparsers.add_parser(
+        "card",
+        help="Generate a HuggingFace model card from search results",
+    )
+    card_parser.add_argument(
+        "--output-dir", default="./output",
+        help="Directory containing search_results.json (default: ./output)",
+    )
+    card_parser.add_argument(
+        "--model", help="Source model path (used to derive the card title)",
+    )
+    card_parser.add_argument(
+        "--base-model", help="Base model name to show on the card",
+    )
+    card_parser.add_argument(
+        "--upload", action="store_true",
+        help="Upload the generated card to HuggingFace (requires huggingface_hub)",
+    )
+    card_parser.add_argument(
+        "--repo", help="Target HF repo id (owner/name) for --upload",
+    )
+    card_parser.set_defaults(func=cmd_card)
 
     # ─────────────────────────────────────────────────────────────────────────
     args = parser.parse_args()

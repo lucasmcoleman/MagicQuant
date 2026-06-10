@@ -29,9 +29,23 @@ COPY --from=builder /opt/llama/bin/ /usr/local/bin/
 COPY --from=builder /opt/llama/lib/ /usr/local/lib/
 RUN ldconfig
 
-COPY pyproject.toml requirements.txt ./
+# Use the libggml we just built and installed (no llama-cpp-python compile in
+# the runtime stage — there is no build toolchain here). ggml_binding
+# discovers it via MAGICQUANT_LIBGGML_DIR.
+ENV MAGICQUANT_LIBGGML_DIR=/usr/local/lib
+
+# requirements.txt was removed; pyproject is the single source of truth.
+COPY pyproject.toml README.md ./
 COPY magicquant/ ./magicquant/
-RUN pip3 install --no-cache-dir -e .
+# Install MagicQuant. llama-cpp-python (a hard dep) needs no compiler when a
+# CPU wheel is available from the official index; we already have system
+# libggml so its bundled libs are only a fallback.
+RUN pip3 install --no-cache-dir \
+        --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
+        -e .
+
+# Smoke check: binding must load at build time.
+RUN python3 -c "from magicquant.quant.ggml_binding import get_handle; get_handle()"
 
 RUN useradd -m -s /bin/bash magicuser \
     && chown -R magicuser:magicuser /app

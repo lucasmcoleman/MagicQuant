@@ -61,6 +61,11 @@ BF16 Source Model
 
 MXFP4 implements the [OCP MX Microscaling](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf) FP4 format (E2M1 values with shared E8M0 exponent). Its non-uniform quantization levels (0, 0.5, 1, 1.5, 2, 3, 4, 6) are denser near zero, naturally matching the Gaussian-like weight distribution of transformers — producing lower noise than integer Q4 at better compression.
 
+> **Note on BF16:** Groups designated `BF16` (brain layers E/H/O) are stored on
+> disk as **F16**, not BF16. llama.cpp's compute graph has incomplete BF16
+> support, so the writer downgrades to F16 (and logs a one-time warning).
+> Values outside the F16 range (|x| > 65504, or subnormals) may become Inf/0.
+
 ## Installation
 
 ```bash
@@ -155,7 +160,9 @@ magicquant/
 
 ## Configuration via Environment
 
-All settings can be provided via environment variables with `MAGICQUANT_` prefix or a `.env` file:
+The `search` command (and `search --dry-run`) reads settings from environment
+variables with the `MAGICQUANT_` prefix or a `.env` file; explicit CLI flags
+override them. Defaults below are the single source of truth (`config.py`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|

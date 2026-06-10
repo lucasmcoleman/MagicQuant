@@ -23,6 +23,10 @@ import pytest
 
 from magicquant.quant.ggml_binding import ggml_encode
 
+# `gguf` is an undeclared-but-required dependency of this module. Use
+# importorskip so the suite SKIPS (not fails collection) when it's absent.
+gguf = pytest.importorskip("gguf")
+
 REF_TENSOR_PATH = Path(__file__).parent.parent / "fixtures" / "reference_tensor.f32.npy"
 
 # Schemes verified in this PR. Q4_0 is included because it's already encoded
@@ -65,8 +69,6 @@ def _write_f32_gguf(tensor: np.ndarray, out_path: Path, tensor_name: str = "test
     """Write a minimal GGUF file containing one F32 tensor with enough llama
     metadata for llama-quantize to load it. Values are fake — llama-quantize
     only requires the keys to exist, it doesn't run inference."""
-    import gguf  # type: ignore
-
     writer = gguf.GGUFWriter(str(out_path), arch="llama")
     writer.add_context_length(2048)
     writer.add_embedding_length(tensor.shape[-1])
@@ -88,8 +90,6 @@ def _read_first_tensor_bytes(gguf_path: Path) -> Tuple[bytes, str]:
 
     Returns (tensor_bytes, ggml_type_name).
     """
-    import gguf  # type: ignore
-
     reader = gguf.GGUFReader(str(gguf_path))
     if not reader.tensors:
         raise RuntimeError(f"no tensors in {gguf_path}")

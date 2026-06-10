@@ -10,13 +10,29 @@ MagicQuant creates hybrid GGUF files with per-tensor-group quantization. Differe
 
 ```bash
 pip install -e .                    # Install (editable)
-pip install -e ".[yaml,dev]"        # With optional deps
+pip install -e ".[yaml,dev]"        # With optional deps (yaml + pytest + gguf)
 magicquant analyze model.gguf       # Inspect tensor groups
 magicquant search model.gguf --rounds 3  # Measured evolutionary search
 magicquant generate model.gguf --tiers Q4,Q5,Q6  # Generate hybrids
 ```
 
-No test suite exists yet. Validate with end-to-end runs on real models.
+### Tests
+
+```bash
+pip install -e ".[dev]"             # pulls pytest + gguf
+python -m pytest tests/ -q          # unit + writer + search + integration
+```
+
+- `tests/test_quantization_guards.py` — dtype guards + encoder output sizes (libggml).
+- `tests/test_tensor_groups.py` — MoE/dense/SSM classification (locks the `*_exps` fix).
+- `tests/test_tiers.py` — tier boundaries (leaf `magicquant.quant.tiers.classify_tier`).
+- `tests/test_writer.py` — crash-safety (.partial + os.replace), UNKNOWN hard error,
+  metadata serialization, BF16->F16 warning, end-to-end read->write->reopen.
+- `tests/integration/test_encoder_parity.py` — byte-for-byte vs `llama-quantize`
+  (skips when `gguf` or `llama-quantize` is unavailable).
+- `tests/test_refactor_regression.py` — seed-pinned evolutionary-search golden fixture;
+  REGENERATE `tests/fixtures/refactor_regression_seed42.json` whenever noise_factors,
+  group sets, the sensitive-group floor clamp, or early-stop change behavior.
 
 ## Architecture
 
@@ -41,9 +57,20 @@ Source (GGUF/safetensors/LoRA) → ModelSource abstraction (source.py)
 - `SafetensorsSource` — reads HF safetensors directories, maps tensor names to GGUF convention, reads config.json for metadata, reads tokenizer.json for vocabulary
 - `LoRAMergedSource` — wraps a base source and applies LoRA deltas on-the-fly during `read_tensor_f32()`
 
-### Quantization (converters.py)
+### Quantization (converters.py + ggml_binding.py)
 
-Single source of truth for all ggml block encoding. `encode_to_ggml_bytes(weights, ggml_type_name)` is the public API. Encoders are vectorized with numpy. K-quant encoders (Q6_K, Q5_K, Q4_K) use RMSE-optimized scale selection (7 candidates per sub-block). The MXFP4 encoder matches llama.cpp's `quantize_row_mxfp4_ref` exactly (split-half nibble packing, doubled kvalues table, E8M0 exponent formula).
+`encode_to_ggml_bytes(weights, ggml_type_name, imatrix=None)` is the public API.
+Float passthroughs (BF16/F16/F32) are native numpy; ALL quantized types route
+through `magicquant.quant.ggml_binding.ggml_encode`, a ctypes binding to
+`libggml` that calls `ggml_quantize_chunk` — the SAME function `llama-quantize`
+uses. Output is therefore **byte-identical** to llama.cpp (proven by
+`tests/integration/test_encoder_parity.py`). There are NO numpy K-quant
+encoders anymore (the May 2026 refactor deleted them).
+
+`ggml_binding._verify_type_ids` runs at first-encode and raises if the loaded
+libggml renumbers/​resizes any type (drift guard). The block/type-size tables in
+converters.py are derived from `ggml_binding._GGML_BLOCK_SIZE/_GGML_TYPE_SIZE`
+(single source of truth) so they cannot drift.
 
 ### Tensor groups (tensor_groups.py)
 
@@ -54,7 +81,10 @@ Groups: E (embeddings), H (head/MTP), Q (query), K (key/value), O (attention out
 - **MXFP4 is ggml type 39** — native llama.cpp support. Never use a custom type ID.
 - **converters.py is the single encoder source** — writer.py must not contain quantization logic.
 - **Shapes are stored row-major** in ModelSource (same as GGUFReader convention). The writer reverses to ggml on-disk order. SafetensorsSource must NOT pre-reverse.
-- **BF16 uses round-to-nearest-even**, not truncation.
+- **BF16 uses round-to-nearest-even**, not truncation. NOTE: BF16-designated
+  groups are written to disk as **F16** (llama.cpp's compute graph has
+  incomplete BF16 support); the writer logs a one-time warning. Out-of-F16-range
+  values may become Inf/0.
 - **Source models must be BF16/F16/F32** — the writer raises ValueError on pre-quantized sources.
 - **LlamaCppTools is lazy** — the orchestrator works without llama.cpp installed (prediction-only mode).
 
@@ -64,6 +94,9 @@ SafetensorsSource strips `model.language_model.` prefix for multimodal models, t
 
 ## Known Limitations
 
-- K-quant encoders use simple min/max with RMSE optimization, not llama.cpp's full importance-matrix-weighted quantization. Quality gap is ~10-27% MSE vs llama.cpp native.
+- Quantized encoding is byte-identical to llama.cpp (it calls libggml directly),
+  so there is NO MSE quality gap. imatrix-weighted quantization is plumbed through
+  `encode_to_ggml_bytes(..., imatrix=)` but imatrix CAPTURE (PR4) is not yet
+  implemented; K-quant/IQ encoding currently runs unweighted.
 - Tokenizer reading only handles BPE (tokenizer.json). SentencePiece (.model) requires protobuf and is not implemented.
 - The evolutionary search mostly rediscovers obvious configs (BF16 brain + MXFP4 FFN) for dense models. Its value comes from the measured search loop and MoE models with larger search spaces.

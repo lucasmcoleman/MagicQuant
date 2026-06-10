@@ -5,7 +5,13 @@ A hybrid quantization framework that dynamically groups tensors by architectural
 and employs evolutionary search to find optimal mixed-precision configurations.
 """
 
-__version__ = "0.1.0"
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("magicquant")
+except Exception:
+    # Editable/uninstalled fallback — keep in sync with pyproject.toml.
+    __version__ = "0.3.0"
 
 from magicquant.quant.schemes import (
     BF16, Q8_0, Q6_K, Q5_K, IQ4_NL, MXFP4_MOE, Q4_K_M, Q3_K, Q2_K,

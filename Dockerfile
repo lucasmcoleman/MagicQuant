@@ -26,11 +26,18 @@ RUN groupadd -g ${GID} magicquant && \
 WORKDIR /app
 
 COPY --from=builder /build/dist/*.whl /tmp/
-RUN pip install --no-cache-dir /tmp/*.whl && rm -f /tmp/*.whl
+# python:3.12-slim has no compiler, so llama-cpp-python (a hard dep) must come
+# from a prebuilt CPU wheel — pull it from the official index rather than
+# compiling from sdist (which would fail without gcc/cmake).
+RUN pip install --no-cache-dir \
+        --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
+        /tmp/*.whl \
+    && rm -f /tmp/*.whl \
+    && python -c "from magicquant.quant.ggml_binding import get_handle; get_handle()"
 
 USER magicquant
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD python -c "import magicquant; print(magicquant.__version__)"
+    CMD python -c "import magicquant; from magicquant.quant.ggml_binding import get_handle; get_handle(); print(magicquant.__version__)"
 
 ENTRYPOINT ["magicquant"]
