@@ -1,0 +1,39 @@
+{
+  "baseline_ppl": 6.1234,
+  "measurements": {},
+  "tiered_survivors": {},
+  "tiered": {
+    "Q4": {
+      "config": {
+        "E": "BF16",
+        "H": "Q8_0",
+        "Q": "Q4_K_M",
+        "K": "Q4_K_M",
+        "O": "Q5_K",
+        "U": "MXFP4_MOE",
+        "D": "MXFP4_MOE",
+        "X": "MXFP4_MOE",
+        "R": "Q8_0"
+      },
+      "ppl": 6.45,
+      "measured_loss": 0.052,
+      "predicted_loss": 0.05,
+      "size_gb": 5.1
+    },
+    "Q6": {
+      "config": {
+        "E": "BF16",
+        "H": "BF16",
+        "Q": "Q6_K",
+        "K": "Q6_K",
+        "O": "Q6_K",
+        "U": "Q6_K",
+        "D": "Q6_K"
+      },
+      "ppl": 6.21,
+      "measured_loss": 0.012,
+      "predicted_loss": 0.011,
+      "size_gb": 7.3
+    }
+  }
+}
