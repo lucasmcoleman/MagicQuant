@@ -5,7 +5,7 @@ plus the QAT-LoRA wrapping/training that compensates for MagicQuant's chosen
 per-group hybrid quant config. Heavy training deps live in the optional ``[qat]``
 extra; importing this package only requires ``torch``.
 
-Public surface (kernels): ``fake_quant``, ``FakeQuantSTE``, ``SCHEME_FAKE_QUANT``.
+v1 public surface (kernels): ``fake_quant``, ``FakeQuantSTE``, ``SCHEME_FAKE_QUANT``.
 (``QATLinear``, ``wrap_model``, ``run_qat`` land in later tasks.)
 """
 

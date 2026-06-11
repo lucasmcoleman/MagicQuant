@@ -17,12 +17,15 @@ from magicquant.qat._ggml_ref import ggml_quant_dequant
 
 
 # Per-scheme tolerance for the libggml round-trip match (mean relative error).
-# Floats are tight; 8-bit loose. (4/5/6-bit K-quants + MXFP4 added in Tasks 2-3.)
+# Floats are tight; 8-bit loose; 4-bit (Q4_K) and MXFP4 wider. (Q6_K/Q5_K in
+# Task 3.)
 _TOLERANCE = {
     "BF16": 0.02,
     "F16": 0.02,
     "F32": 0.001,
     "Q8_0": 0.05,
+    "MXFP4": 0.08,
+    "Q4_K": 0.08,
 }
 
 
@@ -31,7 +34,9 @@ def _ggml_roundtrip(w_np, ggml_type):
     return ggml_quant_dequant(w_np.astype(np.float32), ggml_type)
 
 
-@pytest.mark.parametrize("ggml_type", ["BF16", "F16", "F32", "Q8_0"])
+@pytest.mark.parametrize(
+    "ggml_type", ["BF16", "F16", "F32", "Q8_0", "MXFP4", "Q4_K"]
+)
 def test_fake_quant_matches_libggml(ggml_type):
     torch.manual_seed(0)
     w = torch.randn(256, 256)
@@ -43,7 +48,7 @@ def test_fake_quant_matches_libggml(ggml_type):
     assert rel < tol, f"{ggml_type} fake-quant deviates {rel:.4f} from libggml (tol={tol})"
 
 
-@pytest.mark.parametrize("ggml_type", ["Q8_0"])
+@pytest.mark.parametrize("ggml_type", ["Q8_0", "MXFP4", "Q4_K"])
 def test_fake_quant_idempotent(ggml_type):
     torch.manual_seed(1)
     w = torch.randn(128, 128)
@@ -73,15 +78,33 @@ def test_unmapped_scheme_falls_back_to_bf16():
     assert torch.allclose(out, w.bfloat16().float(), atol=1e-2)
 
 
-def test_registry_has_task1_schemes():
-    for name in ["BF16", "F16", "F32", "Q8_0"]:
+def test_registry_has_task2_schemes():
+    for name in ["BF16", "F16", "F32", "Q8_0", "MXFP4", "Q4_K"]:
         assert name in SCHEME_FAKE_QUANT, f"{name} missing from SCHEME_FAKE_QUANT"
 
 
 def test_fakequantste_backward_is_identity_for_arbitrary_grad():
     """STE backward returns the upstream gradient unchanged (and None for fn)."""
     w = torch.randn(16, 16, requires_grad=True)
-    out = fake_quant(w, "Q8_0")
+    out = fake_quant(w, "Q4_K")
     g = torch.randn(16, 16)
     out.backward(g)
     assert torch.allclose(w.grad, g, atol=1e-6)
+
+
+def test_mxfp4_values_land_on_e2m1_grid():
+    """Every MXFP4 dequant value is a grid entry scaled by a power of two."""
+    torch.manual_seed(2)
+    w = torch.randn(4, 32)  # one block per row
+    out = fake_quant(w, "MXFP4").cpu().numpy()
+    grid = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    for row in out:
+        nz = row[np.abs(row) > 0]
+        for v in nz:
+            mag = abs(v)
+            # value / 2**k must equal a grid magnitude for some integer k
+            ratios = mag / grid[1:]  # exclude zero
+            log2r = np.log2(ratios)
+            assert np.any(np.abs(log2r - np.round(log2r)) < 1e-5), (
+                f"MXFP4 value {v} not on E2M1 grid * 2^k"
+            )
