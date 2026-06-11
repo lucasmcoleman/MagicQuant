@@ -199,6 +199,43 @@ over the same corpus, returning `{plain, qat, delta}`. The confound-controlled
 result above additionally builds the bf16+identical-LoRA control arm so the
 recovery fraction can be computed honestly.
 
+### Production-path proof (real libggml GGUF)
+
+The result above was measured in torch fake-quant space. The same confound-controlled
+design was then repeated **end-to-end through the production path**: every arm was
+`merge_qat_adapters`-merged, saved with transformers, packed to a **real GGUF with
+MagicQuant's libggml encoders** (byte-identical to llama.cpp), and scored with
+`llama-perplexity` (wikitext-2, `-c 512 --chunks 40`). Same aggressive
+Q4_K-attention / MXFP4-FFN hybrid on Qwen2.5-0.5B; QT/BT arms seed-matched, the
+only difference being whether the training forward fake-quantizes:
+
+| Arm | Pack | PPL |
+|-----|------|-----|
+| B — base | F32 | 12.56 |
+| Q — base | hybrid | 14.21 (**+1.65** raw quant damage) |
+| QT — QAT-merged | hybrid | **11.94** |
+| BT — LoRA control | F32 | 10.92 (QT−BT = **+1.02** residual) |
+
+```
+recovery = (1.65 − 1.02) / 1.65 ≈ 38.1%
+```
+
+> **QAT recovery survives the real pack: 38.1% of the quantization damage is
+> recovered in the actual shipped GGUF**, confound-controlled. The QAT'd hybrid
+> (11.94) even lands below the un-quantized base (12.56) — the LoRA's domain
+> adaptation pays for the rest. The real-pack figure is somewhat below the torch
+> fake-quant figures (45–66% across tiers) because training sees a faithful but
+> approximate quant; the gap is the price of the approximation, not a failure of
+> the method.
+
+Getting this number required fixing three GGUF-pack bugs that the proof itself
+exposed (all with regression tests, all general MagicQuant fixes rather than
+QAT-specific): missing `.bias` tensor name-mapping (Qwen qkv-bias models wouldn't
+load), transformers>=5 format drift (BPE merges became pair-arrays, `rope_theta`
+moved into `rope_parameters` — re-saved models packed to garbage), and a missing
+`tokenizer.ggml.pre` key (llama.cpp fell back to the wrong pre-tokenizer regex,
+inflating perplexity on *every* MagicQuant pack — base 21.9→12.6 after the fix).
+
 ---
 
 ## Multimodal and bf16 support
@@ -234,9 +271,10 @@ recovery fraction can be computed honestly.
   of the final model is exact-ggml**: `merge_qat_adapters` hands the *un*-quantized
   merged weight to `magicquant generate`, whose encoder calls `libggml` directly and
   is byte-identical to `llama-quantize`. So there is a small, bounded train/ship
-  mismatch (the adapter is optimized against the approximation, the shipped weights
-  are quantized exactly), which the validated recovery already accounts for —
-  the result above is measured on the *real* packed GGUFs, not the fake-quant.
+  mismatch: the adapter is optimized against the approximation, the shipped weights
+  are quantized exactly. The 47.5% figure was measured in torch fake-quant space;
+  the **production-path proof above re-measures on the real packed GGUFs and gets
+  38.1%** — the difference is the measured cost of that mismatch.
 - **The QAT model can beat the bf16 reference outright** (15.13 < 16.35 here), but
   that is LoRA domain adaptation, not quantization magic. Always cite the
   confound-controlled +3.19 → +1.67 gap, not the raw quant-vs-QAT drop, when
