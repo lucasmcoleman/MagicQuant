@@ -75,17 +75,9 @@ def _run_perplexity(gguf_path: Path, corpus: Path, perplexity_bin: str) -> float
             f"llama-perplexity failed (rc={proc.returncode}):\n"
             f"stderr: {proc.stderr[-500:]}"
         )
-    # Parse output: lines like "[<n>]<ppl>" or final "Final estimate: PPL = <num> +/- ..."
-    for line in reversed(proc.stdout.splitlines()):
-        if "Final estimate" in line and "PPL" in line:
-            # Format: "Final estimate: PPL = 12.3456 +/- 0.06789"
-            parts = line.split("=")
-            if len(parts) >= 2:
-                return float(parts[1].strip().split()[0])
-    raise RuntimeError(
-        "could not parse perplexity from llama-perplexity output:\n"
-        f"{proc.stdout[-500:]}"
-    )
+    # Single source of truth for the "Final estimate: PPL = ..." parsing.
+    from magicquant.qat.validate import parse_perplexity
+    return parse_perplexity(proc.stdout)
 
 
 def _build_uniform_gguf(
