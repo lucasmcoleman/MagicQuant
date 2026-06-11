@@ -412,6 +412,17 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
                 val = int(val)
             meta[gguf_key] = val
 
+    # transformers >=5 nests rope_theta inside ``rope_parameters`` and drops the
+    # flat ``rope_theta`` field, so the field_map above misses it for any model
+    # re-saved by a recent transformers (e.g. a merged/QAT model). Fall back to
+    # rope_parameters.rope_theta for ANY arch — without it the GGUF gets the default
+    # RoPE base and the model outputs garbage (Qwen2.5 needs 1e6, not the 1e4 default).
+    if f"{arch}.rope.freq_base" not in meta:
+        rope_params = effective.get("rope_parameters") or {}
+        rope_theta = rope_params.get("rope_theta")
+        if rope_theta is not None:
+            meta[f"{arch}.rope.freq_base"] = float(rope_theta)
+
     # ── Architecture-specific metadata ──
     # Qwen3.5 requires several additional keys that llama.cpp checks for:
     #   - rope.dimension_sections (MRoPE sections from rope_parameters)
@@ -473,6 +484,27 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
             meta[f"{arch}.ssm.conv_kernel"] = int(conv_kernel)
 
     return meta
+
+
+def _normalize_merges(merges: list) -> list:
+    """Normalize BPE merges to llama.cpp's space-joined string form.
+
+    transformers <5 stored each merge in tokenizer.json as a space-joined string
+    ("Ġ Ġ"); transformers >=5 stores it as a pair-array (["Ġ", "Ġ"]). llama.cpp's
+    GGUF BPE loader only understands the string form — it splits each merge on the
+    first space to recover the pair. If the pair-array form is written verbatim it
+    lands in the GGUF as a Python list repr ("['Ġ', 'Ġ']"), BPE merging silently
+    fails, and any model re-saved by a recent transformers (e.g. a merged QAT
+    model) tokenizes to garbage even though its weights are byte-identical to a
+    working model.
+    """
+    normalized = []
+    for m in merges:
+        if isinstance(m, (list, tuple)):
+            normalized.append(" ".join(m))
+        else:
+            normalized.append(m)
+    return normalized
 
 
 def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
@@ -557,10 +589,11 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
         meta["tokenizer.ggml.scores"] = scores
         meta["tokenizer.ggml.token_type"] = token_types
 
-    # Extract BPE merges
+    # Extract BPE merges (normalizing transformers>=5's pair-array format back
+    # to the space-joined string form llama.cpp's GGUF BPE loader requires).
     merges = model_info.get("merges", [])
     if merges:
-        meta["tokenizer.ggml.merges"] = merges
+        meta["tokenizer.ggml.merges"] = _normalize_merges(merges)
 
     # ── tokenizer_config.json (special token IDs) ──
     config_path = os.path.join(model_dir, "tokenizer_config.json")
