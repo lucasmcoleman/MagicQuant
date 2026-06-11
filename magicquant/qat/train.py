@@ -331,6 +331,41 @@ def _freeze_to_lora_only(model) -> int:
     return n_trainable
 
 
+def _enable_gradient_checkpointing(model) -> bool:
+    """Turn on gradient checkpointing if the model supports it.
+
+    Cuts activation memory (re-computes activations in the backward pass instead
+    of storing them) for big models. Guarded: models without HF's
+    ``gradient_checkpointing_enable`` (or where it raises) are left untouched with
+    a warning, so an exotic architecture never fails the run. Returns whether it
+    was actually enabled.
+    """
+    enable = getattr(model, "gradient_checkpointing_enable", None)
+    if not callable(enable):
+        _log.warning(
+            "gradient_checkpointing requested but %s has no callable "
+            "gradient_checkpointing_enable; skipping.", type(model).__name__,
+        )
+        return False
+    try:
+        # use_reentrant=False is the non-deprecated path; pass it when accepted.
+        try:
+            enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            enable()
+    except Exception as exc:  # never let an opt-in memory knob fail the run
+        _log.warning("gradient_checkpointing_enable failed (%s); skipping.", exc)
+        return False
+    # Checkpointing needs inputs that require grad; HF exposes this helper.
+    if hasattr(model, "enable_input_require_grads"):
+        try:
+            model.enable_input_require_grads()
+        except Exception:  # best-effort
+            pass
+    _log.info("Gradient checkpointing enabled.")
+    return True
+
+
 def _save_adapters(model, out_dir: str) -> str:
     """Save all QATLinear LoRA params to ``adapter_model.safetensors``."""
     from safetensors.torch import save_file
@@ -352,6 +387,11 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     ``scheme_by_group`` or (``config`` + ``tier``).
     Optional: ``lora_r`` (8), ``lora_alpha`` (16), ``epochs`` (1), ``max_steps``
     (-1 = full), ``lr`` (2e-4), ``max_seq_len`` (512).
+
+    Training schedule (sensible defaults, all overridable): ``warmup_ratio``
+    (0.03), ``weight_decay`` (0.0), ``max_grad_norm`` (1.0), ``lr_scheduler``
+    ('cosine'). Set ``gradient_checkpointing`` (False) to trade compute for
+    activation memory on big models.
     """
     from transformers import Trainer, TrainingArguments
 
@@ -364,6 +404,13 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     max_steps = int(cfg.get("max_steps", -1))
     lr = float(cfg.get("lr", 2e-4))
     max_seq_len = int(cfg.get("max_seq_len", 512))
+
+    # Training schedule defaults (production-grade, all overridable via cfg).
+    warmup_ratio = float(cfg.get("warmup_ratio", 0.03))
+    weight_decay = float(cfg.get("weight_decay", 0.0))
+    max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
+    lr_scheduler = str(cfg.get("lr_scheduler", "cosine"))
+    gradient_checkpointing = bool(cfg.get("gradient_checkpointing", False))
 
     scheme_by_group = _resolve_scheme_by_group(cfg)
 
@@ -392,6 +439,9 @@ def run_qat(cfg: Dict[str, Any]) -> str:
             "training has no trainable parameters."
         )
 
+    if gradient_checkpointing:
+        _enable_gradient_checkpointing(model)
+
     rows = _read_jsonl(cfg["dataset"])
     train_examples = _build_dataset(tokenizer, rows, max_seq_len)
     if not train_examples:
@@ -413,6 +463,10 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         num_train_epochs=epochs,
         max_steps=max_steps,
         learning_rate=lr,
+        warmup_ratio=warmup_ratio,
+        weight_decay=weight_decay,
+        max_grad_norm=max_grad_norm,
+        lr_scheduler_type=lr_scheduler,
         logging_steps=1,
         save_strategy="no",
         report_to=[],
@@ -443,6 +497,11 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         "max_steps": max_steps,
         "lr": lr,
         "max_seq_len": max_seq_len,
+        "warmup_ratio": warmup_ratio,
+        "weight_decay": weight_decay,
+        "max_grad_norm": max_grad_norm,
+        "lr_scheduler": lr_scheduler,
+        "gradient_checkpointing": gradient_checkpointing,
         "trainable_params": n_trainable,
         "adapter_file": os.path.basename(adapter_path),
     }
