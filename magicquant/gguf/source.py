@@ -279,6 +279,17 @@ def _hf_name_to_gguf(hf_name: str, arch: str = "") -> str:
     if hf_name in ("output.weight", "lm_head.weight"):
         return "output.weight"
 
+    # Bias tensors share their projection's mapping (the patterns below only cover
+    # .weight). Map the corresponding .weight name and swap the suffix, so e.g.
+    # Qwen2's q/k/v `*_proj.bias` becomes `blk.N.attn_{q,k,v}.bias` (llama.cpp
+    # requires these for qkv-bias architectures; without it the GGUF won't load).
+    if hf_name.endswith(".bias"):
+        weight_name = hf_name[: -len(".bias")] + ".weight"
+        mapped = _hf_name_to_gguf(weight_name, arch)
+        if mapped != weight_name and mapped.endswith(".weight"):
+            return mapped[: -len(".weight")] + ".bias"
+        return hf_name  # projection's .weight didn't map -> leave bias untouched
+
     # Strip common multimodal prefixes so patterns match the LLM core
     stripped = hf_name
     for prefix in ("model.language_model.", "language_model."):
