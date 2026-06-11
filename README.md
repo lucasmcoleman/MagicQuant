@@ -132,6 +132,16 @@ scheme-by-group, hyperparams, config hash) are written to `--out`. Merge the
 adapters, then pack the exact hybrid with `magicquant generate`. In Foundry this
 is surfaced as the **QAT** pipeline stage (toggle + config + live logs).
 
+**Validated result.** In a confound-controlled run on Qwen2.5-0.5B base with an
+aggressive Q4_K-attention/MXFP4-FFN hybrid — bf16 PPL 16.35, plain quant 19.54
+(+3.19 damage), quant+QAT 15.13, and a bf16+identical-LoRA control 13.46 — the
+quant-vs-bf16 gap shrank from +3.19 to +1.67 once the LoRA's own domain adaptation
+is held fixed on both arms. **QAT recovered 47.5% of the quantization loss beyond
+plain LoRA domain-adaptation.** Recovery scales with quant aggressiveness, and the
+final GGUF pack is exact-ggml (byte-identical to llama.cpp) even though training
+uses a faithful torch fake-quant. See [`docs/qat.md`](docs/qat.md) for the full
+methodology, the fake-quant/STE design, multimodal/bf16 support, and caveats.
+
 ### Manual Hybrid from YAML Config
 
 ```yaml

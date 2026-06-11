@@ -96,6 +96,17 @@ training deps (torch/transformers/peft/trl/datasets) live in the `[qat]` extra;
 the package `__init__` keeps `run_qat` lazily imported (from `qat.train`) so the
 light surface only needs torch. Surfaced as Foundry's **QAT** pipeline stage.
 
+**Validated.** In a confound-controlled run on Qwen2.5-0.5B base with an
+aggressive Q4_K-attention/MXFP4-FFN hybrid: bf16 PPL 16.35, plain quant 19.54
+(+3.19 damage), quant+QAT 15.13, and a bf16+identical-LoRA control 13.46. Holding
+the LoRA's domain adaptation fixed on both arms, the quant-vs-bf16 gap shrank from
++3.19 to +1.67 — **QAT recovered 47.5% of the quantization loss beyond plain LoRA
+domain-adaptation**. Recovery scales with quant aggressiveness; the GGUF pack of
+the final model is exact-ggml (`merge_qat_adapters` → `magicquant generate`, byte-
+identical to llama.cpp) while training uses the faithful-but-approximate torch
+fake-quant. Multimodal (Gemma-3/4) and bf16 bases are supported (QAT targets the
+text decoder). Full write-up: `docs/qat.md`.
+
 ## Critical Invariants
 
 - **MXFP4 is ggml type 39** — native llama.cpp support. Never use a custom type ID.
