@@ -17,8 +17,9 @@ from magicquant.qat._ggml_ref import ggml_quant_dequant
 
 
 # Per-scheme tolerance for the libggml round-trip match (mean relative error).
-# Floats are tight; 8-bit loose; 4-bit (Q4_K) and MXFP4 wider. (Q6_K/Q5_K in
-# Task 3.)
+# Floats are tight; 8-bit loose; 4/5/6-bit K-quants and MXFP4 wider (the
+# fake-quant approximates the K-quant 6-bit scale/min sub-quantization with fp16
+# scales, and MXFP4 is only 16 levels).
 _TOLERANCE = {
     "BF16": 0.02,
     "F16": 0.02,
@@ -26,6 +27,8 @@ _TOLERANCE = {
     "Q8_0": 0.05,
     "MXFP4": 0.08,
     "Q4_K": 0.08,
+    "Q6_K": 0.06,
+    "Q5_K": 0.06,
 }
 
 
@@ -35,7 +38,7 @@ def _ggml_roundtrip(w_np, ggml_type):
 
 
 @pytest.mark.parametrize(
-    "ggml_type", ["BF16", "F16", "F32", "Q8_0", "MXFP4", "Q4_K"]
+    "ggml_type", ["BF16", "F16", "F32", "Q8_0", "MXFP4", "Q4_K", "Q6_K", "Q5_K"]
 )
 def test_fake_quant_matches_libggml(ggml_type):
     torch.manual_seed(0)
@@ -48,7 +51,7 @@ def test_fake_quant_matches_libggml(ggml_type):
     assert rel < tol, f"{ggml_type} fake-quant deviates {rel:.4f} from libggml (tol={tol})"
 
 
-@pytest.mark.parametrize("ggml_type", ["Q8_0", "MXFP4", "Q4_K"])
+@pytest.mark.parametrize("ggml_type", ["Q8_0", "MXFP4", "Q4_K", "Q6_K", "Q5_K"])
 def test_fake_quant_idempotent(ggml_type):
     torch.manual_seed(1)
     w = torch.randn(128, 128)
@@ -78,8 +81,8 @@ def test_unmapped_scheme_falls_back_to_bf16():
     assert torch.allclose(out, w.bfloat16().float(), atol=1e-2)
 
 
-def test_registry_has_task2_schemes():
-    for name in ["BF16", "F16", "F32", "Q8_0", "MXFP4", "Q4_K"]:
+def test_registry_has_v1_schemes():
+    for name in ["BF16", "F16", "F32", "Q8_0", "MXFP4", "Q4_K", "Q6_K", "Q5_K"]:
         assert name in SCHEME_FAKE_QUANT, f"{name} missing from SCHEME_FAKE_QUANT"
 
 

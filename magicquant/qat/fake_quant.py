@@ -17,10 +17,9 @@ output is within a per-scheme tolerance of the real libggml round-trip
 (``ggml_encode`` -> ``dequantize_row_*``). These are GPU-fast approximations,
 not byte-exact reimplementations — STE makes exact gradients moot.
 
-Scheme set so far (Task 2): BF16, F16, F32, Q8_0, MXFP4, Q4_K. Any scheme without
+v1 scheme set: BF16, F16, F32, Q8_0, MXFP4, Q4_K, Q6_K, Q5_K. Any scheme without
 a kernel falls back to BF16 passthrough with a logged warning, so a hybrid is
-always trainable (just not quant-aware for the unmapped groups). Q6_K/Q5_K are
-added in Task 3.
+always trainable (just not quant-aware for the unmapped groups).
 """
 
 from __future__ import annotations
@@ -204,6 +203,40 @@ def _fq_q4_k(w: torch.Tensor) -> torch.Tensor:
     return _fq_kquant_min(w, n_bits=4)
 
 
+def _fq_q5_k(w: torch.Tensor) -> torch.Tensor:
+    return _fq_kquant_min(w, n_bits=5)
+
+
+# ── Q6_K: symmetric 6-bit, 16 sub-blocks of 16 ───────────────────────────────
+
+def _fq_q6_k(w: torch.Tensor) -> torch.Tensor:
+    """Symmetric 6-bit K-quant: 256-elem super-block of 16 sub-blocks of 16,
+    each with its own scale. ggml stores per-sub scale as int8 × a single fp16
+    super factor; the fake-quant approximates with a per-sub fp16 scale.
+
+    The signed level range is clamped symmetrically to ``[-31, 31]`` (ggml uses
+    ``[-32, 31]``; dropping the lone ``-32`` level makes the quantizer a clean
+    fixed point — ``max|q| == 31`` always, so re-deriving ``scale = amax/31``
+    from the dequant output reproduces the same scale and ``fq(fq(w)) == fq(w)``).
+    The fidelity cost is negligible (well within the Q6_K tolerance)."""
+    super_block = 256
+    sub = 16
+    n_sub = super_block // sub  # 16
+    lvl = 31
+
+    blocks, shape, n = _to_blocks(w, super_block)
+    sb = blocks.reshape(blocks.shape[0], n_sub, sub)
+
+    amax = sb.abs().amax(dim=-1, keepdim=True)  # (n_super, n_sub, 1)
+    scale = _round_to_fp16(amax / lvl)
+    inv_scale = torch.where(scale > 0, 1.0 / scale, torch.zeros_like(scale))
+    q = torch.clamp(torch.round(sb * inv_scale), -lvl, lvl)
+    deq = q * scale
+
+    deq = deq.reshape(blocks.shape[0], super_block)
+    return _from_blocks(deq, shape, n)
+
+
 # ── Registry + dispatcher ────────────────────────────────────────────────────
 
 SCHEME_FAKE_QUANT: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
@@ -213,6 +246,8 @@ SCHEME_FAKE_QUANT: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "Q8_0": _fq_q8_0,
     "MXFP4": _fq_mxfp4,
     "Q4_K": _fq_q4_k,
+    "Q6_K": _fq_q6_k,
+    "Q5_K": _fq_q5_k,
 }
 
 
