@@ -507,6 +507,42 @@ def _normalize_merges(merges: list) -> list:
     return normalized
 
 
+# Map HuggingFace pre_tokenizer Split regexes -> llama.cpp's ``tokenizer.ggml.pre``
+# names. These regexes are copied verbatim across a model family, so an exact match
+# reliably identifies the pre-tokenizer. llama.cpp picks its splitting regex from
+# this name; without it llama.cpp falls back to 'default' and prints "GENERATION
+# QUALITY WILL BE DEGRADED!", tokenizing text wrongly (perplexity inflates badly).
+_PRETOK_REGEX_TO_PRE = {
+    # Qwen2 / Qwen2.5 (also deepseek-r1-qwen) — note the bare ``\p{N}``.
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+": "qwen2",
+    # Llama-3 and the many llama-bpe descendants — ``\p{N}{1,3}`` groups digits.
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+": "llama-bpe",
+    # GPT-2 / GPT-NeoX / Falcon / MPT / OLMo family (the classic GPT-2 regex).
+    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+": "gpt-2",
+}
+
+
+def _detect_tokenizer_pre(tok_json: Dict[str, Any]):
+    """Identify llama.cpp's ``tokenizer.ggml.pre`` name from a tokenizer.json.
+
+    Returns the canonical pre name (e.g. ``"qwen2"``) or ``None`` if the
+    pre_tokenizer regex isn't recognized (caller should leave the key unset so
+    llama.cpp surfaces its own degradation warning rather than us masking it).
+    """
+    pre = tok_json.get("pre_tokenizer")
+    if not isinstance(pre, dict):
+        return None
+    # pre_tokenizer is either a single Split or a Sequence of pre-tokenizers.
+    candidates = pre.get("pretokenizers", []) if pre.get("type") == "Sequence" else [pre]
+    for c in candidates:
+        if isinstance(c, dict) and c.get("type") == "Split":
+            pattern = c.get("pattern", {})
+            regex = pattern.get("Regex") if isinstance(pattern, dict) else None
+            if regex is not None:
+                return _PRETOK_REGEX_TO_PRE.get(regex)
+    return None
+
+
 def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
     """
     Read tokenizer data from a HuggingFace model directory and return
@@ -534,6 +570,20 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
         meta["tokenizer.ggml.model"] = "llama"
     else:
         meta["tokenizer.ggml.model"] = "gpt2"
+
+    # Pre-tokenizer type. llama.cpp REQUIRES this to pick the correct splitting
+    # regex; without it, it warns "GENERATION QUALITY WILL BE DEGRADED" and
+    # tokenizes with the wrong regex (perplexity inflates). Leave the key unset
+    # when unrecognized so llama.cpp's own warning still surfaces.
+    pre = _detect_tokenizer_pre(tok)
+    if pre is not None:
+        meta["tokenizer.ggml.pre"] = pre
+    else:
+        _log.warning(
+            "Unrecognized BPE pre-tokenizer regex — leaving tokenizer.ggml.pre "
+            "unset. llama.cpp will warn 'GENERATION QUALITY WILL BE DEGRADED'. "
+            "Add the regex to _PRETOK_REGEX_TO_PRE in gguf/source.py to fix."
+        )
 
     # Extract vocabulary: {token_string: id}
     vocab = model_info.get("vocab", {})
@@ -628,6 +678,14 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
                 val = val.get("content", "")
             if isinstance(val, str) and val in all_token_ids:
                 meta[gguf_key] = all_token_ids[val]
+
+        # Whether to prepend BOS at tokenization time. llama.cpp otherwise
+        # applies its own per-arch default (often True), which silently corrupts
+        # perplexity for models that don't use BOS (e.g. Qwen has it False).
+        if "add_bos_token" in tok_cfg:
+            meta["tokenizer.ggml.add_bos_token"] = bool(tok_cfg["add_bos_token"])
+        if "add_eos_token" in tok_cfg and tok_cfg["add_eos_token"] is not None:
+            meta["tokenizer.ggml.add_eos_token"] = bool(tok_cfg["add_eos_token"])
 
         # Chat template
         chat_template = tok_cfg.get("chat_template")
