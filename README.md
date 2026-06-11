@@ -76,6 +76,18 @@ pip install -e .
 
 Requires Python 3.9+ and NumPy. Optional: [llama.cpp](https://github.com/ggerganov/llama.cpp) for real perplexity measurement during probing.
 
+For **Quantization-Aware Training** (`magicquant qat`) install the optional
+`[qat]` extra, which pulls the heavy training stack (the core install stays
+torch-free):
+
+```bash
+pip install -e ".[qat]"   # torch, transformers, peft, trl, datasets
+```
+
+> `torch` must be the build that works on your hardware (the ROCm wheel on AMD,
+> CUDA on NVIDIA, or CPU). Install the matching wheel first if the default index
+> doesn't provide it.
+
 ## Usage
 
 ### Full Pipeline
@@ -93,6 +105,32 @@ magicquant search model-bf16.gguf --output-dir ./output --generations 50
 # 4. Generate best Q4, Q5, Q6 hybrid GGUFs
 magicquant generate model-bf16.gguf --output-dir ./output --tiers Q4,Q5,Q6
 ```
+
+### Quantization-Aware Training (QAT-LoRA)
+
+`magicquant qat` fine-tunes a model to be robust to a chosen per-group hybrid
+config *before* it ships as that hybrid. It freezes the base model,
+fake-quantizes it to the search's per-group schemes in the forward pass (a
+differentiable per-scheme fake-quant with a straight-through estimator, validated
+against libggml), and trains LoRA adapters that compensate. Largest benefit at the
+aggressive tiers (Q2/Q3/MXFP4). Requires the `[qat]` extra (see Installation).
+
+```bash
+# Train adapters robust to the Q4 tier from a prior search's results.
+magicquant qat ./my-model \
+    --config ./output/search_results.json \
+    --tier Q4 \
+    --dataset data/chat.jsonl \
+    --out ./output/qat_adapters \
+    --lora-r 32 --lora-alpha 64 --epochs 1 --lr 2e-4
+```
+
+The per-group hybrid config comes from a prior `search`'s `search_results.json`
+(`--config` + `--tier`); the dataset is a chat JSONL (`{"messages": [...]}` per
+line) trained with completion-only loss. Adapters + a `qat_meta.json` (base model,
+scheme-by-group, hyperparams, config hash) are written to `--out`. Merge the
+adapters, then pack the exact hybrid with `magicquant generate`. In Foundry this
+is surfaced as the **QAT** pipeline stage (toggle + config + live logs).
 
 ### Manual Hybrid from YAML Config
 
@@ -151,6 +189,13 @@ magicquant/
     probing.py         — Sensitivity measurement (real or heuristic)
     predictor.py       — Loss/size/speed prediction with collapse penalties
     survival.py        — Evolutionary search with Protector/Crusher mutations
+  qat/                 — Quantization-Aware Training (QAT-LoRA); needs the [qat] extra
+    fake_quant.py      — Differentiable per-scheme fake-quant + STE (vs libggml)
+    wrap.py            — QATLinear (fake-quants merged base+LoRA) + wrap_model
+    names.py           — HF module -> GGUF tensor name mapping (reuses source.py)
+    config.py          — load_hybrid_config: search_results.json -> {group: ggml_type}
+    train.py           — run_qat: the QAT-LoRA loop (completion-only) + adapters
+    validate.py        — perplexity comparison (QAT hybrid vs plain hybrid)
   utils/
     llamacpp.py        — llama.cpp integration for perplexity measurement
     naming.py          — Hybrid model filename generation
