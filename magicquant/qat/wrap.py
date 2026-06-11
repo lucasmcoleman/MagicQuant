@@ -92,9 +92,13 @@ class QATLinear(nn.Module):
         return self.base_weight + delta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w_eff = self.merged_weight()
+        # Build the merged weight and fake-quant it in fp32 — the block-scale math
+        # needs the range, and this lets the frozen base be bf16 (large models) while
+        # the LoRA adapters + optimizer state stay fp32. Cast back to the input dtype
+        # for the matmul so a bf16 activation path works end to end.
+        w_eff = self.base_weight.float() + self.scaling * (self.lora_B.float() @ self.lora_A.float())
         w_fq = fake_quant(w_eff, self.ggml_type_name)
-        return F.linear(x, w_fq, self.bias)
+        return F.linear(x, w_fq.to(x.dtype), self.bias)
 
     def extra_repr(self) -> str:
         return (

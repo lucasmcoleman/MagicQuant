@@ -146,29 +146,78 @@ def _build_dataset(tokenizer, rows: List[Dict[str, Any]], max_seq_len: int):
 
 # ── model loading (with offline fallback) ─────────────────────────────────────
 
-def _load_model_and_tokenizer(model_id: str):
-    """Load an HF causal-LM + tokenizer, falling back to a tiny offline model.
+def _resolve_dtype(dtype) -> torch.dtype:
+    """Map a cfg dtype (str | torch.dtype | None) to a torch dtype.
 
-    Returns ``(model, tokenizer, loaded_from)`` where ``loaded_from`` is the model
-    id or ``"offline-tiny-llama"`` if the download failed.
+    None → bf16 on GPU (fits large models), fp32 on CPU (bf16 matmul is spotty there).
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if dtype in (None, "auto"):
+        return torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    return {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+            "fp16": torch.float16, "float16": torch.float16,
+            "fp32": torch.float32, "float32": torch.float32}[str(dtype).lower()]
 
-    # QAT runs in float32: the fake-quant kernels upcast to fp32 for their
-    # block-scale math anyway, and CPU bf16 matmul support is spotty. A bf16
-    # base would also mismatch the fp32-init LoRA params in QATLinear.forward.
-    dtype = torch.float32
+
+def _from_pretrained(cls, model_id, dtype):
+    """Load with the transformers-5 ``dtype=`` kwarg, falling back to ``torch_dtype=``."""
+    try:
+        return cls.from_pretrained(model_id, dtype=dtype)
+    except TypeError:
+        return cls.from_pretrained(model_id, torch_dtype=dtype)
+
+
+def _load_model_and_tokenizer(model_id: str, dtype=None):
+    """Load an HF model (causal-LM or multimodal conditional-gen) + tokenizer,
+    falling back to a tiny offline model if the download fails.
+
+    Tries causal-LM first, then multimodal auto-classes (so QAT can target the text
+    decoder of models like Gemma-3/4, which are ``*ForConditionalGeneration`` /
+    ``*ForMultimodalLM``, not ``*ForCausalLM``). The vision/audio Linears simply
+    don't route in ``wrap_model`` (their names don't map to GGUF tensor names), so
+    only the text-decoder weights get fake-quant QAT.
+
+    Returns ``(model, tokenizer, loaded_from)``.
+    """
+    import transformers
+    from transformers import AutoTokenizer
+
+    dtype = _resolve_dtype(dtype)
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_id)
-        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype)
-        return model, _ensure_pad_and_template(tokenizer), model_id
     except Exception as exc:  # network/cache miss -> offline tiny model
-        _log.warning(
-            "Could not load %r (%s); falling back to an offline tiny LlamaForCausalLM "
-            "so the run can proceed (smoke/CI path).",
-            model_id, exc,
-        )
+        _log.warning("Could not load tokenizer for %r (%s); offline tiny fallback.", model_id, exc)
         return _build_offline_tiny_model()
+
+    # In order of specificity: plain causal LM, then the multimodal/conditional-gen
+    # auto-classes a modern Gemma exposes.
+    candidates = [
+        "AutoModelForCausalLM",
+        "AutoModelForMultimodalLM",
+        "AutoModelForImageTextToText",
+        "AutoModelForVision2Seq",
+        "AutoModel",
+    ]
+    last_exc = None
+    for cls_name in candidates:
+        cls = getattr(transformers, cls_name, None)
+        if cls is None:
+            continue
+        try:
+            model = _from_pretrained(cls, model_id, dtype)
+        except Exception as exc:
+            last_exc = exc
+            continue
+        _log.info("Loaded %r with %s (dtype=%s).", model_id, cls_name, dtype)
+        return model, _ensure_pad_and_template(tokenizer), model_id
+
+    _log.warning(
+        "Could not load %r with any auto-class (last error: %s); falling back to an "
+        "offline tiny LlamaForCausalLM (smoke/CI path).",
+        model_id, last_exc,
+    )
+    return _build_offline_tiny_model()
 
 
 def _ensure_pad_and_template(tokenizer):
@@ -318,7 +367,9 @@ def run_qat(cfg: Dict[str, Any]) -> str:
 
     scheme_by_group = _resolve_scheme_by_group(cfg)
 
-    model, tokenizer, loaded_from = _load_model_and_tokenizer(cfg["model"])
+    model, tokenizer, loaded_from = _load_model_and_tokenizer(
+        cfg["model"], dtype=cfg.get("dtype")
+    )
 
     # Wrap routed Linears with per-group fake-quant QATLinears, then freeze.
     wrap_model(
@@ -328,10 +379,16 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         lora_r=lora_r,
         lora_alpha=lora_alpha,
     )
+    n_qat = sum(1 for m in model.modules() if isinstance(m, QATLinear))
     n_trainable = _freeze_to_lora_only(model)
-    if n_trainable == 0:
+    _log.info(
+        "Wrapped %d Linear modules as QATLinear (%d trainable LoRA params).",
+        n_qat, n_trainable,
+    )
+    if n_qat == 0:
         _log.warning(
-            "No QATLinear layers were created (scheme_by_group matched nothing); "
+            "No QATLinear layers were created (scheme_by_group matched no routable "
+            "Linear names — check the model's text-decoder naming vs hf_to_ggml_name); "
             "training has no trainable parameters."
         )
 
@@ -345,6 +402,11 @@ def run_qat(cfg: Dict[str, Any]) -> str:
 
     collator = CompletionOnlyCollator(pad_token_id=tokenizer.pad_token_id or 0)
 
+    # Match the trainer's mixed-precision flag to the model's loaded dtype.
+    model_dtype = next(model.parameters()).dtype
+    use_bf16 = model_dtype == torch.bfloat16
+    use_fp16 = model_dtype == torch.float16
+
     args = TrainingArguments(
         output_dir=os.path.join(out_dir, "_trainer"),
         per_device_train_batch_size=1,
@@ -355,7 +417,8 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         save_strategy="no",
         report_to=[],
         use_cpu=not torch.cuda.is_available(),
-        bf16=False,
+        bf16=use_bf16,
+        fp16=use_fp16,
         dataloader_num_workers=0,
     )
 
