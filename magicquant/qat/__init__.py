@@ -21,6 +21,8 @@ __all__ = [
     "SCHEME_FAKE_QUANT",
     "QATLinear",
     "wrap_model",
+    "bake_for_eval",
+    "merge_qat_adapters",
     "run_qat",
     "hf_to_ggml_name",
     "load_hybrid_config",
@@ -34,6 +36,8 @@ _LAZY = {
     "SCHEME_FAKE_QUANT": ("magicquant.qat.fake_quant", "SCHEME_FAKE_QUANT"),
     "QATLinear": ("magicquant.qat.wrap", "QATLinear"),
     "wrap_model": ("magicquant.qat.wrap", "wrap_model"),
+    "bake_for_eval": ("magicquant.qat.wrap", "bake_for_eval"),
+    "merge_qat_adapters": ("magicquant.qat.wrap", "merge_qat_adapters"),
     "run_qat": ("magicquant.qat.train", "run_qat"),
 }
 

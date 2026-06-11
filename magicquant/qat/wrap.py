@@ -69,6 +69,11 @@ class QATLinear(nn.Module):
         self.lora_B = nn.Parameter(torch.zeros(out_features, lora_r))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
+        # Eval-time bake: ``fake_quant(merged_weight)`` precomputed once so a
+        # no-grad perplexity pass skips the per-forward fake-quant. ``None`` =
+        # live (training) path. Not a Parameter/buffer: it's a transient cache.
+        self._baked_weight: Optional[torch.Tensor] = None
+
     @classmethod
     def from_linear(
         cls,
@@ -92,6 +97,10 @@ class QATLinear(nn.Module):
         return self.base_weight + delta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Eval fast-path: if a weight has been baked (see ``bake_for_eval``), the
+        # fake-quant of the merged weight was precomputed once — just matmul it.
+        if self._baked_weight is not None:
+            return F.linear(x, self._baked_weight.to(x.dtype), self.bias)
         # Build the merged weight and fake-quant it in fp32 — the block-scale math
         # needs the range, and this lets the frozen base be bf16 (large models) while
         # the LoRA adapters + optimizer state stay fp32. Cast back to the input dtype
@@ -156,6 +165,91 @@ def wrap_model(
             lora_alpha=lora_alpha,
         )
         _set_submodule(model, name, qat)
+
+    return model
+
+
+class _BakeHandle:
+    """Toggle returned by :func:`bake_for_eval`.
+
+    Holds the baked ``QATLinear`` modules so the fake-quant fast-path can be torn
+    down (``restore``). Doubles as a context manager: ``with bake_for_eval(m):``
+    bakes on enter and restores on exit.
+    """
+
+    def __init__(self, modules):
+        self._modules = list(modules)
+
+    def restore(self) -> None:
+        """Drop the baked weights — every QATLinear goes back to the live path."""
+        for m in self._modules:
+            m._baked_weight = None
+
+    def __enter__(self) -> "_BakeHandle":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self.restore()
+        return False
+
+
+@torch.no_grad()
+def bake_for_eval(target: nn.Module) -> _BakeHandle:
+    """Precompute ``fake_quant(merged_weight)`` for each QATLinear and swap its
+    forward to a plain ``F.linear`` on that baked weight.
+
+    For a no-grad perplexity eval this avoids re-running the (expensive)
+    fake-quant kernel on every forward — the shipped weight is the same for the
+    whole eval, so quantize it once. The baked output equals the live QATLinear
+    output (the same ``fake_quant(merged_weight)`` is used), just without the
+    per-call recompute.
+
+    ``target`` may be a single ``QATLinear`` or any module containing them. Call
+    the returned handle's ``restore()`` (or use it as a context manager) to drop
+    the bake and return to the live (training) path.
+    """
+    if isinstance(target, QATLinear):
+        modules = [target]
+    else:
+        modules = [m for m in target.modules() if isinstance(m, QATLinear)]
+    for m in modules:
+        w_eff = m.base_weight.float() + m.scaling * (m.lora_B.float() @ m.lora_A.float())
+        m._baked_weight = fake_quant(w_eff, m.ggml_type_name).detach()
+    return _BakeHandle(modules)
+
+
+@torch.no_grad()
+def merge_qat_adapters(model: nn.Module) -> nn.Module:
+    """Replace each ``QATLinear`` with a plain ``nn.Linear`` holding the merged
+    (base + scaled LoRA) weight — **not** fake-quantized.
+
+    This is the handoff into MagicQuant's real pack: the exact ggml quantization
+    of the merged weight happens later in ``magicquant generate`` (byte-identical
+    to llama.cpp), so the merged Linear must carry the full-precision merged
+    weight, not the fake-quant approximation used during training. Bias is
+    preserved; the result is a vanilla module a standard HF save/convert handles.
+
+    Mutates ``model`` in place and returns it.
+    """
+    to_replace = []
+    for name, module in model.named_modules():
+        if isinstance(module, QATLinear):
+            to_replace.append((name, module))
+
+    for name, module in to_replace:
+        merged = module.merged_weight().detach()
+        linear = nn.Linear(
+            module.in_features,
+            module.out_features,
+            bias=module.bias is not None,
+        )
+        linear = linear.to(device=merged.device, dtype=merged.dtype)
+        linear.weight = nn.Parameter(merged.clone(), requires_grad=False)
+        if module.bias is not None:
+            linear.bias = nn.Parameter(
+                module.bias.detach().clone().to(merged.dtype), requires_grad=False
+            )
+        _set_submodule(model, name, linear)
 
     return model
 
