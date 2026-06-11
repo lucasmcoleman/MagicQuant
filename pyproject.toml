@@ -28,9 +28,25 @@ hf = ["huggingface_hub>=0.20.0"]
 # `gguf` is needed by tests/integration/test_encoder_parity.py to write/read
 # reference GGUFs; without it the parity test skips (not fails).
 dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0", "gguf>=0.10.0", "ruff>=0.5.0"]
+# Quantization-Aware Training (QAT-LoRA). Heavy training stack — only needed for
+# `magicquant qat`; the core install is unchanged. torch must be the build that
+# works on this box (ROCm/CPU); install the matching wheel as appropriate.
+qat = [
+    "torch>=2.2.0",
+    "transformers>=4.40.0",
+    "peft>=0.10.0",
+    "trl>=0.8.0",
+    "datasets>=2.18.0",
+]
 
 [project.scripts]
 magicquant = "magicquant.__main__:main"
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "gpu: marks tests that require a GPU (deselect with '-m \"not gpu\"')",
+]
 
 [project.urls]
 Repository = "https://github.com/lucasmcoleman/MagicQuant"

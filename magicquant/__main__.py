@@ -343,6 +343,56 @@ def cmd_generate(args: argparse.Namespace) -> None:
         print(f"  {p}")
 
 
+def cmd_qat(args: argparse.Namespace) -> None:
+    """Run QAT-LoRA: fine-tune adapters robust to a per-group hybrid quant config."""
+    from magicquant.config import MagicQuantSettings
+    from magicquant.qat.train import run_qat
+
+    log = get_logger("qat")
+
+    # Route the output dir through MagicQuantSettings so MAGICQUANT_OUTPUT_DIR
+    # (env / .env) and --out apply uniformly with the other commands. The source
+    # model is the HF model id/path; it doubles as the settings source path.
+    settings_overrides = {"source_model_path": args.source_model}
+    if getattr(args, "out", None) is not None:
+        settings_overrides["output_dir"] = args.out
+    settings = MagicQuantSettings(**settings_overrides)
+
+    out_dir = args.out or str(Path(settings.output_dir) / "qat_adapters")
+
+    # The per-group hybrid config comes from either an explicit scheme map (not a
+    # CLI option) or a search_results.json + tier. The CLI uses --config/--tier.
+    cfg = {
+        "model": args.source_model,
+        "dataset": args.dataset,
+        "out": out_dir,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "epochs": args.epochs,
+        "max_steps": args.max_steps,
+        "lr": args.lr,
+        "max_seq_len": args.max_seq_len,
+    }
+    if args.config:
+        cfg["config"] = args.config
+        cfg["tier"] = args.tier
+    else:
+        log.error("--config (a search_results.json) and --tier are required")
+        sys.exit(1)
+
+    log.info(
+        "Starting QAT-LoRA",
+        model=args.source_model,
+        config=args.config,
+        tier=args.tier,
+        dataset=args.dataset,
+        out=out_dir,
+    )
+
+    result = run_qat(cfg)
+    print(f"\nQAT adapters written to: {result}")
+
+
 def cmd_card(args: argparse.Namespace) -> None:
     """Generate a HuggingFace model card from search_results.json (local-only)."""
     from magicquant.utils.model_card import generate_model_card
@@ -610,6 +660,46 @@ def main() -> None:
         help="Path to LoRA adapter directory",
     )
     generate_parser.set_defaults(func=cmd_generate)
+
+    # ── qat ───────────────────────────────────────────────────────────────────
+    qat_parser = subparsers.add_parser(
+        "qat",
+        help="QAT-LoRA: train adapters robust to a per-group hybrid quant config",
+    )
+    qat_parser.add_argument(
+        "source_model",
+        help="HF model id or path to fine-tune (e.g. ./my-model or org/name)",
+    )
+    qat_parser.add_argument(
+        "--config", required=True,
+        help="Path to search_results.json (the per-group hybrid config source)",
+    )
+    qat_parser.add_argument(
+        "--tier", default="Q4",
+        help="Tier within search_results.json to target (default: Q4)",
+    )
+    qat_parser.add_argument(
+        "--dataset", required=True,
+        help="Path to a chat JSONL dataset ({'messages': [...]} per line)",
+    )
+    qat_parser.add_argument(
+        "--out", default=None,
+        help="Output adapter directory "
+             "(default: MAGICQUANT_OUTPUT_DIR/qat_adapters)",
+    )
+    qat_parser.add_argument("--lora-r", dest="lora_r", type=int, default=32,
+                            help="LoRA rank (default: 32)")
+    qat_parser.add_argument("--lora-alpha", dest="lora_alpha", type=float,
+                            default=64.0, help="LoRA alpha (default: 64)")
+    qat_parser.add_argument("--epochs", type=float, default=1.0,
+                            help="Training epochs (default: 1)")
+    qat_parser.add_argument("--max-steps", dest="max_steps", type=int, default=-1,
+                            help="Max training steps (-1 = full epochs)")
+    qat_parser.add_argument("--lr", type=float, default=2e-4,
+                            help="Learning rate (default: 2e-4)")
+    qat_parser.add_argument("--max-seq-len", dest="max_seq_len", type=int,
+                            default=512, help="Max sequence length (default: 512)")
+    qat_parser.set_defaults(func=cmd_qat)
 
     # ── card ──────────────────────────────────────────────────────────────────
     card_parser = subparsers.add_parser(
