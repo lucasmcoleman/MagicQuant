@@ -54,22 +54,31 @@ def _check_tool(name: str) -> str:
     return found
 
 
-def _baseline_ppl(model_path: Path, corpus: Path, perplexity_bin: str) -> float:
+def _baseline_ppl(model_path: Path, corpus: Path, perplexity_bin: str,
+                  chunks: int = 40) -> float:
     """Run llama-perplexity on the unquantized BF16 model. Returns scalar ppl."""
     print(f"[baseline] computing BF16 perplexity for {model_path.name}...")
-    return _run_perplexity(model_path, corpus, perplexity_bin)
+    return _run_perplexity(model_path, corpus, perplexity_bin, chunks=chunks)
 
 
-def _run_perplexity(gguf_path: Path, corpus: Path, perplexity_bin: str) -> float:
-    """Run llama-perplexity once and parse final perplexity from stdout."""
+def _run_perplexity(gguf_path: Path, corpus: Path, perplexity_bin: str,
+                    chunks: int = 40) -> float:
+    """Run llama-perplexity once and parse final perplexity from stdout.
+
+    chunks bounds the measurement (40 × 512-token chunks ≈ a stable estimate
+    in ~1-2 min on CPU). The previous default — the WHOLE corpus under a hard
+    900 s timeout — could not finish for a bf16 1B+ model on a contended CPU,
+    so calibration silently died on the baseline (observed twice).
+    """
     cmd = [
         perplexity_bin,
         "-m", str(gguf_path),
         "-f", str(corpus),
         "--ctx-size", "512",
+        "--chunks", str(chunks),
         "--threads", str(os.cpu_count() or 4),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
     if proc.returncode != 0:
         raise RuntimeError(
             f"llama-perplexity failed (rc={proc.returncode}):\n"
@@ -112,6 +121,10 @@ def main():
         "--skip", nargs="*", default=["BF16"],
         help="scheme names to skip (BF16 is the baseline; default skips it)",
     )
+    ap.add_argument(
+        "--chunks", type=int, default=40,
+        help="llama-perplexity chunks per measurement (default 40)",
+    )
     args = ap.parse_args()
 
     if not args.model.exists():
@@ -127,7 +140,8 @@ def main():
         tmpdir_path = Path(tmpdir)
 
         # Baseline: source model is already BF16, so use it directly.
-        baseline_ppl = _baseline_ppl(args.model, args.corpus, perplexity_bin)
+        baseline_ppl = _baseline_ppl(args.model, args.corpus, perplexity_bin,
+                                     chunks=args.chunks)
         print(f"[baseline] PPL = {baseline_ppl:.4f}")
 
         results: Dict[str, Dict[str, float]] = {}
@@ -148,7 +162,8 @@ def main():
                 }
                 continue
             try:
-                ppl = _run_perplexity(gguf_path, args.corpus, perplexity_bin)
+                ppl = _run_perplexity(gguf_path, args.corpus, perplexity_bin,
+                                      chunks=args.chunks)
                 results[scheme.name] = {
                     "ppl": ppl,
                     "ppl_loss": ppl - baseline_ppl,
