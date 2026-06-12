@@ -225,6 +225,23 @@ def _requires_imatrix(target_ggml_name: str) -> bool:
     return get_handle().requires_imatrix(target_ggml_name)
 
 
+def _block32_fallback(target_ggml_name: str, row_size: int, group: str) -> str:
+    """Pick a fallback type when a K-quant (block 256) can't encode ``row_size``.
+
+    K-quant block size is 256, so a row width that isn't a multiple of 256 can't
+    be K-quantized. Rather than bloat to F32 (lossless but huge — this turned a
+    ~14 GB MoE pack into 39 GB), prefer a block-32 quant that DOES fit: MXFP4 for
+    low-bit targets, Q8_0 for high-bit. F32 is kept only where it's genuinely
+    needed — SSM/linear-attention conv operands (group ``S``, which llama.cpp
+    requires in F32) — or when the row isn't even 32-divisible (no block-32
+    scheme fits either).
+    """
+    if group == "S" or row_size % 32 != 0:
+        return "F32"
+    low_bit = target_ggml_name in ("Q2_K", "Q3_K", "Q4_K", "IQ4_NL", "MXFP4")
+    return "MXFP4" if low_bit else "Q8_0"
+
+
 def _read_encode_worker(source, entries, result_queue, imatrix=None):
     """
     Background thread: reads each tensor from source, encodes to ggml bytes,
@@ -416,18 +433,22 @@ class GGUFWriter:
                 # Block-size compatibility check: quantized types require the
                 # contiguous row dimension (ne[0] in GGUF) to be a multiple of
                 # the block size.  The writer stores shapes in row-major order
-                # and reverses when writing, so ne[0] = shape[-1].  Fall back
-                # to F32 for tensors that don't meet the requirement.  F32 is
-                # used (not F16) because some ops (SSM conv1d) assert F32
-                # operands.  These tensors are small, so F32 is negligible.
+                # and reverses when writing, so ne[0] = shape[-1].  K-quants use
+                # a 256-block; rows that don't fit fall back to a block-32 quant
+                # (MXFP4/Q8_0) rather than F32 — F32 is lossless but enormous for
+                # big tensors like MoE experts (it once turned a ~14 GB pack into
+                # 39 GB).  F32 is kept only where required (SSM conv operands) or
+                # for rows that aren't 32-divisible either.
                 row_size = shape[-1] if len(shape) >= 1 else 1
                 block_size = GGML_BLOCK_SIZE.get(target_ggml_name, 1)
                 if block_size > 1 and row_size % block_size != 0:
+                    fallback = _block32_fallback(target_ggml_name, row_size, group)
                     if verbose:
                         print(f"  [COMPAT] {name}: row_size={row_size} not divisible by "
-                              f"{target_ggml_name} block_size={block_size}, falling back to F32")
-                    target_ggml_name = "F32"
-                    target_ggml_id = GGML_TYPE["F32"]
+                              f"{target_ggml_name} block_size={block_size}, "
+                              f"falling back to {fallback}")
+                    target_ggml_name = fallback
+                    target_ggml_id = GGML_TYPE[fallback]
 
                 n_elems = _tensor_n_elements(shape)
 

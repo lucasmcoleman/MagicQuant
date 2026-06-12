@@ -87,7 +87,13 @@ class GGUFReader:
         self.metadata: Dict[str, Any] = {}
         self.tensors: List[Dict[str, Any]] = []
         self.data_offset: int = 0
-        
+        self._opened = False
+
+    def _ensure_open(self):
+        """Parse the file on first access if it hasn't been opened explicitly."""
+        if not self._opened:
+            self.open()
+
     def __enter__(self):
         """Context manager entry."""
         self.open()
@@ -98,7 +104,11 @@ class GGUFReader:
         self.close()
     
     def open(self):
-        """Open and parse the GGUF file."""
+        """Open and parse the GGUF file. Idempotent — safe to call repeatedly
+        and via both the context manager and lazy accessor paths."""
+        if self._opened:
+            return
+        self._opened = True
         with open(self.filepath, 'rb') as f:
             # Read magic number
             magic = struct.unpack('<I', f.read(4))[0]
@@ -194,14 +204,17 @@ class GGUFReader:
     
     def get_metadata(self) -> Dict[str, Any]:
         """Get all model metadata."""
+        self._ensure_open()
         return self.metadata.copy()
     
     def get_tensor_names(self) -> List[str]:
         """Get list of tensor names in the model."""
+        self._ensure_open()
         return [t['name'] for t in self.tensors]
     
     def get_tensor_info(self, name: str) -> Optional[Dict[str, Any]]:
         """Get information about a specific tensor."""
+        self._ensure_open()
         for tensor in self.tensors:
             if tensor['name'] == name:
                 return tensor
@@ -209,10 +222,12 @@ class GGUFReader:
     
     def get_all_tensors_info(self) -> List[Dict[str, Any]]:
         """Get information about all tensors."""
+        self._ensure_open()
         return [t.copy() for t in self.tensors]
     
     def get_model_architecture(self) -> str:
         """Get the model architecture name from metadata."""
+        self._ensure_open()
         # Common metadata keys for architecture
         arch_keys = [
             'general.architecture',
@@ -235,6 +250,7 @@ class GGUFReader:
     
     def get_parameter_count(self) -> int:
         """Total element count across all tensors (including 1-D norms/biases)."""
+        self._ensure_open()
         total = 0
         for tensor in self.tensors:
             shape = tensor['shape']
@@ -250,6 +266,7 @@ class GGUFReader:
     
     def get_bits_per_weight(self) -> float:
         """Estimate average bits per weight from model size."""
+        self._ensure_open()
         params = self.get_parameter_count()
         if params == 0:
             return 8.0
@@ -267,6 +284,7 @@ class GGUFReader:
         Returns:
             List of tensor info dicts matching the group
         """
+        self._ensure_open()
         from magicquant.gguf.tensor_groups import TensorGroupClassifier
         
         classifier = TensorGroupClassifier()
@@ -289,7 +307,9 @@ def read_gguf_file(filepath: str) -> GGUFReader:
     Returns:
         Initialized GGUFReader object
     """
-    return GGUFReader(filepath)
+    reader = GGUFReader(filepath)
+    reader.open()
+    return reader
 
 
 if __name__ == "__main__":
