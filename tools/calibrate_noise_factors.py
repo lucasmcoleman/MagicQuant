@@ -84,9 +84,10 @@ def _run_perplexity(gguf_path: Path, corpus: Path, perplexity_bin: str,
             f"llama-perplexity failed (rc={proc.returncode}):\n"
             f"stderr: {proc.stderr[-500:]}"
         )
-    # Single source of truth for the "Final estimate: PPL = ..." parsing.
+    # llama-perplexity prints per-chunk progress to stdout but the
+    # "Final estimate: PPL = ..." line to stderr — parse both.
     from magicquant.qat.validate import parse_perplexity
-    return parse_perplexity(proc.stdout)
+    return parse_perplexity(proc.stdout + "\n" + proc.stderr)
 
 
 def _build_uniform_gguf(
