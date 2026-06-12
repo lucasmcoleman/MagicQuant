@@ -486,6 +486,32 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return meta
 
 
+# GGUF architectures whose Q/K projections llama.cpp stores rope-PERMUTED
+# ("NORM"-style / rope type 0, interleaved pairs). HF safetensors keep the
+# half-split rotary layout, so these arches need the converter's permutation;
+# NEOX-rope arches (qwen2, gemma, phi3, ...) consume the HF layout directly.
+# Mirrors LlamaModel.permute in llama.cpp's convert_hf_to_gguf.py. Note
+# model_type mistral/mixtral/internlm3 all map to GGUF arch "llama".
+_QK_PERMUTED_ARCHS = {"llama", "baichuan"}
+
+
+def _permute_qk_rows(weights: np.ndarray, n_head: int) -> np.ndarray:
+    """Reorder Q/K output rows from HF half-split rotary layout to llama.cpp's
+    interleaved layout (llama.cpp converter's ``LlamaModel.permute``).
+
+    Works for 2-D weights (out, in) and 1-D biases (out,). Pure row reorder —
+    values are never mixed. Without this, every llama-arch pack had scrambled
+    attention (Llama-3.2-1B f16: PPL ~1725 vs 18.9 for the reference convert;
+    proven byte-exact: permute(ours) == reference, V tensors identical).
+    """
+    out_dim = weights.shape[0]
+    rest = weights.shape[1:]
+    return np.ascontiguousarray(
+        weights.reshape(n_head, 2, out_dim // n_head // 2, *rest)
+               .swapaxes(1, 2)
+    ).reshape(weights.shape)
+
+
 def _normalize_merges(merges: list) -> list:
     """Normalize BPE merges to llama.cpp's space-joined string form.
 
@@ -766,6 +792,26 @@ class SafetensorsSource(ModelSource):
 
         arch = self._metadata.get("general.architecture", "llama")
 
+        # Rope permutation setup for NORM-rope arches (see _QK_PERMUTED_ARCHS):
+        # resolve head counts from the (text_config-aware) effective config.
+        self._qk_heads = None
+        if arch in _QK_PERMUTED_ARCHS:
+            effective = config
+            for sub_key in ("text_config", "language_config", "llm_config"):
+                if sub_key in config and isinstance(config[sub_key], dict):
+                    effective = {**config, **config[sub_key]}
+                    break
+            n_head = effective.get("num_attention_heads")
+            n_kv = effective.get("num_key_value_heads", n_head)
+            if n_head:
+                self._qk_heads = {"q": int(n_head), "k": int(n_kv or n_head)}
+            else:
+                _log.warning(
+                    "arch '%s' needs Q/K rope permutation but config has no "
+                    "num_attention_heads — packing UNPERMUTED (model will be "
+                    "broken in llama.cpp).", arch,
+                )
+
         # Parse headers from all files
         for filepath in list(self._files.keys()):
             header, data_start = self._parse_header(filepath)
@@ -863,6 +909,25 @@ class SafetensorsSource(ModelSource):
             return "F16"
         return info["dtype"]  # "F32", "F16", "BF16"
 
+    def get_qk_permute_heads(self, tensor_name: str) -> Optional[int]:
+        """Head count to rope-permute ``tensor_name`` with, or None.
+
+        Non-None only for attn_q/attn_k weights+biases of NORM-rope arches
+        (see ``_QK_PERMUTED_ARCHS``). Exposed so wrappers that add deltas on
+        top of the base weights (LoRAMergedSource) can permute their deltas
+        identically.
+        """
+        self._ensure_loaded()
+        heads = getattr(self, "_qk_heads", None)
+        if not heads:
+            return None
+        base = tensor_name.rsplit(".", 1)[0]  # strip .weight/.bias
+        if base.endswith(".attn_q"):
+            return heads["q"]
+        if base.endswith(".attn_k"):
+            return heads["k"]
+        return None
+
     def read_tensor_f32(self, tensor_name: str) -> Optional[np.ndarray]:
         self._ensure_loaded()
         info = self._tensor_map.get(tensor_name)
@@ -881,14 +946,21 @@ class SafetensorsSource(ModelSource):
         buf = mmap[start:end]
 
         if dtype == "F32":
-            return np.frombuffer(buf, dtype=np.float32).copy()
+            flat = np.frombuffer(buf, dtype=np.float32).copy()
         elif dtype == "F16":
-            return np.frombuffer(buf, dtype=np.float16).astype(np.float32)
+            flat = np.frombuffer(buf, dtype=np.float16).astype(np.float32)
         elif dtype == "BF16":
             raw = np.frombuffer(buf, dtype=np.uint16)
-            return (raw.astype(np.uint32) << 16).view(np.float32)
+            flat = (raw.astype(np.uint32) << 16).view(np.float32)
         else:
-            return np.frombuffer(buf, dtype=np_dtype).astype(np.float32)
+            flat = np.frombuffer(buf, dtype=np_dtype).astype(np.float32)
+
+        # NORM-rope arches: llama.cpp expects Q/K rows interleaved.
+        n_head = self.get_qk_permute_heads(tensor_name)
+        if n_head:
+            shaped = flat.reshape(info["shape"])
+            flat = _permute_qk_rows(shaped, n_head).reshape(-1)
+        return flat
 
     def _get_mmap(self, filepath: str):
         """Get or create a memory-mapped view of a safetensors file."""
@@ -1068,6 +1140,15 @@ class LoRAMergedSource(ModelSource):
         # fan_in_fan_out: transpose delta for Conv1D-based models (GPT-2 style)
         if self._fan_in_fan_out:
             delta = delta.T
+
+        # The adapter delta is in HF layout; if the base source rope-permuted
+        # this tensor (llama-arch Q/K), permute the delta identically or the
+        # merge would mix the two layouts.
+        permute_heads = getattr(self._base, "get_qk_permute_heads", None)
+        if permute_heads is not None:
+            n_head = permute_heads(tensor_name)
+            if n_head:
+                delta = _permute_qk_rows(delta, n_head)
 
         # Shape guard: a mismatched delta would silently corrupt the merge
         # (reshape could broadcast/raise obscurely). Fail loud, naming the
