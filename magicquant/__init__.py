@@ -22,6 +22,7 @@ from magicquant.quant.schemes import (
 )
 
 from magicquant.gguf.tensor_groups import TensorGroupClassifier
+from magicquant.imatrix import capture_imatrix, load_imatrix
 
 __all__ = [
     "BF16", "Q8_0", "Q6_K", "Q5_K", "IQ4_NL", "MXFP4_MOE", "Q4_K_M",
@@ -31,4 +32,6 @@ __all__ = [
     "get_all_schemes",
     "get_schemes_by_category",
     "TensorGroupClassifier",
+    "capture_imatrix",
+    "load_imatrix",
 ]

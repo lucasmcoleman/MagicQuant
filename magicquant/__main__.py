@@ -343,6 +343,24 @@ def cmd_generate(args: argparse.Namespace) -> None:
         print(f"  {p}")
 
 
+def cmd_imatrix(args: argparse.Namespace) -> None:
+    """Capture an importance matrix for a GGUF model via llama-imatrix."""
+    from magicquant.imatrix import capture_imatrix, load_imatrix
+
+    out = args.output or (str(Path(args.model).with_suffix("")) + ".imatrix.gguf")
+    print(f"Capturing imatrix: {args.model}")
+    print(f"  corpus: {args.corpus}")
+    print(f"  output: {out}")
+    capture_imatrix(
+        args.model, args.corpus, out,
+        chunks=args.chunks, ctx_size=args.ctx_size,
+    )
+    imat = load_imatrix(out)
+    print(f"Captured importance vectors for {len(imat)} tensors -> {out}")
+    print("Pass the file (or magicquant.imatrix.load_imatrix(it)) to "
+          "create_hybrid_gguf(..., imatrix=...) for weighted quantization.")
+
+
 def cmd_qat(args: argparse.Namespace) -> None:
     """Run QAT-LoRA: fine-tune adapters robust to a per-group hybrid quant config."""
     from magicquant.config import MagicQuantSettings
@@ -660,6 +678,30 @@ def main() -> None:
         help="Path to LoRA adapter directory",
     )
     generate_parser.set_defaults(func=cmd_generate)
+
+    # ── imatrix ───────────────────────────────────────────────────────────────
+    imatrix_parser = subparsers.add_parser(
+        "imatrix",
+        help="Capture an importance matrix (weighted quantization) via llama-imatrix",
+    )
+    imatrix_parser.add_argument("model", help="Path to GGUF model to instrument")
+    imatrix_parser.add_argument(
+        "-f", "--corpus", required=True,
+        help="Plain-text calibration corpus (e.g. wikitext-2 train split)",
+    )
+    imatrix_parser.add_argument(
+        "-o", "--output", default=None,
+        help="Output imatrix GGUF (default: <model>.imatrix.gguf)",
+    )
+    imatrix_parser.add_argument(
+        "--chunks", type=int, default=-1,
+        help="Max ctx-size chunks of the corpus to process (-1 = all)",
+    )
+    imatrix_parser.add_argument(
+        "--ctx-size", type=int, default=512,
+        help="Chunk length in tokens (default 512)",
+    )
+    imatrix_parser.set_defaults(func=cmd_imatrix)
 
     # ── qat ───────────────────────────────────────────────────────────────────
     qat_parser = subparsers.add_parser(

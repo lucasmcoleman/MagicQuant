@@ -130,8 +130,16 @@ SafetensorsSource strips `model.language_model.` prefix for multimodal models, t
 ## Known Limitations
 
 - Quantized encoding is byte-identical to llama.cpp (it calls libggml directly),
-  so there is NO MSE quality gap. imatrix-weighted quantization is plumbed through
-  `encode_to_ggml_bytes(..., imatrix=)` but imatrix CAPTURE (PR4) is not yet
-  implemented; K-quant/IQ encoding currently runs unweighted.
+  so there is NO MSE quality gap. **imatrix support (M4) is implemented**:
+  `magicquant imatrix model.gguf -f corpus` captures via `llama-imatrix`
+  (`magicquant/imatrix.py`), `create_hybrid_gguf(..., imatrix=path_or_dict)`
+  threads per-tensor importance vectors to the encoder with the true row width,
+  and Pass 1 hard-errors if a target type REQUIRES an imatrix (IQ1/IQ2 family,
+  once PR3 registers them) but none was provided. Weighting is USED by the
+  K-quants (Q2_K–Q6_K) and IQ4_NL; **MXFP4 and Q8_0 ignore it by ggml design**
+  (absmax/E8M0 scaling has no importance input), and tensors that fall back to
+  F32 (row width not block-divisible) are unaffected. Limits: per-expert MoE
+  imatrix slices are rejected (clear error, drop the imatrix for `*_exps`
+  tensors); orchestrator/search auto-capture is deferred to PR4-full with PR3.
 - Tokenizer reading only handles BPE (tokenizer.json). SentencePiece (.model) requires protobuf and is not implemented.
 - The evolutionary search mostly rediscovers obvious configs (BF16 brain + MXFP4 FFN) for dense models. Its value comes from the measured search loop and MoE models with larger search spaces.

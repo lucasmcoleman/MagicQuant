@@ -77,6 +77,7 @@ def encode_to_ggml_bytes(
     weights: np.ndarray,
     ggml_type_name: str,
     imatrix: Optional[np.ndarray] = None,
+    n_per_row: Optional[int] = None,
 ) -> bytes:
     """
     Quantize a float weight array into ggml block-format bytes.
@@ -118,4 +119,19 @@ def encode_to_ggml_bytes(
             f"No ggml encoder for type '{ggml_type_name}'. "
             f"Available: {sorted(GGML_TYPE_IDS)}"
         )
-    return ggml_encode(flat, ggml_type_name, imatrix=imatrix)
+
+    # Imatrix weighting is per input column, so ggml_quantize_chunk must see
+    # the tensor's true row width (the unweighted path flattens to one row,
+    # which is byte-identical because blocks never span row boundaries).
+    # Sources hand the writer FLAT buffers, so the writer passes n_per_row
+    # explicitly from its Pass-1 shape metadata; direct callers with shaped
+    # arrays get it inferred from the trailing dimension.
+    if imatrix is not None and n_per_row is None:
+        if weights.ndim < 2:
+            raise ValueError(
+                f"imatrix-weighted encoding needs the tensor's row width: "
+                f"pass n_per_row= or a 2-D+ weights array (got shape "
+                f"{weights.shape})."
+            )
+        n_per_row = int(weights.shape[-1])
+    return ggml_encode(flat, ggml_type_name, imatrix=imatrix, n_per_row=n_per_row)

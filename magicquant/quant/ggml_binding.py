@@ -260,13 +260,20 @@ class _LibggmlHandle:
         weights: np.ndarray,
         ggml_type: str,
         imatrix: Optional[np.ndarray] = None,
+        n_per_row: Optional[int] = None,
     ) -> bytes:
         """Quantize a float tensor to ggml block-format bytes.
 
         Args:
             weights: floating-point numpy array (any shape; flattened internally).
             ggml_type: ggml type name (e.g., "Q4_K", "Q2_K", "MXFP4").
-            imatrix: optional float32 importance matrix (1-D, length matches weights).
+            imatrix: optional float32 importance vector — one entry per input
+                column of the tensor (length must equal ``n_per_row``).
+            n_per_row: the tensor's true row width. REQUIRED with ``imatrix``
+                (importance is applied per column, so row structure matters);
+                ignored otherwise — the unweighted path quantizes the flat
+                buffer as a single row, which is byte-identical because ggml
+                blocks never span row boundaries.
 
         Returns:
             Raw bytes in the on-disk ggml block layout.
@@ -281,7 +288,33 @@ class _LibggmlHandle:
             )
 
         flat = np.ascontiguousarray(weights, dtype=np.float32).reshape(-1)
-        n_per_row = flat.size
+
+        if imatrix is not None:
+            if n_per_row is None:
+                raise ValueError(
+                    "imatrix-weighted encoding requires n_per_row (the "
+                    "tensor's row width); importance is applied per column."
+                )
+            if n_per_row <= 0 or flat.size % n_per_row != 0:
+                raise ValueError(
+                    f"tensor size {flat.size} is not a multiple of "
+                    f"n_per_row={n_per_row}"
+                )
+            imat_check = np.asarray(imatrix).reshape(-1)
+            if imat_check.size != n_per_row:
+                raise ValueError(
+                    f"imatrix length {imat_check.size} != row width "
+                    f"{n_per_row}. Each weight tensor needs its own "
+                    f"importance vector with one entry per input column. "
+                    f"(Per-expert MoE imatrix slices are not supported yet — "
+                    f"drop the imatrix for this tensor.)"
+                )
+            nrows = flat.size // n_per_row
+        else:
+            # Historical fast path: one row spanning the whole buffer.
+            n_per_row = flat.size
+            nrows = 1
+
         type_id = GGML_TYPE_IDS[ggml_type]
         out_size = _expected_size(ggml_type, flat.size)
 
@@ -309,7 +342,7 @@ class _LibggmlHandle:
             flat.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             ctypes.cast(dst_buf, ctypes.c_void_p),
             ctypes.c_int64(0),
-            ctypes.c_int64(1),
+            ctypes.c_int64(nrows),
             ctypes.c_int64(n_per_row),
             imat_ptr if imat_ptr is not None else ctypes.POINTER(ctypes.c_float)(),
         )
@@ -343,9 +376,10 @@ def ggml_encode(
     weights: np.ndarray,
     ggml_type: str,
     imatrix: Optional[np.ndarray] = None,
+    n_per_row: Optional[int] = None,
 ) -> bytes:
     """Quantize via libggml's ggml_quantize_chunk.
 
     Public entry point used by magicquant.quant.converters.
     """
-    return get_handle().encode(weights, ggml_type, imatrix)
+    return get_handle().encode(weights, ggml_type, imatrix, n_per_row=n_per_row)

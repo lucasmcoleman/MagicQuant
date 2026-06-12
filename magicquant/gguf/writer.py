@@ -217,13 +217,24 @@ def _write_metadata_value(f, value: Any):
 # Pipeline worker (runs in background thread)
 # ---------------------------------------------------------------------------
 
-def _read_encode_worker(source, entries, result_queue):
+def _requires_imatrix(target_ggml_name: str) -> bool:
+    """Does this ggml type REQUIRE an importance matrix to produce usable
+    output (IQ1/IQ2 family)? Lazy libggml lookup; callers must only consult
+    this for quantized targets (float passthroughs never need libggml)."""
+    from magicquant.quant.ggml_binding import get_handle
+    return get_handle().requires_imatrix(target_ggml_name)
+
+
+def _read_encode_worker(source, entries, result_queue, imatrix=None):
     """
     Background thread: reads each tensor from source, encodes to ggml bytes,
     and pushes (entry, blob) onto the result queue.
 
     The bounded queue (maxsize=2) ensures at most 2 encoded tensors are
     buffered, preventing memory blowup on large models.
+
+    imatrix: optional {tensor_name: importance_vector}; tensors with an entry
+    are encoded imatrix-weighted, the rest unweighted.
     """
     try:
         for entry in entries:
@@ -245,7 +256,14 @@ def _read_encode_worker(source, entries, result_queue):
                         f"source but got dtype={f32.dtype}. Source model may "
                         f"be pre-quantized. Use a BF16/F16/F32 source."
                     )
-                blob = encode_to_ggml_bytes(f32, target)
+                imat_vec = imatrix.get(name) if imatrix else None
+                # Sources return flat buffers; the importance vector is per
+                # input column, so supply the true row width from Pass-1
+                # shape metadata (row-major convention: ne0 = shape[-1]).
+                row_width = entry["shape"][-1] if imat_vec is not None else None
+                blob = encode_to_ggml_bytes(
+                    f32, target, imatrix=imat_vec, n_per_row=row_width,
+                )
             elif f32 is not None:
                 blob = f32.view(np.uint8).tobytes()
             else:
@@ -304,6 +322,7 @@ class GGUFWriter:
         quant_config: Dict,
         verbose: bool = True,
         adapter_path: Optional[str] = None,
+        imatrix: Optional[Dict[str, np.ndarray]] = None,
     ) -> str:
         """
         Create a hybrid GGUF from any supported source format.
@@ -314,6 +333,10 @@ class GGUFWriter:
             quant_config: {"base": "MXFP4_MOE", "groups": {"E": "BF16", ...}}
             verbose: Print progress
             adapter_path: Optional path to a LoRA adapter directory.
+            imatrix: Optional {gguf_tensor_name: importance_vector} from
+                magicquant.imatrix.load_imatrix. Tensors with an entry are
+                encoded imatrix-weighted (better quality, REQUIRED for the
+                IQ1/IQ2 family); the rest encode unweighted.
         """
         from magicquant.gguf.source import open_model_source
         from magicquant.gguf.tensor_groups import TensorGroupClassifier
@@ -489,6 +512,32 @@ class GGUFWriter:
                     f"Use a high-precision source model."
                 )
 
+            # ── Gate: imatrix-REQUIRING types must have an imatrix entry ──
+            # IQ1/IQ2-family quantizers produce unusable output without an
+            # importance matrix; fail fast in Pass 1 (before any bytes are
+            # written) instead of silently shipping garbage. Only consulted
+            # for quantized targets so float-only writes never load libggml.
+            _FLOAT_TARGETS = ("F32", "F16", "BF16")
+            missing_imatrix = [
+                entry["name"] for entry in tensor_entries
+                if entry["_can_decode"]
+                and entry["_target_ggml_name"] not in _FLOAT_TARGETS
+                and _requires_imatrix(entry["_target_ggml_name"])
+                and (imatrix is None or entry["name"] not in imatrix)
+            ]
+            if missing_imatrix:
+                first = ", ".join(missing_imatrix[:3])
+                more = (f" (+{len(missing_imatrix) - 3} more)"
+                        if len(missing_imatrix) > 3 else "")
+                raise ValueError(
+                    f"{len(missing_imatrix)} tensor(s) target an imatrix-"
+                    f"REQUIRING quantization type but no imatrix entry was "
+                    f"provided: {first}{more}. Capture one with "
+                    f"magicquant.imatrix.capture_imatrix (or llama-imatrix) "
+                    f"and pass imatrix=load_imatrix(path), or choose a type "
+                    f"that does not require an importance matrix."
+                )
+
             # ── Prepare metadata ──
             self.metadata = {}
             for k, v in source_metadata.items():
@@ -555,7 +604,7 @@ class GGUFWriter:
             try:
                 self._write_gguf_body(
                     tmp_path, filtered_meta, tensor_entries, source,
-                    t_start, verbose,
+                    t_start, verbose, imatrix=imatrix,
                 )
             except BaseException:
                 # Remove the partially-written temp file before propagating.
@@ -581,6 +630,7 @@ class GGUFWriter:
 
     def _write_gguf_body(
         self, tmp_path, filtered_meta, tensor_entries, source, t_start, verbose,
+        imatrix=None,
     ) -> None:
         """Write the full GGUF (header + pipelined data) to ``tmp_path``.
 
@@ -622,7 +672,7 @@ class GGUFWriter:
             result_q: queue.Queue = queue.Queue(maxsize=2)
             worker = threading.Thread(
                 target=_read_encode_worker,
-                args=(source, tensor_entries, result_q),
+                args=(source, tensor_entries, result_q, imatrix),
                 daemon=True,
             )
             worker.start()
@@ -695,12 +745,21 @@ def create_hybrid_gguf(
     output_path: str, base_model_path: str,
     quant_config: Dict, verbose: bool = True,
     adapter_path: Optional[str] = None,
+    imatrix=None,
 ) -> str:
-    """Convenience function to create a hybrid GGUF model."""
+    """Convenience function to create a hybrid GGUF model.
+
+    imatrix may be a ``{tensor_name: importance_vector}`` dict (from
+    ``magicquant.imatrix.load_imatrix``) or a path to an imatrix GGUF
+    captured by llama-imatrix, which is loaded here.
+    """
+    if isinstance(imatrix, (str, os.PathLike)):
+        from magicquant.imatrix import load_imatrix
+        imatrix = load_imatrix(imatrix)
     writer = GGUFWriter(output_path)
     return writer.create_hybrid_gguf(
         base_model_path, quant_config, verbose,
-        adapter_path=adapter_path
+        adapter_path=adapter_path, imatrix=imatrix,
     )
 
 
