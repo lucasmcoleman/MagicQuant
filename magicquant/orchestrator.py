@@ -76,6 +76,31 @@ class MagicQuantOrchestrator:
         # the search methods and passed to run_evolution.
         self._search_groups: List[str] = list(EvolutionarySurvivor.DEFAULT_GROUPS)
 
+        # RNG seed for the last search (None = nondeterministic). Recorded in
+        # search_results.json so a run can be reproduced / A-B compared.
+        self._search_seed: Optional[int] = None
+
+    def _apply_seed(self, seed: Optional[int]) -> None:
+        """Seed the RNGs once for a reproducible search.
+
+        Seeds the global ``random`` module (used by survival.py's mutation /
+        sampling and the orchestrator's candidate shuffle) plus numpy. Called
+        ONCE at the start of a search — not per generation/round — so the
+        sequence still evolves across rounds. ``None`` leaves RNG state
+        untouched (nondeterministic; preserves the historical default and the
+        seed-pinned regression fixture, which seeds globally in the test).
+        """
+        self._search_seed = seed
+        if seed is None:
+            return
+        import random as _random
+        _random.seed(seed)
+        try:
+            import numpy as _np
+            _np.random.seed(seed & 0xFFFFFFFF)
+        except Exception:
+            pass
+
     @property
     def llama_tools(self) -> Optional[LlamaCppTools]:
         """Lazily initialize LlamaCppTools on first access."""
@@ -101,6 +126,7 @@ class MagicQuantOrchestrator:
         verbose: bool = True,
         patience: Optional[int] = None,
         enable_rocmfpx: bool = False,
+        seed: Optional[int] = None,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run the full Predict -> Measure -> Learn loop.
@@ -118,6 +144,7 @@ class MagicQuantOrchestrator:
             (all_configs, tiered_best) where tiered_best maps tier names
             to the best *measured* config for that tier.
         """
+        self._apply_seed(seed)
         if verbose:
             log.info(
                 "MagicQuant Measured Hybrid Search",
@@ -127,6 +154,7 @@ class MagicQuantOrchestrator:
                 output_dir=str(self.output_dir),
                 rounds=measurement_rounds,
                 candidates_per_round=candidates_per_round,
+                seed=seed,
             )
 
         if self.llama_tools is None:
@@ -430,6 +458,7 @@ class MagicQuantOrchestrator:
         results = {
             "baseline_ppl": self.baseline_ppl,
             "baseline_provenance": self.baseline_provenance,
+            "seed": self._search_seed,
             "measurements": {
                 k: {
                     "config": v["config"],
@@ -477,11 +506,13 @@ class MagicQuantOrchestrator:
         verbose: bool = True,
         patience: Optional[int] = None,
         enable_rocmfpx: bool = False,
+        seed: Optional[int] = None,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run prediction-only evolutionary search (no real measurements).
         Use run_measured_search() for the full Predict->Measure->Learn loop.
         """
+        self._apply_seed(seed)
         if verbose:
             log.info(
                 "MagicQuant Prediction-Only Search",

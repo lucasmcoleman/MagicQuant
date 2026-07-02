@@ -161,9 +161,13 @@ class GGUFReader:
             self.data_offset = ((f.tell() + 31) // 32) * 32
     
     def _read_string(self, f) -> str:
-        """Read a GGUF string."""
+        """Read a GGUF string.
+
+        Decode non-strictly: one non-UTF-8 byte in a vocab token or metadata
+        value shouldn't abort parsing the whole file.
+        """
         length = struct.unpack('<Q', f.read(8))[0]
-        return f.read(length).decode('utf-8')
+        return f.read(length).decode('utf-8', errors='replace')
     
     def _read_value(self, f, data_type: int) -> Any:
         """Read a value of the given GGUF type."""
