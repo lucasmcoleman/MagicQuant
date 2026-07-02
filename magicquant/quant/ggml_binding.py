@@ -54,6 +54,32 @@ GGML_TYPE_IDS = {
     "MXFP4":   39,
 }
 
+# ROCmFPX fork types (https://github.com/ciru-ai/ROCmFPX — a llama.cpp fork).
+# IDs from the fork's ggml/include/ggml.h; NOT present in stock ggml, where
+# these enum values are past GGML_TYPE_COUNT. The binding therefore never
+# passes these IDs to a loaded libggml unless the fork-support probe
+# (``_probe_rocmfpx``) has confirmed the lib knows them — an out-of-range
+# enum would index past ggml's type_traits array.
+ROCMFPX_TYPE_IDS = {
+    "Q4_0_ROCMFP4":      100,
+    "Q4_0_ROCMFP4_FAST": 101,
+    "Q6_0_ROCMFPX":      102,
+    "Q8_0_ROCMFPX":      103,
+    "Q3_0_ROCMFPX":      104,
+}
+ROCMFPX_TYPE_NAMES = frozenset(ROCMFPX_TYPE_IDS)
+GGML_TYPE_IDS.update(ROCMFPX_TYPE_IDS)
+
+# Map our type-name keys to the lowercase strings the fork registers in its
+# ggml type_traits table (used by the ggml_type_from_name support probe).
+_ROCMFPX_REGISTERED_NAME = {
+    "Q4_0_ROCMFP4":      "q4_0_rocmfp4",
+    "Q4_0_ROCMFP4_FAST": "q4_0_rocmfp4_fast",
+    "Q6_0_ROCMFPX":      "q6_0_rocmfpx",
+    "Q8_0_ROCMFPX":      "q8_0_rocmfpx",
+    "Q3_0_ROCMFPX":      "q3_0_rocmfpx",
+}
+
 
 _SYSTEM_SEARCH_DIRS = [
     "~/llama.cpp/build/bin",
@@ -163,6 +189,10 @@ _GGML_BLOCK_SIZE = {
     "IQ1_S": 256, "IQ4_NL": 32, "IQ3_S": 256,
     "IQ2_S": 256, "IQ4_XS": 256, "IQ1_M": 256,
     "MXFP4": 32,
+    # ROCmFPX fork types — all 32-element blocks (ggml/rocmfp4/rocmfp4.h,
+    # ggml/rocmfpx/rocmfpx.h in the fork).
+    "Q4_0_ROCMFP4": 32, "Q4_0_ROCMFP4_FAST": 32,
+    "Q3_0_ROCMFPX": 32, "Q6_0_ROCMFPX": 32, "Q8_0_ROCMFPX": 32,
 }
 
 _GGML_TYPE_SIZE = {
@@ -175,6 +205,12 @@ _GGML_TYPE_SIZE = {
     "IQ1_S": 50, "IQ4_NL": 18, "IQ3_S": 110,
     "IQ2_S": 82, "IQ4_XS": 136, "IQ1_M": 56,
     "MXFP4": 17,
+    # ROCmFPX fork block byte sizes, verified against the fork's block structs:
+    # rocmfp4 = 16 qs + 2 scale; fast = 16 + 1; fp3 = 12 + 2; fp6 = 24 + 2;
+    # fp8 = 32 + 1. Cross-checked at runtime by _verify_type_ids when the
+    # loaded libggml supports them.
+    "Q4_0_ROCMFP4": 18, "Q4_0_ROCMFP4_FAST": 17,
+    "Q3_0_ROCMFPX": 14, "Q6_0_ROCMFPX": 26, "Q8_0_ROCMFPX": 33,
 }
 
 
@@ -197,6 +233,7 @@ class _LibggmlHandle:
         self._base_path = base_path
         self._cpu_path = cpu_path
         self._setup_signatures()
+        self.rocmfpx_supported: frozenset = self._probe_rocmfpx()
         self._verify_type_ids()
         # Initialize all type tables (-1 = init all). Required for IQ-quants
         # which use precomputed grid tables.
@@ -234,16 +271,45 @@ class _LibggmlHandle:
         self._base.ggml_quantize_init.argtypes = [ctypes.c_int]
         self._base.ggml_quantize_init.restype = None
 
+        # enum ggml_type ggml_type_from_name(const char * name);
+        # Present on the ROCmFPX fork; may be absent on older stock builds.
+        self._has_type_from_name = hasattr(self._base, "ggml_type_from_name")
+        if self._has_type_from_name:
+            self._base.ggml_type_from_name.argtypes = [ctypes.c_char_p]
+            self._base.ggml_type_from_name.restype = ctypes.c_int
+
+    def _probe_rocmfpx(self) -> frozenset:
+        """Return the set of ROCmFPX type NAMES the loaded libggml supports.
+
+        Probes by NAME via ggml_type_from_name (which returns GGML_TYPE_COUNT
+        for unknown names) — never by passing a possibly-out-of-range type ID
+        to a size/name lookup, which would index past a stock lib's
+        type_traits array. Empty set on a stock (non-fork) libggml.
+        """
+        if not self._has_type_from_name:
+            return frozenset()
+        supported = set()
+        for name, reg in _ROCMFPX_REGISTERED_NAME.items():
+            got = self._base.ggml_type_from_name(reg.encode("ascii"))
+            if got == ROCMFPX_TYPE_IDS[name]:
+                supported.add(name)
+        return frozenset(supported)
+
     def _verify_type_ids(self) -> None:
         """Sanity check: each (name, id) pair agrees with what libggml reports.
 
         Catches the case where a future ggml release renumbers types. If
         any mismatch is found, raise immediately with a clear actionable error.
+        Fork-only ROCmFPX types are verified only when the loaded lib supports
+        them (else skipped — a stock lib legitimately doesn't know them, and
+        the ID is out of range so we must not call ggml_type_size on it).
         """
         for name, type_id in GGML_TYPE_IDS.items():
             expected = _GGML_TYPE_SIZE.get(name)
             if expected is None:
                 continue  # not all types have known sizes (extension types)
+            if name in ROCMFPX_TYPE_NAMES and name not in self.rocmfpx_supported:
+                continue  # fork type, loaded lib doesn't have it — don't probe its ID
             actual = self._base.ggml_type_size(type_id)
             if actual != expected:
                 raise RuntimeError(
@@ -254,6 +320,16 @@ class _LibggmlHandle:
                     f"incompatible ggml version. Pin llama-cpp-python or "
                     f"update GGML_TYPE_IDS."
                 )
+
+    def supports(self, ggml_type: str) -> bool:
+        """True if the loaded libggml can encode this type.
+
+        Non-fork types are assumed supported (stock ggml has them all);
+        ROCmFPX fork types require the fork's libggml (probed at load).
+        """
+        if ggml_type in ROCMFPX_TYPE_NAMES:
+            return ggml_type in self.rocmfpx_supported
+        return ggml_type in GGML_TYPE_IDS
 
     def encode(
         self,
@@ -285,6 +361,13 @@ class _LibggmlHandle:
         if ggml_type not in GGML_TYPE_IDS:
             raise ValueError(
                 f"Unknown ggml type: {ggml_type}. Available: {sorted(GGML_TYPE_IDS)}"
+            )
+        if ggml_type in ROCMFPX_TYPE_NAMES and ggml_type not in self.rocmfpx_supported:
+            raise ValueError(
+                f"'{ggml_type}' is a ROCmFPX fork type, but the loaded libggml "
+                f"({self._base_path}) does not support it. Point "
+                f"MAGICQUANT_LIBGGML_DIR at a ROCmFPX build "
+                f"(e.g. ~/ROCmFPX/build-strix-rocmfp4/bin)."
             )
 
         flat = np.ascontiguousarray(weights, dtype=np.float32).reshape(-1)

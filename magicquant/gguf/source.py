@@ -611,11 +611,24 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
             "Add the regex to _PRETOK_REGEX_TO_PRE in gguf/source.py to fix."
         )
 
-    # Extract vocabulary: {token_string: id}
+    # Extract vocabulary. BPE stores it as a {token: id} dict; Unigram (SPM)
+    # stores a LIST of [token, score] pairs where the id is the list index.
+    # Calling .items() on the list form used to crash with AttributeError.
     vocab = model_info.get("vocab", {})
+    unigram_scores: Dict[int, float] = {}
+    if isinstance(vocab, list):
+        sorted_tokens = []
+        for idx, entry in enumerate(vocab):
+            if isinstance(entry, (list, tuple)) and entry:
+                sorted_tokens.append((entry[0], idx))
+                if len(entry) > 1 and isinstance(entry[1], (int, float)):
+                    unigram_scores[idx] = float(entry[1])
+            else:
+                sorted_tokens.append((entry, idx))
+        vocab = sorted_tokens  # truthy guard below
+    else:
+        sorted_tokens = sorted(vocab.items(), key=lambda x: x[1]) if vocab else []
     if vocab:
-        # Sort by ID to get ordered token list
-        sorted_tokens = sorted(vocab.items(), key=lambda x: x[1])
         max_id = sorted_tokens[-1][1] if sorted_tokens else 0
 
         # Added tokens may have IDs beyond the base vocab (e.g. Qwen3.5
@@ -650,6 +663,8 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
         for token_str, token_id in sorted_tokens:
             if token_id < len(tokens):
                 tokens[token_id] = token_str
+                if token_id in unigram_scores:
+                    scores[token_id] = unigram_scores[token_id]
 
         # Fill in added_tokens (special tokens with IDs beyond base vocab)
         for at in added:
@@ -727,6 +742,40 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
                     chat_template = chat_template[0].get("template", "")
         if isinstance(chat_template, str) and chat_template:
             meta["tokenizer.chat_template"] = chat_template
+
+    # Fallback: transformers >= 4.44 stores the chat template in a standalone
+    # chat_template.jinja (or legacy chat_template.json) file, not in
+    # tokenizer_config.json. Without this, GGUFs ship with no
+    # tokenizer.chat_template and can't be chatted/tool-called without a manual
+    # patch — the known Foundry "GGUF needs chat-template patching" issue.
+    if "tokenizer.chat_template" not in meta:
+        jinja_path = os.path.join(model_dir, "chat_template.jinja")
+        json_path = os.path.join(model_dir, "chat_template.json")
+        if os.path.exists(jinja_path):
+            with open(jinja_path, encoding="utf-8") as f:
+                tmpl = f.read().strip()
+            if tmpl:
+                meta["tokenizer.chat_template"] = tmpl
+        elif os.path.exists(json_path):
+            try:
+                with open(json_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                tmpl = data.get("chat_template") if isinstance(data, dict) else None
+                if isinstance(tmpl, str) and tmpl.strip():
+                    meta["tokenizer.chat_template"] = tmpl.strip()
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    # A template file that exists but yielded nothing is worth flagging — the
+    # resulting GGUF would silently lack a usable chat template.
+    if "tokenizer.chat_template" not in meta:
+        for name in ("chat_template.jinja", "chat_template.json"):
+            if os.path.exists(os.path.join(model_dir, name)):
+                _log.warning(
+                    "chat template file %s present in %s but no template emitted",
+                    name, model_dir,
+                )
+                break
 
     return meta
 

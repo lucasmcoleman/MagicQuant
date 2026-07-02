@@ -111,6 +111,24 @@ training uses the faithful-but-approximate torch fake-quant. Multimodal (Gemma-3
 and bf16 bases are supported (QAT targets the text decoder). Full write-up:
 `docs/qat.md`.
 
+## ROCmFPX fork schemes (opt-in, fork-only)
+
+The AMD-native ROCmFPX types (`ROCMFP3/4/6/8`, ggml ids 100–104 from the
+[ciru-ai/ROCmFPX](https://github.com/ciru-ai/ROCmFPX) llama.cpp fork) are
+registered in `quant/schemes.py` (category `rocmfpx`) but **excluded from the
+default search** — their per-class sampling mass is zero and
+`_generate_random_config` drops them unless `EvolutionarySurvivor(...,
+enable_rocmfpx=True)` (surfaced as `run_full_search/run_measured_search(...,
+enable_rocmfpx=True)`, and Foundry's `--magicquant-rocmfpx`). Enabling adds
+ROCmFPX seeds + sampling mass so the search compares them head-to-head.
+
+Encoding requires a ROCmFPX build's libggml: `ggml_binding` probes support by
+NAME via `ggml_type_from_name` (never passing an out-of-range enum id to a
+stock lib), exposes `handle.rocmfpx_supported` / `handle.supports(type)`, and
+`encode()` raises a clear error for a fork type on a stock lib. Point
+`MAGICQUANT_LIBGGML_DIR` at `…/ROCmFPX/build-strix-rocmfp4/bin`. GGUFs
+containing these types load only on the fork, not stock llama.cpp.
+
 ## Critical Invariants
 
 - **MXFP4 is ggml type 39** — native llama.cpp support. Never use a custom type ID.

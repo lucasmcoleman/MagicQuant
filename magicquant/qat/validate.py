@@ -18,14 +18,16 @@ import subprocess
 from typing import Dict
 
 
-def parse_perplexity(stdout: str) -> float:
-    """Parse the final perplexity from ``llama-perplexity`` stdout.
+def parse_perplexity(output: str) -> float:
+    """Parse the final perplexity from ``llama-perplexity`` output.
 
-    Looks for the last ``Final estimate: PPL = <num> +/- <err>`` line (the last
-    one wins, matching the running-estimate output where the final line is the
-    most complete). Raises ``RuntimeError`` if no such line is present.
+    Pass the combined stdout+stderr: llama-perplexity prints the
+    ``Final estimate: PPL = <num> +/- <err>`` line to STDERR. Looks for the
+    last such line (the last one wins, matching the running-estimate output
+    where the final line is the most complete). Raises ``RuntimeError`` if no
+    such line is present.
     """
-    for line in reversed(stdout.splitlines()):
+    for line in reversed(output.splitlines()):
         if "Final estimate" in line and "PPL" in line:
             # "Final estimate: PPL = 12.3456 +/- 0.06789"
             parts = line.split("=")
@@ -33,7 +35,7 @@ def parse_perplexity(stdout: str) -> float:
                 return float(parts[1].strip().split()[0])
     raise RuntimeError(
         "could not parse perplexity from llama-perplexity output:\n"
-        f"{stdout[-500:]}"
+        f"{output[-500:]}"
     )
 
 
@@ -58,7 +60,9 @@ def _run_perplexity(
             f"llama-perplexity failed (rc={proc.returncode}) for {gguf_path}:\n"
             f"stderr: {proc.stderr[-500:]}"
         )
-    return parse_perplexity(proc.stdout)
+    # The "Final estimate: PPL =" line goes to STDERR, not stdout — scan both
+    # or every QAT recovery measurement raises "could not parse".
+    return parse_perplexity((proc.stdout or "") + "\n" + (proc.stderr or ""))
 
 
 def compare_perplexity(

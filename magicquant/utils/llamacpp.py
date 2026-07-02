@@ -267,9 +267,14 @@ class LlamaCppTools:
                 cmd, timeout=_SUBPROCESS_TIMEOUT,
             )
 
-            # Parse perplexity from output -- try specific patterns first,
-            # then fall back to generic extraction.
-            ppl = _parse_perplexity_output(result.stdout)
+            # Parse perplexity from output. llama-perplexity prints the
+            # "Final estimate: PPL = ..." line to STDERR, not stdout, so scan
+            # both streams (matches tools/calibrate_noise_factors.py). Parsing
+            # stdout only silently returned None here — collapsing the entire
+            # measured search + QAT validation to prediction-only.
+            ppl = _parse_perplexity_output(
+                (result.stdout or "") + "\n" + (result.stderr or "")
+            )
 
             if ppl is not None and verbose:
                 print(f"  Perplexity: {ppl:.4f}")
@@ -283,16 +288,17 @@ class LlamaCppTools:
             return None
 
 
-def _parse_perplexity_output(stdout: str) -> Optional[float]:
+def _parse_perplexity_output(output: str) -> Optional[float]:
     """Extract perplexity value from llama-perplexity output.
 
     Args:
-        stdout: The stdout text from llama-perplexity.
+        output: Combined stdout+stderr from llama-perplexity (the
+            "Final estimate: PPL =" line is emitted on stderr).
 
     Returns:
         The parsed perplexity float, or None if not found.
     """
-    for line in reversed(stdout.split("\n")):
+    for line in reversed(output.split("\n")):
         # llama.cpp "Final estimate: PPL = 5.2345 +/- 0.0123"
         m = re.search(r"Final estimate.*?PPL\s*=\s*(\d+\.?\d*)", line)
         if m:

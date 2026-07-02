@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional
 
 
-SchemeCategory = Literal["k_quant", "iq_quant", "legacy_q", "float", "mxfp4"]
+SchemeCategory = Literal["k_quant", "iq_quant", "legacy_q", "float", "mxfp4", "rocmfpx"]
 
 
 @dataclass(frozen=True)
@@ -184,6 +184,69 @@ Q2_K = QuantizationScheme(
 )
 
 
+# ── ROCmFPX fork schemes ─────────────────────────────────────────────
+# AMD-native (gfx1151-tuned) tensor formats from the ROCmFPX llama.cpp fork
+# (https://github.com/ciru-ai/ROCmFPX). These are OPT-IN: the search only
+# considers them when explicitly enabled AND the bound libggml is a ROCmFPX
+# build that can encode them (gated in survival.py via the predictor's
+# available-scheme set). GGUFs containing these types load only on the fork,
+# not stock llama.cpp — documented as a hard caveat.
+#
+# bpw is the true storage cost from the fork's block structs (block=32):
+#   fp3 = 14 B/blk → 3.5 bpw; fp4 = 18 → 4.5; fp6 = 26 → 6.5; fp8 = 33 → 8.25.
+# noise_factor values are HEURISTIC, slotted next to the K-quant of matching
+# bpw (calibration pending, like Q3_K/Q2_K).
+
+ROCMFP8 = QuantizationScheme(
+    name="ROCMFP8",
+    ggml_type_name="Q8_0_ROCMFPX",
+    ggml_type_id=103,
+    bits_per_weight=8.25,
+    noise_factor=1.05,          # ~Q8_0
+    speed_multiplier=1.8,
+    category="rocmfpx",
+    upgrade_neighbor="BF16",
+    downgrade_neighbor="ROCMFP6",
+)
+
+ROCMFP6 = QuantizationScheme(
+    name="ROCMFP6",
+    ggml_type_name="Q6_0_ROCMFPX",
+    ggml_type_id=102,
+    bits_per_weight=6.5,
+    noise_factor=2.3,           # ~Q6_K
+    speed_multiplier=2.3,
+    category="rocmfpx",
+    upgrade_neighbor="ROCMFP8",
+    downgrade_neighbor="ROCMFP4",
+)
+
+ROCMFP4 = QuantizationScheme(
+    name="ROCMFP4",
+    ggml_type_name="Q4_0_ROCMFP4",
+    ggml_type_id=100,
+    bits_per_weight=4.5,
+    noise_factor=4.2,           # ~Q4_K_M / MXFP4 band
+    speed_multiplier=3.8,       # AMD-native FP4 kernel is the fork's fast path
+    category="rocmfpx",
+    is_moe_optimized=True,
+    upgrade_neighbor="ROCMFP6",
+    downgrade_neighbor="ROCMFP3",
+)
+
+ROCMFP3 = QuantizationScheme(
+    name="ROCMFP3",
+    ggml_type_name="Q3_0_ROCMFPX",
+    ggml_type_id=104,
+    bits_per_weight=3.5,
+    noise_factor=8.5,           # ~Q3_K
+    speed_multiplier=4.0,
+    category="rocmfpx",
+    upgrade_neighbor="ROCMFP4",
+    downgrade_neighbor=None,
+)
+
+
 _REGISTRY: Dict[str, QuantizationScheme] = {
     "BF16": BF16,
     "Q8_0": Q8_0,
@@ -194,7 +257,14 @@ _REGISTRY: Dict[str, QuantizationScheme] = {
     "MXFP4_MOE": MXFP4_MOE,
     "Q3_K": Q3_K,
     "Q2_K": Q2_K,
+    "ROCMFP8": ROCMFP8,
+    "ROCMFP6": ROCMFP6,
+    "ROCMFP4": ROCMFP4,
+    "ROCMFP3": ROCMFP3,
 }
+
+# ROCmFPX fork scheme names (opt-in; excluded from the default search pool).
+ROCMFPX_SCHEME_NAMES = frozenset({"ROCMFP8", "ROCMFP6", "ROCMFP4", "ROCMFP3"})
 
 # Group-class floors: minimum acceptable scheme per group class.
 # "sensitive" (E, H, O, R) shouldn't go below Q8_0; "robust" (U, D, X)

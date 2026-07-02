@@ -67,6 +67,12 @@ GGML_TYPE = {
     "IQ1_M":   29,
     "BF16":    30,
     "MXFP4":   39,  # GGML_TYPE_MXFP4 (native llama.cpp support)
+    # ROCmFPX fork types — only loadable by the ROCmFPX llama.cpp fork.
+    "Q4_0_ROCMFP4":      100,
+    "Q4_0_ROCMFP4_FAST": 101,
+    "Q6_0_ROCMFPX":      102,
+    "Q8_0_ROCMFPX":      103,
+    "Q3_0_ROCMFPX":      104,
 }
 
 _GGML_TYPE_NAME = {v: k for k, v in GGML_TYPE.items()}

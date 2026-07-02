@@ -55,6 +55,12 @@ class MagicQuantOrchestrator:
         self._llama_tools: Optional[LlamaCppTools] = None
 
         self.baseline_ppl: Optional[float] = None
+        # How baseline_ppl was obtained: "measured" (real llama-perplexity),
+        # "fabricated" (measurement failed → default 5.0), or "prediction-only"
+        # (no llama.cpp; heuristic search). Stamped into search_results.json so
+        # QAT auto-detect and Foundry's rocmfpx MQ-hybrid can tell a verified
+        # config from a guessed one.
+        self.baseline_provenance: str = "unknown"
         self.sensitivity_weights: Optional[Dict[str, float]] = None
         self.predictor: Optional[PredictiveScorer] = None
 
@@ -94,6 +100,7 @@ class MagicQuantOrchestrator:
         candidates_per_round: int = 4,
         verbose: bool = True,
         patience: Optional[int] = None,
+        enable_rocmfpx: bool = False,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run the full Predict -> Measure -> Learn loop.
@@ -136,8 +143,18 @@ class MagicQuantOrchestrator:
             self.source_model_path, verbose=verbose
         )
         if self.baseline_ppl is None:
-            log.warning("Could not measure baseline PPL, using default", stage="baseline", default_ppl=5.0)
-            self.baseline_ppl = 5.0
+            # Measured search is worthless against a fabricated baseline: every
+            # measured_loss=(ppl-baseline)/baseline and every survivor ranking
+            # would be computed against a guess. Fail loudly rather than
+            # silently emit "verified" tiers that were never verified.
+            raise RuntimeError(
+                "Measured search could not measure baseline perplexity "
+                f"(llama-perplexity on {self.source_model_path}). Check the "
+                "llama.cpp build and calibration corpus. Refusing to proceed "
+                "with a fabricated baseline; use prediction-only search "
+                "(run_full_search) if no llama.cpp is available."
+            )
+        self.baseline_provenance = "measured"
 
         # ── Step 2: Sensitivity probing ──
         if verbose:
@@ -208,6 +225,7 @@ class MagicQuantOrchestrator:
                 max_generations=search_generations,
                 population_size=population_size,
                 epsilon=0.2,
+                enable_rocmfpx=enable_rocmfpx,
             )
 
             round_configs = survivor.run_evolution(
@@ -400,26 +418,35 @@ class MagicQuantOrchestrator:
         return result
 
     def _save_results(self, all_configs, tiered):
-        """Persist search results and measurements to JSON."""
+        """Persist search results and measurements to JSON.
+
+        Called from BOTH search paths. Prediction-only tiers (run_full_search)
+        carry ``predicted_size_gb``/``predicted_loss`` and no measured fields,
+        so every access is ``.get()`` with the predicted fallback — the
+        measured path simply fills in more of the fields. Consumers (QAT's
+        ``load_hybrid_config``, Foundry's rocmfpx MQ-hybrid mode) only require
+        ``tiered[tier]["config"]``, which both paths provide.
+        """
         results = {
             "baseline_ppl": self.baseline_ppl,
+            "baseline_provenance": self.baseline_provenance,
             "measurements": {
                 k: {
                     "config": v["config"],
-                    "ppl": v["ppl"],
-                    "measured_loss": v["measured_loss"],
-                    "predicted_loss": v["predicted_loss"],
-                    "residual": v["residual"],
-                    "size_gb": v["size_gb"],
+                    "ppl": v.get("ppl"),
+                    "measured_loss": v.get("measured_loss"),
+                    "predicted_loss": v.get("predicted_loss"),
+                    "residual": v.get("residual"),
+                    "size_gb": v.get("size_gb"),
                 }
                 for k, v in self._measured.items()
             },
             "tiered_survivors": {
                 tier: {
                     "config": info["config"],
-                    "ppl": info["ppl"],
-                    "measured_loss": info["measured_loss"],
-                    "size_gb": info["size_gb"],
+                    "ppl": info.get("ppl"),
+                    "measured_loss": info.get("measured_loss"),
+                    "size_gb": info.get("size_gb", info.get("predicted_size_gb")),
                 }
                 for tier, info in tiered.items()
             },
@@ -429,7 +456,7 @@ class MagicQuantOrchestrator:
                     "ppl": info.get("ppl"),
                     "measured_loss": info.get("measured_loss"),
                     "predicted_loss": info.get("predicted_loss"),
-                    "size_gb": info.get("size_gb"),
+                    "size_gb": info.get("size_gb", info.get("predicted_size_gb")),
                 }
                 for tier, info in tiered.items()
             },
@@ -449,6 +476,7 @@ class MagicQuantOrchestrator:
         population_size: int = 100,
         verbose: bool = True,
         patience: Optional[int] = None,
+        enable_rocmfpx: bool = False,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run prediction-only evolutionary search (no real measurements).
@@ -461,14 +489,25 @@ class MagicQuantOrchestrator:
                 source=self.source_model_path,
             )
 
-        # Baseline PPL
+        # Baseline PPL. Prediction-only search doesn't strictly need it (the
+        # predictor scores by relative noise), so a default is tolerable here —
+        # but stamp provenance so consumers know the tiers are predicted, not
+        # verified.
         _llama = self.llama_tools
         if _llama is not None:
             self.baseline_ppl = _llama.calculate_perplexity(
                 self.source_model_path, verbose=verbose
             )
             if self.baseline_ppl is None:
+                log.warning(
+                    "Baseline PPL measurement failed; using default (search "
+                    "remains prediction-only)",
+                    stage="baseline", default_ppl=5.0,
+                )
                 self.baseline_ppl = 5.0
+                self.baseline_provenance = "fabricated"
+            else:
+                self.baseline_provenance = "measured"
         else:
             log.warning(
                 "llama.cpp unavailable, using default baseline PPL",
@@ -476,6 +515,7 @@ class MagicQuantOrchestrator:
                 default_ppl=5.0,
             )
             self.baseline_ppl = 5.0
+            self.baseline_provenance = "prediction-only"
 
         # Sensitivity probing
         if verbose:
@@ -523,6 +563,7 @@ class MagicQuantOrchestrator:
             max_generations=max_generations,
             population_size=population_size,
             epsilon=0.2,
+            enable_rocmfpx=enable_rocmfpx,
         )
 
         best_configs = survivor.run_evolution(
@@ -535,6 +576,12 @@ class MagicQuantOrchestrator:
                 cfg['tier'] = self._classify_tier(
                     cfg.get('predicted_size_gb', 0), baseline_size_gb
                 )
+
+        # Persist search_results.json for downstream consumers (QAT's
+        # auto-detect, Foundry's rocmfpx MQ-hybrid mode). Previously only the
+        # measured path saved — the prediction-only path silently produced
+        # nothing to hand off.
+        self._save_results(best_configs, tiered)
 
         return best_configs, tiered
 

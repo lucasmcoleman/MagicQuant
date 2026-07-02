@@ -81,13 +81,19 @@ class EvolutionarySurvivor:
         baseline_config: Dict[str, str],
         max_generations: int = 50,
         population_size: int = 100,
-        epsilon: float = 0.2
+        epsilon: float = 0.2,
+        enable_rocmfpx: bool = False,
     ):
         self.predictor = predictor
         self.baseline_config = baseline_config
         self.max_generations = max_generations
         self.population_size = population_size
         self.epsilon = epsilon
+        # When True, the AMD-native ROCmFPX fork schemes join the candidate
+        # pool (random-config sampling + dedicated seeds). Off by default so
+        # the standard search — and its seed-pinned regression fixture — is
+        # unchanged. Gated further at encode time by the libggml probe.
+        self.enable_rocmfpx = enable_rocmfpx
 
         self.history: List[Dict] = []
         self.tier_winners: Dict[str, Dict] = {}
@@ -221,6 +227,26 @@ class EvolutionarySurvivor:
         for scheme in ["Q6_K", "Q5_K", "IQ4_NL", "MXFP4_MOE"]:
             population.append({'config': {g: scheme for g in groups}})
 
+        # Seed 5b (opt-in): ROCmFPX-native seeds so the AMD family starts near
+        # good configs rather than only arriving via random sampling.
+        if self.enable_rocmfpx:
+            # Brain-protected fp4 core (the MagicQuant signature, AMD-native).
+            rocm_core = {g: "ROCMFP4" for g in groups}
+            rocm_core['E'] = "BF16"
+            rocm_core['H'] = "BF16"
+            rocm_core['O'] = "ROCMFP8"
+            population.append({'config': rocm_core})
+            # High-contrast: fp6 attention, fp4 FFN, protected brain.
+            rocm_contrast = {g: "ROCMFP6" for g in groups}
+            rocm_contrast['E'] = "BF16"
+            rocm_contrast['H'] = "BF16"
+            rocm_contrast['U'] = "ROCMFP4"
+            rocm_contrast['D'] = "ROCMFP4"
+            population.append({'config': rocm_contrast})
+            # Uniform references across the family.
+            for scheme in ["ROCMFP8", "ROCMFP6", "ROCMFP4"]:
+                population.append({'config': {g: scheme for g in groups}})
+
         # Seed 6: Random configs weighted toward MXFP4
         for _ in range(self.population_size - len(population)):
             population.append({'config': self._generate_random_config(groups)})
@@ -261,6 +287,31 @@ class EvolutionarySurvivor:
         "mxfp4":    0.33,
     }
 
+    # ROCmFPX mass added to each class dict when enable_rocmfpx is set. The
+    # AMD-native family is offered as a compression alternative — a little for
+    # brain groups (fp8/fp6 as high-quality options), more for FFN (fp4 is the
+    # fork's fastest path). Merged, not replacing, so the search compares
+    # rocmfpx head-to-head against the standard schemes via the predictor.
+    _ROCMFPX_CLASS_MASS = {
+        "brain":     0.10,
+        "attention": 0.25,
+        "ffn":       0.40,
+    }
+
+    def _class_weights(self, group_key: str) -> Dict[str, float]:
+        """Return the category-weight dict for a group class ('brain',
+        'attention', 'ffn'), injecting rocmfpx mass when enabled."""
+        base = {
+            "brain": self._BRAIN_CLASS_WEIGHTS,
+            "attention": self._ATTENTION_CLASS_WEIGHTS,
+            "ffn": self._FFN_CLASS_WEIGHTS,
+        }[group_key]
+        if not self.enable_rocmfpx:
+            return base
+        merged = dict(base)
+        merged["rocmfpx"] = self._ROCMFPX_CLASS_MASS[group_key]
+        return merged
+
     def _generate_random_config(self, groups: List[str]) -> Dict[str, str]:
         """Generate a random config biased toward compression for FFN and
         higher precision for brain layers.
@@ -268,18 +319,23 @@ class EvolutionarySurvivor:
         Weights are category-indexed (not positional) so adding new schemes
         to the registry doesn't require updating positional arrays.
         """
-        from magicquant.quant.schemes import get_all_schemes
+        from magicquant.quant.schemes import get_all_schemes, ROCMFPX_SCHEME_NAMES
 
         config: Dict[str, str] = {}
         all_schemes = get_all_schemes()
+        if not self.enable_rocmfpx:
+            # Defense-in-depth: rocmfpx categories already carry zero weight
+            # when disabled, but drop the schemes entirely so a future weight
+            # typo can't leak an unusable fork type into a standard search.
+            all_schemes = [s for s in all_schemes if s.name not in ROCMFPX_SCHEME_NAMES]
 
         for g in groups:
             if g in self._HIGH_SENSITIVITY:
-                class_weights = self._BRAIN_CLASS_WEIGHTS
+                class_weights = self._class_weights("brain")
             elif g in self._LOW_SENSITIVITY:
-                class_weights = self._FFN_CLASS_WEIGHTS
+                class_weights = self._class_weights("ffn")
             else:
-                class_weights = self._ATTENTION_CLASS_WEIGHTS
+                class_weights = self._class_weights("attention")
 
             # Build per-scheme weights: start with the class weight, then
             # divide it across all schemes in that category, inversely
