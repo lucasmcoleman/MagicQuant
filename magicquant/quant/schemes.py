@@ -247,6 +247,143 @@ ROCMFP3 = QuantizationScheme(
 )
 
 
+# ── Sub-4-bit IQ-quants ──────────────────────────────────────────────
+# Stock-ggml importance-matrix-friendly non-linear quants below IQ4_NL.
+# OPT-IN: excluded from the default search pool (see IQ_SCHEME_NAMES below
+# and the enable_iq gate in evolution/survival.py) so the default search —
+# and its seed-pinned regression fixture — is byte-identical to today.
+#
+# bpw is the true storage cost from the binding's block/type tables
+# (magicquant/quant/ggml_binding.py _GGML_BLOCK_SIZE / _GGML_TYPE_SIZE; all
+# block=256 except IQ4_NL's block=32, which is unaffected here):
+#   IQ4_XS  = 136B/256  = 4.25   bpw
+#   IQ3_S   = 110B/256  = 3.4375 bpw
+#   IQ3_XXS =  98B/256  = 3.0625 bpw
+#   IQ2_S   =  82B/256  = 2.5625 bpw
+#   IQ2_XS  =  74B/256  = 2.3125 bpw
+#   IQ2_XXS =  66B/256  = 2.0625 bpw
+#   IQ1_M   =  56B/256  = 1.75   bpw
+#   IQ1_S   =  50B/256  = 1.5625 bpw
+# noise_factor values are HEURISTIC (ordered by published llama.cpp quality),
+# consistent with the existing heuristic Q3_K=8.0/Q2_K=15.0 (calibration
+# pending, see the module docstring).
+#
+# requires_imatrix is read from the REAL libggml
+# (ggml_quantize_requires_imatrix), not guessed: verified against a stock
+# (non-fork) libggml at ~/llama.cpp/build/bin — IQ2_XS, IQ2_XXS, and IQ1_S
+# report True; IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, and IQ1_M report False.
+# survival.py's enable_iq gate additionally drops every requires_imatrix
+# scheme unconditionally (the search threads no imatrix).
+#
+# CRITICAL: only these NEW schemes reference existing registry entries
+# (upward, via upgrade/downgrade_neighbor) — no existing scheme's neighbor
+# fields are modified, so the default mutation chain is unchanged.
+
+IQ4_XS = QuantizationScheme(
+    name="IQ4_XS",
+    ggml_type_name="IQ4_XS",
+    ggml_type_id=23,
+    bits_per_weight=4.25,
+    noise_factor=4.1,
+    speed_multiplier=3.3,
+    category="iq_quant",
+    requires_imatrix=False,
+    upgrade_neighbor="MXFP4_MOE",
+    downgrade_neighbor="IQ3_S",
+)
+
+IQ3_S = QuantizationScheme(
+    name="IQ3_S",
+    ggml_type_name="IQ3_S",
+    ggml_type_id=21,
+    bits_per_weight=3.4375,
+    noise_factor=6.0,
+    speed_multiplier=3.5,
+    category="iq_quant",
+    requires_imatrix=False,
+    upgrade_neighbor="IQ4_XS",
+    downgrade_neighbor="IQ3_XXS",
+)
+
+IQ3_XXS = QuantizationScheme(
+    name="IQ3_XXS",
+    ggml_type_name="IQ3_XXS",
+    ggml_type_id=18,
+    bits_per_weight=3.0625,
+    noise_factor=7.5,
+    speed_multiplier=3.6,
+    category="iq_quant",
+    requires_imatrix=False,
+    upgrade_neighbor="IQ3_S",
+    downgrade_neighbor="Q3_K",
+)
+
+IQ2_S = QuantizationScheme(
+    name="IQ2_S",
+    ggml_type_name="IQ2_S",
+    ggml_type_id=22,
+    bits_per_weight=2.5625,
+    noise_factor=11.0,
+    speed_multiplier=3.7,
+    category="iq_quant",
+    requires_imatrix=False,
+    upgrade_neighbor="IQ3_XXS",
+    downgrade_neighbor="IQ2_XS",
+)
+
+IQ2_XS = QuantizationScheme(
+    name="IQ2_XS",
+    ggml_type_name="IQ2_XS",
+    ggml_type_id=17,
+    bits_per_weight=2.3125,
+    noise_factor=13.0,
+    speed_multiplier=3.8,
+    category="iq_quant",
+    requires_imatrix=True,
+    upgrade_neighbor="IQ2_S",
+    downgrade_neighbor="IQ2_XXS",
+)
+
+IQ2_XXS = QuantizationScheme(
+    name="IQ2_XXS",
+    ggml_type_name="IQ2_XXS",
+    ggml_type_id=16,
+    bits_per_weight=2.0625,
+    noise_factor=16.0,
+    speed_multiplier=3.9,
+    category="iq_quant",
+    requires_imatrix=True,
+    upgrade_neighbor="IQ2_XS",
+    downgrade_neighbor="IQ1_M",
+)
+
+IQ1_M = QuantizationScheme(
+    name="IQ1_M",
+    ggml_type_name="IQ1_M",
+    ggml_type_id=29,
+    bits_per_weight=1.75,
+    noise_factor=24.0,
+    speed_multiplier=3.95,
+    category="iq_quant",
+    requires_imatrix=False,
+    upgrade_neighbor="IQ2_XXS",
+    downgrade_neighbor="IQ1_S",
+)
+
+IQ1_S = QuantizationScheme(
+    name="IQ1_S",
+    ggml_type_name="IQ1_S",
+    ggml_type_id=19,
+    bits_per_weight=1.5625,
+    noise_factor=30.0,
+    speed_multiplier=4.0,
+    category="iq_quant",
+    requires_imatrix=True,
+    upgrade_neighbor="IQ1_M",
+    downgrade_neighbor=None,
+)
+
+
 _REGISTRY: Dict[str, QuantizationScheme] = {
     "BF16": BF16,
     "Q8_0": Q8_0,
@@ -261,10 +398,25 @@ _REGISTRY: Dict[str, QuantizationScheme] = {
     "ROCMFP6": ROCMFP6,
     "ROCMFP4": ROCMFP4,
     "ROCMFP3": ROCMFP3,
+    "IQ4_XS": IQ4_XS,
+    "IQ3_S": IQ3_S,
+    "IQ3_XXS": IQ3_XXS,
+    "IQ2_S": IQ2_S,
+    "IQ2_XS": IQ2_XS,
+    "IQ2_XXS": IQ2_XXS,
+    "IQ1_M": IQ1_M,
+    "IQ1_S": IQ1_S,
 }
 
 # ROCmFPX fork scheme names (opt-in; excluded from the default search pool).
 ROCMFPX_SCHEME_NAMES = frozenset({"ROCMFP8", "ROCMFP6", "ROCMFP4", "ROCMFP3"})
+
+# Sub-4-bit IQ scheme names (opt-in; excluded from the default search pool).
+# Deliberately does NOT include IQ4_NL, which is an existing default-pool
+# scheme (see IQ4_NL above) and must stay sampled by default.
+IQ_SCHEME_NAMES = frozenset({
+    "IQ4_XS", "IQ3_S", "IQ3_XXS", "IQ2_S", "IQ2_XS", "IQ2_XXS", "IQ1_M", "IQ1_S",
+})
 
 # Group-class floors: minimum acceptable scheme per group class.
 # "sensitive" (E, H, O, R) shouldn't go below Q8_0; "robust" (U, D, X)

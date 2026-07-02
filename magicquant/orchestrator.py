@@ -126,6 +126,7 @@ class MagicQuantOrchestrator:
         verbose: bool = True,
         patience: Optional[int] = None,
         enable_rocmfpx: bool = False,
+        enable_iq: bool = False,
         seed: Optional[int] = None,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
@@ -254,6 +255,7 @@ class MagicQuantOrchestrator:
                 population_size=population_size,
                 epsilon=0.2,
                 enable_rocmfpx=enable_rocmfpx,
+                enable_iq=enable_iq,
             )
 
             round_configs = survivor.run_evolution(
@@ -506,6 +508,7 @@ class MagicQuantOrchestrator:
         verbose: bool = True,
         patience: Optional[int] = None,
         enable_rocmfpx: bool = False,
+        enable_iq: bool = False,
         seed: Optional[int] = None,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
@@ -595,6 +598,7 @@ class MagicQuantOrchestrator:
             population_size=population_size,
             epsilon=0.2,
             enable_rocmfpx=enable_rocmfpx,
+            enable_iq=enable_iq,
         )
 
         best_configs = survivor.run_evolution(

@@ -83,6 +83,7 @@ class EvolutionarySurvivor:
         population_size: int = 100,
         epsilon: float = 0.2,
         enable_rocmfpx: bool = False,
+        enable_iq: bool = False,
     ):
         self.predictor = predictor
         self.baseline_config = baseline_config
@@ -94,6 +95,12 @@ class EvolutionarySurvivor:
         # the standard search — and its seed-pinned regression fixture — is
         # unchanged. Gated further at encode time by the libggml probe.
         self.enable_rocmfpx = enable_rocmfpx
+        # When True, the sub-4-bit stock-ggml IQ schemes (IQ_SCHEME_NAMES)
+        # join the random-config candidate pool. Off by default so the
+        # standard search — and its seed-pinned regression fixture — is
+        # unchanged. Schemes with requires_imatrix=True are ALWAYS excluded
+        # regardless of this flag (the search threads no imatrix).
+        self.enable_iq = enable_iq
 
         self.history: List[Dict] = []
         self.tier_winners: Dict[str, Dict] = {}
@@ -319,7 +326,9 @@ class EvolutionarySurvivor:
         Weights are category-indexed (not positional) so adding new schemes
         to the registry doesn't require updating positional arrays.
         """
-        from magicquant.quant.schemes import get_all_schemes, ROCMFPX_SCHEME_NAMES
+        from magicquant.quant.schemes import (
+            get_all_schemes, ROCMFPX_SCHEME_NAMES, IQ_SCHEME_NAMES,
+        )
 
         config: Dict[str, str] = {}
         all_schemes = get_all_schemes()
@@ -328,6 +337,15 @@ class EvolutionarySurvivor:
             # when disabled, but drop the schemes entirely so a future weight
             # typo can't leak an unusable fork type into a standard search.
             all_schemes = [s for s in all_schemes if s.name not in ROCMFPX_SCHEME_NAMES]
+        if not self.enable_iq:
+            # Same defense-in-depth for the sub-4-bit IQ family: dropped
+            # entirely when disabled, not just down-weighted, so the default
+            # search (and its seed-pinned regression fixture) is unchanged.
+            all_schemes = [s for s in all_schemes if s.name not in IQ_SCHEME_NAMES]
+        # Schemes that require an importance matrix are ALWAYS excluded: the
+        # search threads no imatrix, so encoding one would hard-error the
+        # writer. This applies regardless of enable_iq.
+        all_schemes = [s for s in all_schemes if not s.requires_imatrix]
 
         for g in groups:
             if g in self._HIGH_SENSITIVITY:
