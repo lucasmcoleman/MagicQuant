@@ -20,10 +20,32 @@ def test_no_placeholder_or_pr1_claims():
 
 
 def test_noise_factors_strictly_increase_toward_compression():
-    """Sanity: schemes ordered by noise must also be (weakly) ordered by bpw
-    descending — a heuristic-but-coherent registry."""
-    ordered = get_all_schemes()  # ascending noise
-    noises = [s.noise_factor for s in ordered]
-    assert noises == sorted(noises)
+    """Sanity: every scheme has a well-formed, non-negative noise_factor,
+    and the known anchor ordering holds.
+
+    NOTE: this used to assert `noises == sorted(noises)` where `noises` was
+    pulled straight from `get_all_schemes()` — but that function already
+    returns schemes sorted by noise_factor, so the assertion was
+    tautologically true no matter what the actual values were. Instead we
+    check real invariants: every noise_factor is a finite non-negative
+    number, and a handful of schemes whose relative quality ordering is
+    well known (BF16 < Q8_0 < Q4_K_M < Q2_K) are ordered correctly.
+    """
+    import math
+
+    for scheme in get_all_schemes():
+        assert isinstance(scheme.noise_factor, (int, float))
+        assert math.isfinite(scheme.noise_factor)
+        assert scheme.noise_factor >= 0.0, (
+            f"{scheme.name} has a negative noise_factor: {scheme.noise_factor}"
+        )
+
+    bf16 = get_scheme_by_name("BF16").noise_factor
+    q8_0 = get_scheme_by_name("Q8_0").noise_factor
+    q4_k_m = get_scheme_by_name("Q4_K_M").noise_factor
+    q2_k = get_scheme_by_name("Q2_K").noise_factor
+
+    assert bf16 < q8_0 < q4_k_m < q2_k
+
     # The cleanest scheme (BF16) has zero noise.
-    assert get_scheme_by_name("BF16").noise_factor == 0.0
+    assert bf16 == 0.0

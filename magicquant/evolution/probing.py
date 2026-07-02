@@ -18,6 +18,7 @@ import tempfile
 import logging
 import numpy as np
 
+from magicquant.quant import calibration
 from magicquant.quant.schemes import get_scheme_by_name
 
 _log = logging.getLogger(__name__)
@@ -287,9 +288,15 @@ class SensitivityProber:
         # Scheme aggressiveness scaled to the heuristic's [0, 1] range.
         # Registry's noise_factor uses Q8_0=1.0 anchor; we rescale here so
         # Q4_K_M=1.0 maps to "max heuristic aggressiveness". This preserves
-        # the original heuristic's behavior pre-refactor.
+        # the original heuristic's behavior pre-refactor. Prefer the
+        # empirically calibrated noise_factor (tools/calibration_results.json)
+        # over the static registry value when it's available.
         try:
-            registry_noise = get_scheme_by_name(scheme).noise_factor
+            calibrated_noise = calibration.calibrated_noise_factor(scheme)
+            registry_noise = (
+                calibrated_noise if calibrated_noise is not None
+                else get_scheme_by_name(scheme).noise_factor
+            )
             # Q4_K_M (registry noise=4.5) maps to 1.0; linearly scale others.
             noise = registry_noise / 4.5
         except ValueError:

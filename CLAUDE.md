@@ -155,8 +155,14 @@ SafetensorsSource strips `model.language_model.` prefix for multimodal models, t
   and Pass 1 hard-errors if a target type REQUIRES an imatrix (IQ1/IQ2 family,
   once PR3 registers them) but none was provided. Weighting is USED by the
   K-quants (Q2_K–Q6_K) and IQ4_NL; **MXFP4 and Q8_0 ignore it by ggml design**
-  (absmax/E8M0 scaling has no importance input), and tensors that fall back to
-  F32 (row width not block-divisible) are unaffected. Limits: per-expert MoE
+  (absmax/E8M0 scaling has no importance input). A row whose width isn't a
+  multiple of the requested K-quant's 256-block falls back to a block-32
+  quant (MXFP4 for low-bit targets, Q8_0 for high-bit) rather than F32; F32
+  is used only for SSM/linear-attention operands (group `S`, which llama.cpp
+  requires in F32) or rows that aren't even 32-divisible
+  (`writer._block32_fallback`). Either way the fallback target already
+  ignores imatrix by ggml design, so these tensors are unaffected regardless
+  of which fallback type they land on. Limits: per-expert MoE
   imatrix slices are rejected (clear error, drop the imatrix for `*_exps`
   tensors); orchestrator/search auto-capture is deferred to PR4-full with PR3.
 - Tokenizer reading only handles BPE (tokenizer.json). SentencePiece (.model) requires protobuf and is not implemented.

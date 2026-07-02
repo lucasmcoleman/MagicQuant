@@ -16,6 +16,7 @@ Compression ratios are derived from actual ggml block format byte sizes.
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 
+from magicquant.quant import calibration
 from magicquant.quant.schemes import get_scheme_by_name
 
 
@@ -217,7 +218,12 @@ class PredictiveScorer:
 
     @staticmethod
     def _noise_factor_for(scheme: str) -> float:
-        """Look up noise_factor from registry; fallback to 3.0 if unknown."""
+        """Prefer an empirically calibrated noise_factor (from
+        tools/calibration_results.json, when present) over the static
+        registry value; fall back to 3.0 if the scheme is unknown to both."""
+        calibrated = calibration.calibrated_noise_factor(scheme)
+        if calibrated is not None:
+            return calibrated
         try:
             return get_scheme_by_name(scheme).noise_factor
         except ValueError:

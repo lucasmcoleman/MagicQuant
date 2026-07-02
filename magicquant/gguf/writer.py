@@ -338,6 +338,12 @@ class GGUFWriter:
         self.metadata: Dict[str, Any] = {}
         # One-time warning flag for the BF16 -> F16 on-disk downgrade.
         self._bf16_downgrade_warned = False
+        # Provenance log for the block-32 fallback (see _block32_fallback):
+        # one {"tensor", "group", "requested", "actual", "reason"} dict per
+        # tensor whose requested K-quant was silently downgraded because its
+        # row width wasn't block-divisible. Populated during Pass 1 of
+        # create_hybrid_gguf; a summary is logged once the write completes.
+        self._fallbacks: List[Dict[str, str]] = []
 
     def create_hybrid_gguf(
         self,
@@ -399,6 +405,9 @@ class GGUFWriter:
             # ==============================================================
             tensor_entries: List[Dict[str, Any]] = []
             data_offset = 0
+            # Reset per-call so re-using a writer instance for a second
+            # create_hybrid_gguf() call doesn't carry stale entries forward.
+            self._fallbacks = []
 
             for tinfo in all_tensors_info:
                 name = tinfo["name"]
@@ -448,7 +457,19 @@ class GGUFWriter:
                 row_size = shape[-1] if len(shape) >= 1 else 1
                 block_size = GGML_BLOCK_SIZE.get(target_ggml_name, 1)
                 if block_size > 1 and row_size % block_size != 0:
+                    requested_ggml_name = target_ggml_name
                     fallback = _block32_fallback(target_ggml_name, row_size, group)
+                    if fallback != requested_ggml_name:
+                        # Record the deviation so it's auditable even when
+                        # verbose=False (data-integrity notice, not a
+                        # progress message) — see the summary log below.
+                        self._fallbacks.append({
+                            "tensor": name,
+                            "group": group,
+                            "requested": requested_ggml_name,
+                            "actual": fallback,
+                            "reason": "block-size",
+                        })
                     if verbose:
                         print(f"  [COMPAT] {name}: row_size={row_size} not divisible by "
                               f"{target_ggml_name} block_size={block_size}, "
@@ -649,6 +670,18 @@ class GGUFWriter:
             if verbose:
                 print(f"Done. {output_size_mb:.1f} MB in {elapsed:.1f}s "
                       f"({output_size_mb / max(elapsed, 0.001):.0f} MB/s)")
+
+            # Data-integrity notice: surface block-size fallbacks even when
+            # verbose=False. One summary line regardless of how many tensors
+            # were affected — per-tensor detail lives in self._fallbacks.
+            if self._fallbacks:
+                first = self._fallbacks[0]
+                logger.warning(
+                    "%d tensor(s) fell back from their requested quant due to "
+                    "block-size (e.g. %s: %s->%s)",
+                    len(self._fallbacks), first["tensor"],
+                    first["requested"], first["actual"],
+                )
 
             return self.output_path
 
