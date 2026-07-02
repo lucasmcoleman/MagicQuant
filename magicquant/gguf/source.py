@@ -106,6 +106,10 @@ class GGUFSource(ModelSource):
         self._reader = GGUFReader(filepath)
         self._reader.open()
         self._data_offset = self._reader.data_offset
+        # Cached read handle: re-quantizing a GGUF source touches every tensor,
+        # so a per-tensor open/seek/close (thousands of syscalls on a big MoE)
+        # is wasteful. Opened lazily, closed in close().
+        self._fh = None
 
     def get_metadata(self):
         return self._reader.get_metadata()
@@ -143,9 +147,10 @@ class GGUFSource(ModelSource):
         for d in info["shape"]:
             n_elems *= d
         byte_len = ggml_tensor_data_size(type_name, n_elems)
-        with open(self._path, "rb") as f:
-            f.seek(self._data_offset + info["offset"])
-            buf = f.read(byte_len)
+        if self._fh is None:
+            self._fh = open(self._path, "rb")
+        self._fh.seek(self._data_offset + info["offset"])
+        buf = self._fh.read(byte_len)
         if type_name == "F32":
             return np.frombuffer(buf, dtype=np.float32).copy()
         if type_name == "F16":
@@ -156,6 +161,9 @@ class GGUFSource(ModelSource):
         return None  # quantised — can't decode
 
     def close(self):
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
         self._reader.close()
 
 
