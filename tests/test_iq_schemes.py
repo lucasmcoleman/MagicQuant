@@ -131,6 +131,55 @@ def test_requires_imatrix_schemes_never_sampled_regardless_of_enable_iq():
         )
 
 
+# ── mutation neighbor-walk gate (Crusher/Protector) ──────────────────────────
+#
+# _generate_random_config already drops requires_imatrix schemes from the
+# sampling pool. But the Crusher mutation reaches new schemes by walking
+# downgrade_neighbor links (and Protector via upgrade_neighbor), which is a
+# separate code path. IQ2_S.downgrade_neighbor == "IQ2_XS" and
+# IQ1_M.downgrade_neighbor == "IQ1_S" — both requires_imatrix=True — so an
+# unfiltered walk could hand the writer a scheme it will hard-error on for
+# lack of an imatrix. These tests pin the fix: _upgrade/_downgrade must treat
+# a requires_imatrix neighbor as end-of-chain (return None) rather than
+# yielding it.
+
+def test_downgrade_neighbor_walk_never_yields_requires_imatrix_scheme():
+    # IQ2_S -> IQ2_XS (requires_imatrix=True): must be closed off, not walked.
+    assert EvolutionarySurvivor._downgrade("IQ2_S") is None
+    # IQ1_M -> IQ1_S (requires_imatrix=True): same.
+    assert EvolutionarySurvivor._downgrade("IQ1_M") is None
+
+
+def test_mutation_leak_closed_across_full_evolution_run():
+    """Reproduces the Crusher mutation leak end-to-end: with enable_iq=True
+    and FFN groups in play, no config discovered over a full run_evolution
+    may contain a requires_imatrix scheme."""
+    imatrix_names = _requires_imatrix_names()
+    assert imatrix_names, "expected at least one requires_imatrix scheme in the registry"
+    for seed in (7, 13, 42, 99, 123):
+        random.seed(seed)
+        np.random.seed(seed)
+        groups = ["E", "H", "Q", "K", "O", "U", "D", "X"]
+        configs = EvolutionarySurvivor(
+            predictor=PredictiveScorer(
+                sensitivity_weights={g: 1.0 for g in groups},
+                parameter_counts={g: 100_000_000 for g in groups},
+                baseline_size_gb=5.0,
+                baseline_tps=100.0,
+            ),
+            baseline_config={"E": "BF16", "H": "BF16"},
+            max_generations=15,
+            population_size=80,
+            epsilon=0.2,
+            enable_iq=True,
+        ).run_evolution(groups=groups, verbose=False)
+        used = _all_schemes_used(configs)
+        assert not (used & imatrix_names), (
+            f"seed={seed}: requires_imatrix scheme leaked via mutation: "
+            f"{used & imatrix_names}"
+        )
+
+
 # ── live encode round trip (real libggml required; skipped otherwise) ────────
 #
 # Run in a SUBPROCESS, mirroring tests/test_rocmfpx_schemes.py's pattern: keep

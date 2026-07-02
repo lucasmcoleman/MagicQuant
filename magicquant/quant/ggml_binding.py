@@ -439,6 +439,8 @@ class _LibggmlHandle:
 
     def requires_imatrix(self, ggml_type: str) -> bool:
         """Does this scheme need an importance matrix for best quality?"""
+        if ggml_type in ROCMFPX_TYPE_NAMES and ggml_type not in self.rocmfpx_supported:
+            return False
         if ggml_type not in GGML_TYPE_IDS:
             return False
         return self._base.ggml_quantize_requires_imatrix(GGML_TYPE_IDS[ggml_type])

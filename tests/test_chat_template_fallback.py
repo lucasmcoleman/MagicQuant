@@ -45,3 +45,15 @@ def test_no_template_anywhere(tmp_path):
     (tmp_path / "tokenizer_config.json").write_text(json.dumps({}))
     meta = _build_tokenizer_metadata(str(tmp_path))
     assert "tokenizer.chat_template" not in meta
+
+
+def test_empty_jinja_falls_through_to_json(tmp_path):
+    # chat_template.jinja exists but is whitespace-only — must not suppress
+    # the chat_template.json fallback (previously an elif branch did exactly
+    # that, silently dropping a perfectly good template).
+    _min_tokenizer(tmp_path)
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({}))
+    (tmp_path / "chat_template.jinja").write_text("   \n")
+    (tmp_path / "chat_template.json").write_text(json.dumps({"chat_template": "TEMPLATE_JSON_FALLBACK"}))
+    meta = _build_tokenizer_metadata(str(tmp_path))
+    assert meta.get("tokenizer.chat_template") == "TEMPLATE_JSON_FALLBACK"

@@ -47,19 +47,46 @@ class EvolutionarySurvivor:
 
     @staticmethod
     def _upgrade(scheme: str) -> Optional[str]:
-        """Return the next-better scheme, or None if at the top."""
+        """Return the next-better scheme, or None if at the top.
+
+        Neighbor walks never land on a requires_imatrix scheme: the search
+        threads no imatrix, so a mutant that adopts one would hard-error the
+        GGUF writer's Pass-1 gate at encode time. This mirrors the filter
+        already applied in _generate_random_config; here it treats a
+        requires_imatrix neighbor as end-of-chain instead of dropping it
+        from a pool.
+        """
         try:
-            return get_scheme_by_name(scheme).upgrade_neighbor
+            neighbor = get_scheme_by_name(scheme).upgrade_neighbor
         except ValueError:
             return None
+        if neighbor is not None:
+            try:
+                if get_scheme_by_name(neighbor).requires_imatrix:
+                    return None
+            except ValueError:
+                pass
+        return neighbor
 
     @staticmethod
     def _downgrade(scheme: str) -> Optional[str]:
-        """Return the next-smaller scheme, or None if at the bottom."""
+        """Return the next-smaller scheme, or None if at the bottom.
+
+        See _upgrade's docstring: a requires_imatrix neighbor is treated as
+        end-of-chain so mutation can never produce a config the writer would
+        reject for lack of an imatrix.
+        """
         try:
-            return get_scheme_by_name(scheme).downgrade_neighbor
+            neighbor = get_scheme_by_name(scheme).downgrade_neighbor
         except ValueError:
             return None
+        if neighbor is not None:
+            try:
+                if get_scheme_by_name(neighbor).requires_imatrix:
+                    return None
+            except ValueError:
+                pass
+        return neighbor
 
     # Groups that are sensitive to quantization ("brain" layers)
     _HIGH_SENSITIVITY = {'E', 'H', 'O', 'R'}

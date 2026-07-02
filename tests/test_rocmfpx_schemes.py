@@ -20,7 +20,7 @@ from magicquant.quant.schemes import (
     get_scheme_by_name, get_all_schemes, ROCMFPX_SCHEME_NAMES,
 )
 from magicquant.quant.ggml_binding import (
-    ROCMFPX_TYPE_IDS, _GGML_BLOCK_SIZE, _GGML_TYPE_SIZE,
+    ROCMFPX_TYPE_IDS, _GGML_BLOCK_SIZE, _GGML_TYPE_SIZE, get_handle,
 )
 from magicquant.evolution.predictor import PredictiveScorer
 from magicquant.evolution.survival import EvolutionarySurvivor
@@ -73,6 +73,28 @@ def test_binding_block_tables(name, block, size):
 def test_rocmfpx_type_ids_registered():
     assert ROCMFPX_TYPE_IDS["Q4_0_ROCMFP4"] == 100
     assert ROCMFPX_TYPE_IDS["Q8_0_ROCMFPX"] == 103
+
+
+def test_requires_imatrix_never_forwards_unsupported_fork_id():
+    """requires_imatrix() must never hand a fork type ID (100-104) to a
+    loaded libggml that doesn't support it — that would be an out-of-range
+    enum on a stock lib. Fork schemes never require an imatrix, so the gate
+    should short-circuit to False without touching the lib at all.
+
+    Robust to whichever libggml happens to be bound in this environment:
+    if it's a stock build (the common case), assert the short-circuit;
+    if it's somehow a ROCmFPX build, just assert the call is well-formed
+    (doesn't raise, returns a bool).
+    """
+    try:
+        h = get_handle()
+    except Exception:
+        pytest.skip("no libggml available in this environment")
+
+    result = h.requires_imatrix("Q4_0_ROCMFP4")
+    assert isinstance(result, bool)
+    if "Q4_0_ROCMFP4" not in h.rocmfpx_supported:
+        assert result is False
 
 
 # ── search gating ────────────────────────────────────────────────────────────

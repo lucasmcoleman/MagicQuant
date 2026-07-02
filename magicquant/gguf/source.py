@@ -764,7 +764,7 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
                 tmpl = f.read().strip()
             if tmpl:
                 meta["tokenizer.chat_template"] = tmpl
-        elif os.path.exists(json_path):
+        if "tokenizer.chat_template" not in meta and os.path.exists(json_path):
             try:
                 with open(json_path, encoding="utf-8") as f:
                     data = json.load(f)
