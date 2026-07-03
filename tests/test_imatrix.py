@@ -72,6 +72,46 @@ def test_load_imatrix_rejects_file_without_imatrix_tensors(tmp_path):
         load_imatrix(tmp_path / "model.gguf")
 
 
+def _write_per_expert_imatrix_gguf(path, name, sum2_2d, counts_2d):
+    """Write a stacked-expert imatrix pair: in_sum2 [n_experts, n_per_row],
+    counts [n_experts, 1] -- the shape llama-imatrix produces for a `_exps`
+    tensor (each expert's activations are tracked separately since routing
+    sends each token to only a few experts)."""
+    w = gguf.GGUFWriter(str(path), arch="imatrix")
+    w.add_type("imatrix")
+    w.add_tensor(f"{name}.in_sum2", np.asarray(sum2_2d, dtype=np.float32))
+    w.add_tensor(f"{name}.counts", np.asarray(counts_2d, dtype=np.float32))
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    return path
+
+
+def test_load_imatrix_per_expert_shape_divides_and_flattens(tmp_path):
+    sum2_2d = np.array([[4.0, 8.0], [30.0, 60.0]], dtype=np.float32)
+    counts_2d = np.array([[2.0], [10.0]], dtype=np.float32)
+    path = _write_per_expert_imatrix_gguf(
+        tmp_path / "im.gguf", "blk.0.ffn_down_exps.weight", sum2_2d, counts_2d
+    )
+    result = load_imatrix(path)
+    vec = result["blk.0.ffn_down_exps.weight"]
+    assert vec.shape == (4,)
+    np.testing.assert_allclose(vec, [2.0, 4.0, 3.0, 6.0])
+
+
+def test_load_imatrix_per_expert_fills_unvisited_with_mean(tmp_path):
+    sum2_2d = np.array([[10.0, 20.0], [0.0, 0.0], [30.0, 40.0]], dtype=np.float32)
+    counts_2d = np.array([[2.0], [0.0], [2.0]], dtype=np.float32)
+    path = _write_per_expert_imatrix_gguf(
+        tmp_path / "im.gguf", "blk.0.ffn_up_exps.weight", sum2_2d, counts_2d
+    )
+    vec = load_imatrix(path)["blk.0.ffn_up_exps.weight"].reshape(3, 2)
+    np.testing.assert_allclose(vec[0], [5.0, 10.0])
+    np.testing.assert_allclose(vec[1], [10.0, 15.0])  # mean of visited experts
+    np.testing.assert_allclose(vec[2], [15.0, 20.0])
+
+
 def test_load_imatrix_missing_counts_raises(tmp_path):
     w = gguf.GGUFWriter(str(tmp_path / "im.gguf"), arch="imatrix")
     w.add_tensor("blk.0.attn_q.weight.in_sum2",

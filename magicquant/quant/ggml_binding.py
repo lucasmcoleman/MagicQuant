@@ -343,8 +343,16 @@ class _LibggmlHandle:
         Args:
             weights: floating-point numpy array (any shape; flattened internally).
             ggml_type: ggml type name (e.g., "Q4_K", "Q2_K", "MXFP4").
-            imatrix: optional float32 importance vector — one entry per input
-                column of the tensor (length must equal ``n_per_row``).
+            imatrix: optional float32 importance vector. Either a plain
+                ``[n_per_row]`` vector shared across every row (the normal
+                dense-tensor case), or a per-expert ``[n_experts * n_per_row]``
+                vector, expert-major (one ``n_per_row``-length slice per
+                expert) — the layout ``magicquant.imatrix.load_imatrix``
+                produces for a stacked MoE ``_exps`` tensor, since llama-imatrix
+                tracks activation importance separately per expert (routing
+                sends each token to only a few experts, so a shared vector
+                would silently average unrelated experts' statistics
+                together). Length must be a multiple of ``n_per_row``.
             n_per_row: the tensor's true row width. REQUIRED with ``imatrix``
                 (importance is applied per column, so row structure matters);
                 ignored otherwise — the unweighted path quantizes the flat
@@ -372,6 +380,8 @@ class _LibggmlHandle:
 
         flat = np.ascontiguousarray(weights, dtype=np.float32).reshape(-1)
 
+        n_slices = 1
+        imat_check = None
         if imatrix is not None:
             if n_per_row is None:
                 raise ValueError(
@@ -383,16 +393,24 @@ class _LibggmlHandle:
                     f"tensor size {flat.size} is not a multiple of "
                     f"n_per_row={n_per_row}"
                 )
-            imat_check = np.asarray(imatrix).reshape(-1)
-            if imat_check.size != n_per_row:
-                raise ValueError(
-                    f"imatrix length {imat_check.size} != row width "
-                    f"{n_per_row}. Each weight tensor needs its own "
-                    f"importance vector with one entry per input column. "
-                    f"(Per-expert MoE imatrix slices are not supported yet — "
-                    f"drop the imatrix for this tensor.)"
-                )
             nrows = flat.size // n_per_row
+            imat_check = np.ascontiguousarray(imatrix, dtype=np.float32).reshape(-1)
+            if imat_check.size == 0 or imat_check.size % n_per_row != 0:
+                raise ValueError(
+                    f"imatrix length {imat_check.size} is not a multiple of "
+                    f"row width {n_per_row}. Each weight tensor needs one "
+                    f"([n_per_row]) or, for stacked MoE experts, several "
+                    f"([n_experts * n_per_row], expert-major) importance "
+                    f"vectors."
+                )
+            n_slices = imat_check.size // n_per_row
+            if n_slices > 1 and nrows % n_slices != 0:
+                raise ValueError(
+                    f"imatrix has {n_slices} per-expert slices but the "
+                    f"tensor's {nrows} rows don't divide evenly by that — "
+                    f"shape mismatch between the captured imatrix and this "
+                    f"weight tensor."
+                )
         else:
             # Historical fast path: one row spanning the whole buffer.
             n_per_row = flat.size
@@ -414,26 +432,66 @@ class _LibggmlHandle:
 
         dst_buf = (ctypes.c_uint8 * out_size)()
 
-        imat_ptr = None
-        imat_owner = None  # keep alive
-        if imatrix is not None:
-            imat_owner = np.ascontiguousarray(imatrix, dtype=np.float32)
-            imat_ptr = imat_owner.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        if n_slices <= 1:
+            imat_ptr = None
+            if imat_check is not None:
+                imat_ptr = imat_check.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-        actual = self._base.ggml_quantize_chunk(
-            type_id,
-            flat.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            ctypes.cast(dst_buf, ctypes.c_void_p),
-            ctypes.c_int64(0),
-            ctypes.c_int64(nrows),
-            ctypes.c_int64(n_per_row),
-            imat_ptr if imat_ptr is not None else ctypes.POINTER(ctypes.c_float)(),
-        )
-        if actual != out_size:
+            actual = self._base.ggml_quantize_chunk(
+                type_id,
+                flat.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                ctypes.cast(dst_buf, ctypes.c_void_p),
+                ctypes.c_int64(0),
+                ctypes.c_int64(nrows),
+                ctypes.c_int64(n_per_row),
+                imat_ptr if imat_ptr is not None else ctypes.POINTER(ctypes.c_float)(),
+            )
+            if actual != out_size:
+                raise RuntimeError(
+                    f"ggml_quantize_chunk wrote {actual} bytes, expected {out_size} "
+                    f"(type={ggml_type}, n_elements={n_per_row}). "
+                    f"Likely cause: wrong type_id or block-size mismatch."
+                )
+            return bytes(dst_buf)
+
+        # Per-expert MoE tensor: quantize each expert's slice separately with
+        # its own imatrix slice, mirroring llama.cpp's own handling (see
+        # llama-quant.cpp's per-i03 loop, which offsets src/dst/imatrix by
+        # i03*nelements_matrix / i03*row_size*nrows / i03*n_per_row — the
+        # same per-expert-imatrix scheme, confirmed against a real gpt-oss-20b
+        # imatrix capture during development).
+        rows_per_slice = nrows // n_slices
+        elems_per_slice = rows_per_slice * n_per_row
+        slice_bytes = _expected_size(ggml_type, elems_per_slice)
+        dst_base = ctypes.addressof(dst_buf)
+        total_written = 0
+        for slice_idx in range(n_slices):
+            src_slice = flat[slice_idx * elems_per_slice: (slice_idx + 1) * elems_per_slice]
+            imat_slice = imat_check[slice_idx * n_per_row: (slice_idx + 1) * n_per_row]
+            dst_ptr = ctypes.c_void_p(dst_base + slice_idx * slice_bytes)
+
+            actual = self._base.ggml_quantize_chunk(
+                type_id,
+                src_slice.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                dst_ptr,
+                ctypes.c_int64(0),
+                ctypes.c_int64(rows_per_slice),
+                ctypes.c_int64(n_per_row),
+                imat_slice.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            )
+            if actual != slice_bytes:
+                raise RuntimeError(
+                    f"ggml_quantize_chunk wrote {actual} bytes for expert "
+                    f"slice {slice_idx}/{n_slices}, expected {slice_bytes} "
+                    f"(type={ggml_type}). Likely cause: wrong type_id or "
+                    f"block-size mismatch."
+                )
+            total_written += actual
+
+        if total_written != out_size:
             raise RuntimeError(
-                f"ggml_quantize_chunk wrote {actual} bytes, expected {out_size} "
-                f"(type={ggml_type}, n_elements={n_per_row}). "
-                f"Likely cause: wrong type_id or block-size mismatch."
+                f"per-expert encode wrote {total_written} bytes total, "
+                f"expected {out_size} (type={ggml_type}, n_slices={n_slices})."
             )
         return bytes(dst_buf)
 

@@ -108,18 +108,64 @@ def capture_imatrix(
     return output_path
 
 
+def _reduce_per_expert_imatrix(
+    weight_name: str, sum2_2d: np.ndarray, counts_2d: np.ndarray
+) -> Optional[np.ndarray]:
+    """Divide per-expert sums by per-expert counts for a stacked MoE tensor.
+
+    llama-imatrix tracks activation importance separately per expert for
+    ``_exps`` tensors (confirmed empirically: capturing over gpt-oss-20b with
+    a small corpus left several experts per layer at count=0, since MoE
+    routing sends each token to only a handful of experts) — ``in_sum2``
+    comes back shaped ``[n_experts, n_per_row]`` and ``counts`` shaped
+    ``[n_experts, 1]``, not the flat ``[n_per_row]`` a dense tensor gets.
+
+    An unvisited expert (count == 0) is filled with the mean of the visited
+    experts' vectors rather than left at zero — a zero-everywhere importance
+    row would make the encoder's weighted quantization degenerate for that
+    expert's rows. Mirrors llama.cpp's own fallback for the same situation.
+    Returns None (drop imatrix for this tensor entirely) only if NO expert
+    was visited at all.
+    """
+    visited = counts_2d.ravel() > 0
+    if not visited.any():
+        logger.warning(
+            "imatrix: '%s' has no visited experts (calibration corpus too "
+            "small/narrow for this tensor's routing) -- skipping",
+            weight_name,
+        )
+        return None
+
+    per_expert = np.zeros_like(sum2_2d)
+    per_expert[visited] = sum2_2d[visited] / counts_2d[visited]
+    if not visited.all():
+        fallback = per_expert[visited].mean(axis=0)
+        per_expert[~visited] = fallback
+        logger.info(
+            "imatrix: '%s' had %d/%d unvisited expert(s); filled with the "
+            "mean of visited experts",
+            weight_name, int((~visited).sum()), len(visited),
+        )
+    return per_expert.reshape(-1)
+
+
 def load_imatrix(path: Union[str, Path]) -> Dict[str, np.ndarray]:
     """Load an imatrix GGUF into ``{weight_tensor_name: importance_vector}``.
 
     Each vector is float32 with one entry per input column of the weight it
     belongs to (``in_sum2 / counts``), ready to pass to
-    ``create_hybrid_gguf(..., imatrix=...)``.
+    ``create_hybrid_gguf(..., imatrix=...)``. For a stacked MoE ``_exps``
+    tensor, the vector is instead ``n_experts`` such slices concatenated
+    expert-major (``[n_experts * n_per_row]``) — see
+    ``_reduce_per_expert_imatrix`` — which ``ggml_binding.encode()``
+    recognizes and quantizes expert-by-expert.
     """
     from magicquant.gguf.source import GGUFSource
 
     path = Path(path)
     source = GGUFSource(str(path))
     names = set(source.get_tensor_names())
+    shapes = {info["name"]: info["shape"] for info in source.get_all_tensors_info()}
 
     sum_names = {n for n in names if n.endswith(_SUM_SUFFIX)}
     if not sum_names:
@@ -141,6 +187,17 @@ def load_imatrix(path: Union[str, Path]) -> Dict[str, np.ndarray]:
         counts = source.read_tensor_f32(count_name)
         if sum2 is None or counts is None:
             raise ValueError(f"{path}: failed to read pair for '{weight_name}'")
+
+        sum_shape = shapes.get(sum_name)
+        if sum_shape is not None and len(sum_shape) == 2:
+            n_experts, n_per_row = sum_shape
+            sum2_2d = np.asarray(sum2, dtype=np.float32).reshape(n_experts, n_per_row)
+            counts_2d = np.asarray(counts, dtype=np.float32).reshape(n_experts, 1)
+            vector = _reduce_per_expert_imatrix(weight_name, sum2_2d, counts_2d)
+            if vector is not None:
+                result[weight_name] = vector
+            continue
+
         count = float(np.asarray(counts).ravel()[0])
         if count <= 0:
             logger.warning("imatrix: '%s' has count %s; skipping", weight_name, count)

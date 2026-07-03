@@ -8,6 +8,8 @@ F32). A block-32 scheme (MXFP4 / Q8_0) encodes those rows and respects the user'
 size intent; F32 is kept only where it's actually required (SSM conv operands) or
 when the row isn't even 32-divisible.
 """
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -60,3 +62,25 @@ def test_incompatible_expert_packs_as_mxfp4_not_f32(tmp_path, monkeypatch):
     from gguf import GGUFReader
     types = {t.name: t.tensor_type.name for t in GGUFReader(out).tensors}
     assert types["blk.0.ffn_down_exps.weight"] == "MXFP4", types
+
+
+def test_create_hybrid_gguf_with_per_expert_imatrix(tmp_path, monkeypatch):
+    """End-to-end: a stacked `_exps` tensor quantized with a real per-expert
+    imatrix dict (the shape magicquant.imatrix.load_imatrix now produces)
+    must build successfully through the full worker-thread pipeline, not
+    just through a direct encode_to_ggml_bytes call."""
+    n_expert, out_f, in_f = 4, 8, 32  # in_f=32 -> MXFP4/Q8_0 eligible
+    name = "blk.0.ffn_down_exps.weight"
+    src = StubSource([_expert(name, n_expert, out_f, in_f)])
+    monkeypatch.setattr(source_mod, "open_model_source", lambda *a, **k: src)
+
+    rng = np.random.default_rng(3)
+    imatrix = {name: rng.random(n_expert * in_f).astype(np.float32)}
+
+    out = str(tmp_path / "h.gguf")
+    result = create_hybrid_gguf(
+        out, "ignored", {"base": "Q8_0", "groups": {"X": "Q8_0"}},
+        verbose=False, imatrix=imatrix,
+    )
+    assert Path(result).is_file()
+    assert Path(result).stat().st_size > 0
