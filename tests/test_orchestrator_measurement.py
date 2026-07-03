@@ -9,6 +9,8 @@ exercises the actual wiring rather than a hand-rolled stand-in.
 """
 import json
 
+import pytest
+
 import magicquant.gguf.source as source_mod
 from magicquant.orchestrator import MagicQuantOrchestrator
 
@@ -279,6 +281,46 @@ def test_save_results_persists_kl_and_bench_fields(tmp_path):
     entry = saved["measurements"]["a"]
     assert entry["kl"] == {"mean_kl": 0.02}
     assert entry["bench"] == {"pp_tps": 90.0}
+
+
+def test_measured_search_raises_when_every_candidate_build_fails(tmp_path, monkeypatch):
+    """F3: a measured search where every build/measure fails must not report
+    success -- self._measured stays empty, so run_measured_search must raise
+    instead of falling through to _select_final_survivors/_save_results."""
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    monkeypatch.setattr(orch, "_build_candidate", lambda *a, **k: None)
+
+    with pytest.raises(RuntimeError, match="zero successful"):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=2, verbose=False,
+        )
+
+    assert not (orch.output_dir / "search_results.json").exists(), (
+        "must not write search_results.json for an all-failed run"
+    )
+
+
+def test_measured_search_raises_when_every_perplexity_measurement_fails(tmp_path, monkeypatch):
+    """Same guard, but the build succeeds and perplexity measurement is what
+    fails for every candidate (calculate_perplexity returns None)."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+
+    calls = {"n": 0}
+
+    def flaky_perplexity(path, verbose=False, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return 5.0  # baseline succeeds
+        return None  # every candidate measurement fails
+
+    monkeypatch.setattr(fake_tools, "calculate_perplexity", flaky_perplexity)
+
+    with pytest.raises(RuntimeError, match="zero successful"):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=2, verbose=False,
+        )
 
 
 def test_save_results_defaults_kl_and_bench_to_none_when_absent(tmp_path):
