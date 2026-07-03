@@ -20,9 +20,18 @@ Usage:
     capture_imatrix("model.gguf", "wiki.train.raw", "model.imatrix.gguf")
     imat = load_imatrix("model.imatrix.gguf")     # {tensor_name: float32[ncols]}
     create_hybrid_gguf(out, src, cfg, imatrix=imat)
+
+``ensure_imatrix`` wraps capture+load with an on-disk cache and a bundled
+default calibration corpus, so callers don't have to hand-manage either:
+
+    from magicquant.imatrix import ensure_imatrix
+    imat = ensure_imatrix("model.gguf")           # None on any failure
+    if imat is not None:
+        create_hybrid_gguf(out, src, cfg, imatrix=imat)
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import subprocess
@@ -35,6 +44,11 @@ logger = logging.getLogger(__name__)
 
 _SUM_SUFFIX = ".in_sum2"
 _COUNT_SUFFIX = ".counts"
+
+# Bundled default calibration corpus — a few KB of neutral, diverse English
+# prose. Good enough for a general-purpose imatrix when the caller doesn't
+# have a domain-specific corpus on hand.
+DEFAULT_CORPUS_PATH = Path(__file__).resolve().parent / "data" / "calib_corpus.txt"
 
 
 def capture_imatrix(
@@ -135,3 +149,136 @@ def load_imatrix(path: Union[str, Path]) -> Dict[str, np.ndarray]:
             np.asarray(sum2, dtype=np.float32).reshape(-1) / np.float32(count)
         )
     return result
+
+
+def _imatrix_cache_key(
+    source_path: Path, corpus_path: Path, ctx_size: int, chunks: int
+) -> str:
+    """Short, stable hash over the inputs that determine imatrix content.
+
+    Keyed on the source model's identity (name + mtime + size — cheap stand-in
+    for a content hash that still invalidates on re-export/re-quantize) plus
+    the corpus and capture parameters, so a stale cache is never reused after
+    the model, corpus, or capture settings change.
+    """
+    st = source_path.stat()
+    payload = "|".join(
+        [
+            source_path.name,
+            str(int(st.st_mtime)),
+            str(st.st_size),
+            corpus_path.name,
+            str(ctx_size),
+            str(chunks),
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def ensure_imatrix(
+    source_model_path: Union[str, Path],
+    *,
+    corpus_path: Optional[Union[str, Path]] = None,
+    cache_dir: Optional[Union[str, Path]] = None,
+    chunks: int = -1,
+    ctx_size: int = 512,
+    imatrix_bin: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> Optional[Dict[str, np.ndarray]]:
+    """Capture (or reuse a cached) imatrix for ``source_model_path`` and load it.
+
+    This is the orchestration layer over ``capture_imatrix`` / ``load_imatrix``:
+    it derives a cache key from the source model's identity, the corpus, and
+    the capture parameters, skips capture entirely on a cache hit, and always
+    returns a usable ``{tensor_name: importance_vector}`` dict or ``None`` —
+    it never raises, so callers can unconditionally do
+    ``create_hybrid_gguf(..., imatrix=ensure_imatrix(...))``.
+
+    Args:
+        source_model_path: path to the model to instrument. llama-imatrix can
+            only read a GGUF; if this doesn't end in ``.gguf`` (e.g. a
+            safetensors file or checkpoint directory) this function does NOT
+            attempt to pack one — it logs and returns ``None``. Callers with a
+            safetensors model must pack a BF16 GGUF first (the pipeline
+            orchestrator is expected to do this) and pass that path in.
+        corpus_path: plain-text calibration corpus. Defaults to the bundled
+            ``magicquant/data/calib_corpus.txt`` (a few KB of neutral, diverse
+            English prose) when not given.
+        cache_dir: directory to store captured imatrix GGUFs under. Defaults
+            to ``<source_model_path's dir>/_imatrix``.
+        chunks: max ctx_size-token chunks to process (-1 = whole corpus).
+        ctx_size: chunk length in tokens.
+        imatrix_bin: explicit path to llama-imatrix (default: search PATH).
+        timeout: optional subprocess timeout in seconds, passed through to
+            ``capture_imatrix``.
+
+    Returns:
+        ``{tensor_name: importance_vector}`` on success, or ``None`` if the
+        source isn't a GGUF, doesn't exist, or capture failed for any reason
+        (missing binary, non-zero exit, timeout, ...).
+    """
+    source_model_path = Path(source_model_path)
+
+    if source_model_path.suffix.lower() != ".gguf":
+        logger.warning(
+            "ensure_imatrix: %s is not a GGUF — llama-imatrix can only "
+            "instrument GGUFs. Pack a BF16 GGUF first; skipping imatrix "
+            "capture.",
+            source_model_path,
+        )
+        return None
+
+    if not source_model_path.exists():
+        logger.warning(
+            "ensure_imatrix: source model not found: %s", source_model_path
+        )
+        return None
+
+    corpus = Path(corpus_path) if corpus_path is not None else DEFAULT_CORPUS_PATH
+    cache_root = (
+        Path(cache_dir) if cache_dir is not None else source_model_path.parent / "_imatrix"
+    )
+
+    try:
+        key = _imatrix_cache_key(source_model_path, corpus, ctx_size, chunks)
+    except OSError:
+        logger.warning(
+            "ensure_imatrix: could not stat source model %s",
+            source_model_path,
+            exc_info=True,
+        )
+        return None
+    cache_path = cache_root / f"{key}.imatrix.gguf"
+
+    if cache_path.exists():
+        logger.info("ensure_imatrix: cache hit at %s", cache_path)
+    else:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        try:
+            capture_imatrix(
+                source_model_path,
+                corpus,
+                cache_path,
+                chunks=chunks,
+                ctx_size=ctx_size,
+                imatrix_bin=imatrix_bin,
+                timeout=timeout,
+            )
+        except Exception:
+            logger.warning(
+                "ensure_imatrix: capture failed for %s; continuing without "
+                "an imatrix",
+                source_model_path,
+                exc_info=True,
+            )
+            return None
+
+    try:
+        return load_imatrix(cache_path)
+    except Exception:
+        logger.warning(
+            "ensure_imatrix: failed to load captured imatrix %s",
+            cache_path,
+            exc_info=True,
+        )
+        return None

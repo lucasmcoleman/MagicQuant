@@ -2,6 +2,7 @@
 llama.cpp integration - Wrapper for calling llama.cpp quantization tools.
 """
 
+import json
 import subprocess
 import os
 import re
@@ -12,8 +13,14 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 
 # Default timeout for subprocess calls (seconds)
-_SUBPROCESS_TIMEOUT = 600  # 10 minutes
+_SUBPROCESS_TIMEOUT = 7200  # 2 hours (35B baseline perplexity ~67 min)
 _QUANTIZE_TIMEOUT = 1800   # 30 minutes for large model quantization
+_BENCH_TIMEOUT = 300       # 5 minutes for llama-bench pp/tg speed measurement
+# A real saved-logits (--kl-divergence-base) file is tens of MB even for a
+# tiny model/corpus; a corpus too short for the requested ctx_size*chunks
+# makes llama-perplexity exit 0 but write only a ~12-byte header stub. 4 KiB
+# comfortably separates "real" from "stub" without depending on model size.
+_MIN_LOGITS_FILE_BYTES = 4096
 
 
 class LlamaCppTools:
@@ -39,6 +46,7 @@ class LlamaCppTools:
         self.llamacpp_path = llamacpp_path or self._find_llamacpp()
         self.quantize_tool = self._find_quantize_tool()
         self.perplexity_tool = self._find_perplexity_tool()
+        self.bench_tool = _find_bench_tool(self.perplexity_tool)
         self.data_file = data_file
         self.ctx_size = ctx_size
 
@@ -256,7 +264,8 @@ class LlamaCppTools:
             "-m", model_path,
             "-f", resolved_data_file,
             "--ctx-size", str(effective_ctx),
-            "--perplexity",
+            "--batch-size", "512",
+            "--ubatch-size", "128",
         ]
 
         if verbose:
@@ -287,6 +296,179 @@ class LlamaCppTools:
             print("Perplexity calculation timed out")
             return None
 
+    def bench(
+        self,
+        model_path: str,
+        *,
+        n_prompt: int = 32,
+        n_gen: int = 32,
+        reps: int = 2,
+        timeout: int = _BENCH_TIMEOUT,
+    ) -> Optional[dict]:
+        """Measure prompt-processing and token-generation throughput.
+
+        Runs ``llama-bench -m <model> -p <n_prompt> -n <n_gen> -r <reps> -o
+        json``, which reports two rows: a prompt-processing row (n_gen == 0,
+        whose avg_ts is the pp t/s) and a generation row (n_prompt == 0,
+        whose avg_ts is the tg t/s). Confirmed empirically against the
+        ROCmFPX llama-bench build (see tests/test_llamacpp_measure.py).
+
+        Args:
+            model_path: Path to GGUF model to benchmark.
+            n_prompt: Prompt length (tokens) for the pp test.
+            n_gen: Generation length (tokens) for the tg test.
+            reps: Repetitions per test (-r).
+            timeout: Subprocess timeout in seconds.
+
+        Returns:
+            {"pp_ts": float, "tg_ts": float} (tokens/sec), or None if
+            llama-bench is unavailable or the run/parse failed.
+        """
+        if not self.bench_tool:
+            print("llama-bench not found; skipping speed measurement")
+            return None
+
+        cmd = [
+            self.bench_tool,
+            "-m", model_path,
+            "-p", str(n_prompt),
+            "-n", str(n_gen),
+            "-r", str(reps),
+            "-o", "json",
+        ]
+
+        try:
+            result = self._run_perplexity_subprocess(cmd, timeout=timeout)
+        except subprocess.CalledProcessError as e:
+            print(f"llama-bench failed: {e.stderr}")
+            return None
+        except subprocess.TimeoutExpired:
+            print("llama-bench timed out")
+            return None
+
+        parsed = _parse_bench_json(result.stdout or "")
+        if parsed is None:
+            print("llama-bench: could not parse pp_ts/tg_ts from JSON output")
+        return parsed
+
+    def save_base_logits(
+        self,
+        base_model_path: str,
+        corpus_path: str,
+        out_logits_path: str,
+        *,
+        ctx_size: int = 512,
+        chunks: int = -1,
+        timeout: int = _SUBPROCESS_TIMEOUT,
+    ) -> bool:
+        """Run the base model once, saving per-token logits to disk.
+
+        These saved logits are the reference distribution that later
+        ``calculate_kl_divergence`` calls compare quantized models against.
+        Wraps ``llama-perplexity -m <base> -f <corpus>
+        --kl-divergence-base <out_logits_path>``.
+
+        Args:
+            base_model_path: Path to the (typically un-quantized/BF16 or
+                highest-fidelity) reference GGUF model.
+            corpus_path: Path to a plain-text corpus file.
+            out_logits_path: Where to write the saved logits.
+            ctx_size: Context size for the pass.
+            chunks: Number of context-sized chunks to process (-1 = all).
+            timeout: Subprocess timeout in seconds.
+
+        Returns:
+            True if the subprocess succeeded and out_logits_path exists.
+        """
+        cmd = [
+            self.perplexity_tool,
+            "-m", base_model_path,
+            "-f", corpus_path,
+            "--kl-divergence-base", out_logits_path,
+            "--ctx-size", str(ctx_size),
+            "--chunks", str(chunks),
+        ]
+
+        try:
+            self._run_perplexity_subprocess(cmd, timeout=timeout)
+        except subprocess.CalledProcessError as e:
+            print(f"Saving base logits failed: {e.stderr}")
+            return False
+        except subprocess.TimeoutExpired:
+            print("Saving base logits timed out")
+            return False
+
+        # llama-perplexity exits 0 even when it can't actually run (e.g. the
+        # corpus tokenizes to fewer tokens than ctx_size*chunks requires) --
+        # it still creates the output file, but as a ~12-byte header stub
+        # with no real logits (empirically: a valid file is tens of MB for a
+        # small model/corpus). is_file() alone can't tell success from a
+        # stub, so also require a minimum size.
+        out_path = Path(out_logits_path)
+        return out_path.is_file() and out_path.stat().st_size > _MIN_LOGITS_FILE_BYTES
+
+    def calculate_kl_divergence(
+        self,
+        quant_model_path: str,
+        base_logits_path: str,
+        corpus_path: str,
+        *,
+        ctx_size: int = 512,
+        chunks: int = -1,
+        timeout: int = _SUBPROCESS_TIMEOUT,
+    ) -> Optional[dict]:
+        """Compute KL divergence of a quantized model against saved base logits.
+
+        Wraps ``llama-perplexity -m <quant> -f <corpus> --kl-divergence
+        --kl-divergence-base <base_logits_path>`` and parses the "KL
+        divergence statistics" block it prints to stdout. Label/format
+        confirmed empirically (see tests/test_llamacpp_measure.py):
+
+            Mean    KLD:  -0.000019 +/-   0.000001
+            Maximum KLD:   0.000001
+            90.0%   KLD:  -0.000005
+
+        Args:
+            quant_model_path: Path to the quantized GGUF model to evaluate.
+            base_logits_path: Path to logits previously written by
+                save_base_logits().
+            corpus_path: Path to the same plain-text corpus used to save
+                the base logits (chunking must match).
+            ctx_size: Context size for the pass (must match the base-logits
+                run).
+            chunks: Number of context-sized chunks to process (-1 = all;
+                must match the base-logits run).
+            timeout: Subprocess timeout in seconds.
+
+        Returns:
+            {"mean_kl": float, "max_kl": float, "p90_kl": float} (the
+            latter two omitted if absent from the output), or None if the
+            run failed or the "Mean KLD" line couldn't be found.
+        """
+        cmd = [
+            self.perplexity_tool,
+            "-m", quant_model_path,
+            "-f", corpus_path,
+            "--kl-divergence",
+            "--kl-divergence-base", base_logits_path,
+            "--ctx-size", str(ctx_size),
+            "--chunks", str(chunks),
+        ]
+
+        try:
+            result = self._run_perplexity_subprocess(cmd, timeout=timeout)
+        except subprocess.CalledProcessError as e:
+            print(f"KL divergence calculation failed: {e.stderr}")
+            return None
+        except subprocess.TimeoutExpired:
+            print("KL divergence calculation timed out")
+            return None
+
+        parsed = _parse_kl_output((result.stdout or "") + "\n" + (result.stderr or ""))
+        if parsed is None:
+            print("KL divergence: could not find 'Mean KLD' in output")
+        return parsed
+
 
 def _parse_perplexity_output(output: str) -> Optional[float]:
     """Extract perplexity value from llama-perplexity output.
@@ -313,6 +495,119 @@ def _parse_perplexity_output(output: str) -> Optional[float]:
             if m:
                 return float(m.group(1))
     return None
+
+
+def _parse_bench_json(text: str) -> Optional[dict]:
+    """Extract pp_ts/tg_ts from llama-bench's ``-o json`` output.
+
+    llama-bench (with ``-o json``) prints a JSON array with one object per
+    test row. Confirmed empirically: the prompt-processing row has
+    ``n_gen == 0`` (its ``avg_ts`` is the pp t/s); the generation row has
+    ``n_prompt == 0`` (its ``avg_ts`` is the tg t/s).
+
+    Args:
+        text: llama-bench stdout (the JSON array; some builds may print
+            extra banner/log lines around it, so the outermost ``[...]``
+            is isolated before parsing).
+
+    Returns:
+        {"pp_ts": float, "tg_ts": float}, or None if the JSON can't be
+        parsed or the expected rows aren't both present.
+    """
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end < start:
+        return None
+
+    try:
+        rows = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+    pp_ts = None
+    tg_ts = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if pp_ts is None and row.get("n_gen") == 0:
+            pp_ts = row.get("avg_ts")
+        if tg_ts is None and row.get("n_prompt") == 0:
+            tg_ts = row.get("avg_ts")
+
+    if pp_ts is None or tg_ts is None:
+        return None
+
+    return {"pp_ts": float(pp_ts), "tg_ts": float(tg_ts)}
+
+
+def _parse_kl_output(output: str) -> Optional[dict]:
+    """Extract KL-divergence statistics from llama-perplexity output.
+
+    ``llama-perplexity --kl-divergence`` prints a "KL divergence
+    statistics" block to stdout with lines like (real format, confirmed by
+    running a q8_0 model against its own saved logits -- see
+    tests/test_llamacpp_measure.py)::
+
+        ====== KL divergence statistics ======
+        Mean    KLD:  -0.000019 ±   0.000001
+        Maximum KLD:   0.000001
+        90.0%   KLD:  -0.000005
+
+    Args:
+        output: Combined stdout+stderr from llama-perplexity.
+
+    Returns:
+        {"mean_kl": float, "max_kl": float, "p90_kl": float} (max_kl/p90_kl
+        omitted if not present in the output), or None if no "Mean ... KLD:"
+        line is found.
+    """
+    result: dict = {}
+
+    m = re.search(r"Mean\s+KLD:\s*(-?\d+\.?\d*)", output)
+    if not m:
+        return None
+    result["mean_kl"] = float(m.group(1))
+
+    m = re.search(r"Maximum\s+KLD:\s*(-?\d+\.?\d*)", output)
+    if m:
+        result["max_kl"] = float(m.group(1))
+
+    m = re.search(r"90\.0%\s+KLD:\s*(-?\d+\.?\d*)", output)
+    if m:
+        result["p90_kl"] = float(m.group(1))
+
+    return result
+
+
+def _find_bench_tool(perplexity_tool_path: str) -> Optional[str]:
+    """Locate the llama-bench executable next to the resolved perplexity tool.
+
+    Mirrors LlamaCppTools._find_perplexity_tool, but returns None instead of
+    raising when the binary is absent -- bench() must degrade gracefully
+    (return None) rather than prevent LlamaCppTools from being constructed.
+    """
+    possible_names = ["llama-bench.exe", "llama-bench"]
+    base = Path(perplexity_tool_path).parent
+
+    for name in possible_names:
+        candidate = base / name
+        if candidate.exists():
+            return str(candidate)
+
+    # Fall back to PATH
+    which_cmd = "where" if os.name == "nt" else "which"
+    try:
+        result = subprocess.run(
+            [which_cmd, "llama-bench"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        found = result.stdout.strip().splitlines()
+        return found[0] if found else None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return None
 
 
 # Quantization type mapping from MagicQuant to llama.cpp

@@ -215,14 +215,28 @@ _HF_TO_GGUF_PATTERNS = [
     (r"^model\.layers\.(\d+)\.post_attention_layernorm\.weight$",
      lambda m: f"blk.{m.group(1)}.ffn_norm.weight"),
     # MoE
+    # NOTE: per-expert projection tensors (model.layers.N.mlp.experts.E.*,
+    # block_sparse_moe.experts.E.*) are intentionally NOT matched here.
+    # SafetensorsSource._ensure_loaded() intercepts them via
+    # _detect_moe_expert_tensor() BEFORE this table is consulted and stacks
+    # them into one 3-D ffn_{gate,up,down}_exps tensor per layer (see the
+    # "MoE expert stacking" section below) -- matching them 1:1 here would
+    # collapse all experts of a projection onto the same GGUF name (last
+    # expert silently wins), producing an unloadable GGUF.
     (r"^model\.layers\.(\d+)\.mlp\.gate\.weight$",
      lambda m: f"blk.{m.group(1)}.ffn_gate_inp.weight"),
-    (r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.up_proj\.weight$",
-     lambda m: f"blk.{m.group(1)}.ffn_up_exps.{m.group(2)}.weight"),
-    (r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_proj\.weight$",
-     lambda m: f"blk.{m.group(1)}.ffn_gate_exps.{m.group(2)}.weight"),
-    (r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\.weight$",
-     lambda m: f"blk.{m.group(1)}.ffn_down_exps.{m.group(2)}.weight"),
+    # Mixtral router lives under block_sparse_moe instead of mlp.
+    (r"^model\.layers\.(\d+)\.block_sparse_moe\.gate\.weight$",
+     lambda m: f"blk.{m.group(1)}.ffn_gate_inp.weight"),
+    # Shared expert(s) (DeepSeek/Qwen MoE): always-on expert(s) that run
+    # alongside the routed ones. Each is already a single HF tensor per
+    # projection (no per-expert axis), so it maps 1:1 like any other tensor.
+    (r"^model\.layers\.(\d+)\.mlp\.shared_experts\.gate_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.ffn_gate_shexp.weight"),
+    (r"^model\.layers\.(\d+)\.mlp\.shared_experts\.up_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.ffn_up_shexp.weight"),
+    (r"^model\.layers\.(\d+)\.mlp\.shared_experts\.down_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.ffn_down_shexp.weight"),
     # Granite MoE Hybrid: fused expert tensors + shared MLP + Mamba
     (r"^model\.layers\.(\d+)\.block_sparse_moe\.input_linear\.weight$",
      lambda m: f"blk.{m.group(1)}.ffn_gate_up_exps.weight"),
@@ -270,6 +284,22 @@ _HF_TO_GGUF_PATTERNS = [
      lambda m: f"blk.{m.group(1)}.ssm_norm.weight"),
     (r"^model\.layers\.(\d+)\.linear_attn\.out_proj\.weight$",
      lambda m: f"blk.{m.group(1)}.ssm_out.weight"),
+    # TODO(deepseek-v2/v3 MLA): DeepSeek-V2/V3's Multi-head Latent Attention
+    # uses a different projection set than the plain q/k/v/o above:
+    #   self_attn.q_a_proj            -> blk.N.attn_q_a.weight
+    #   self_attn.q_b_proj            -> blk.N.attn_q_b.weight
+    #   self_attn.kv_a_proj_with_mqa  -> blk.N.attn_kv_a_mqa.weight
+    #   self_attn.kv_b_proj           -> blk.N.attn_kv_b.weight
+    #   self_attn.q_a_layernorm       -> blk.N.attn_q_a_norm.weight
+    #   self_attn.kv_a_layernorm      -> blk.N.attn_kv_a_norm.weight
+    # (names confirmed against llama.cpp's gguf-py/gguf/tensor_mapping.py
+    # ATTN_Q_A / ATTN_Q_B / ATTN_KV_A_MQA / ATTN_KV_B / ATTN_Q_A_NORM /
+    # ATTN_KV_A_NORM entries). Not added here to keep this change focused on
+    # MoE expert-stacking + Mixtral; deepseek2/deepseek_v3 checkpoints will
+    # currently fall through to the generic q/k/v/o patterns (no match, since
+    # the attribute names differ) and keep their raw HF names, which
+    # llama.cpp's deepseek2 loader won't recognize. Add a dedicated pattern
+    # block here (mirroring the q/k/v block above) when MLA support is needed.
 ]
 
 _HF_TO_GGUF_COMPILED = [(re.compile(p), r) for p, r in _HF_TO_GGUF_PATTERNS]
@@ -321,6 +351,81 @@ def _hf_name_to_gguf(hf_name: str, arch: str = "") -> str:
     return hf_name
 
 
+# =====================================================================
+# MoE expert stacking
+# =====================================================================
+#
+# HF MoE checkpoints store each expert's projection as its own separate
+# 2-D tensor, e.g.:
+#   model.layers.3.mlp.experts.7.gate_proj.weight            (generic/Qwen/DeepSeek)
+#   model.layers.3.block_sparse_moe.experts.7.w1.weight       (Mixtral)
+#
+# llama.cpp's GGUF format instead expects ONE 3-D tensor per (layer,
+# projection), with every expert's 2-D weight stacked along a new leading
+# axis in ascending expert-index order:
+#   blk.3.ffn_gate_exps.weight   shape [n_expert, out_features, in_features]
+#   blk.3.ffn_up_exps.weight
+#   blk.3.ffn_down_exps.weight
+#
+# This mirrors llama.cpp convert_hf_to_gguf.py's per-arch expert handling
+# (e.g. MixtralModel.modify_tensors / Qwen2MoeModel.modify_tensors), which
+# accumulates each expert's tensor into a per-layer dict keyed by HF name
+# and, once all n_experts are collected, does
+# ``torch.stack([experts[i] for i in range(n_experts)], dim=0)`` before
+# handing the merged tensor to the normal write path -- i.e. expert 0's
+# weight occupies index 0 of the new leading axis, expert 1 index 1, etc.
+#
+# Mixtral's w1/w2/w3 map to gate/down/up respectively (confirmed against
+# llama.cpp's gguf-py/gguf/tensor_mapping.py FFN_GATE_EXP / FFN_DOWN_EXP /
+# FFN_UP_EXP entries, which list "...block_sparse_moe.experts.w1" under
+# FFN_GATE_EXP, "...w2" under FFN_DOWN_EXP, and "...w3" under FFN_UP_EXP).
+#
+# Router (ffn_gate_inp) and shared-expert (ffn_*_shexp) tensors are NOT
+# per-expert -- each is already a single HF tensor, so they map 1:1 via the
+# ordinary _HF_TO_GGUF_PATTERNS table above and never reach this code.
+#
+# NOTE: expert *bias* tensors (model.layers.N.mlp.experts.E.gate_proj.bias
+# etc.) are not handled here -- most MoE Linear layers ship with
+# bias=False, and no architecture in this codebase's test fleet currently
+# needs it. An unmatched expert bias falls through to _hf_name_to_gguf
+# unmatched and keeps its raw HF name (harmless: llama.cpp's MoE loaders
+# don't require a bias tensor to be present). Extend
+# _MOE_EXPERT_PATTERNS with a ".bias" variant if a checkpoint needs it.
+_MOE_EXPERT_PATTERNS = [
+    # Generic / Qwen / DeepSeek
+    (re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_proj\.weight$"), "gate"),
+    (re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.up_proj\.weight$"), "up"),
+    (re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\.weight$"), "down"),
+    # Mixtral (w1=gate, w2=down, w3=up)
+    (re.compile(r"^model\.layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.w1\.weight$"), "gate"),
+    (re.compile(r"^model\.layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.w2\.weight$"), "down"),
+    (re.compile(r"^model\.layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.w3\.weight$"), "up"),
+]
+
+
+def _detect_moe_expert_tensor(stripped_name: str) -> Optional[Tuple[str, int, str]]:
+    """Identify a per-expert MoE projection tensor.
+
+    Args:
+        stripped_name: HF tensor name with multimodal prefixes already
+            stripped (same preprocessing SafetensorsSource applies before
+            calling ``_hf_name_to_gguf``).
+
+    Returns:
+        ``(gguf_stacked_name, expert_idx, proj_key)`` if *stripped_name*
+        names one expert's slice of a gate/up/down projection (e.g.
+        ``("blk.3.ffn_gate_exps.weight", 7, "gate")``), else ``None``.
+        ``gguf_stacked_name`` is the SAME name for every expert index of a
+        given (layer, projection) -- callers group by it to stack.
+    """
+    for pattern, proj_key in _MOE_EXPERT_PATTERNS:
+        m = pattern.match(stripped_name)
+        if m:
+            layer, expert_idx = m.group(1), int(m.group(2))
+            return f"blk.{layer}.ffn_{proj_key}_exps.weight", expert_idx, proj_key
+    return None
+
+
 # safetensors dtype -> ggml type id
 _ST_DTYPE_TO_GGML = {
     "F32": 0,
@@ -343,6 +448,26 @@ _ST_DTYPE_NUMPY = {
     "I64": np.int64,
     "F64": np.float64,
 }
+
+
+def _decode_st_bytes_to_f32(dtype: str, buf) -> Optional[np.ndarray]:
+    """Decode a raw safetensors byte buffer to a flat float32 array.
+
+    Shared by SafetensorsSource.read_tensor_f32 (single tensor) and its
+    stacked-MoE-expert reader (one call per expert part, concatenated).
+    Returns None for an unrecognized dtype.
+    """
+    np_dtype = _ST_DTYPE_NUMPY.get(dtype)
+    if np_dtype is None:
+        return None
+    if dtype == "F32":
+        return np.frombuffer(buf, dtype=np.float32).copy()
+    if dtype == "F16":
+        return np.frombuffer(buf, dtype=np.float16).astype(np.float32)
+    if dtype == "BF16":
+        raw = np.frombuffer(buf, dtype=np.uint16)
+        return (raw.astype(np.uint32) << 16).view(np.float32)
+    return np.frombuffer(buf, dtype=np_dtype).astype(np.float32)
 
 
 def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -869,6 +994,12 @@ class SafetensorsSource(ModelSource):
                     "broken in llama.cpp).", arch,
                 )
 
+        # Per-expert MoE projection tensors accumulate here instead of going
+        # straight into self._tensor_map: gguf_stacked_name -> {expert_idx: raw_info}.
+        # Stacked into single virtual 3-D tensors after all files are parsed
+        # (see "MoE expert stacking" below _hf_name_to_gguf).
+        expert_groups: Dict[str, Dict[int, Dict[str, Any]]] = {}
+
         # Parse headers from all files
         for filepath in list(self._files.keys()):
             header, data_start = self._parse_header(filepath)
@@ -892,10 +1023,29 @@ class SafetensorsSource(ModelSource):
                 if stripped.startswith("model.visual.") or hf_name.startswith("mtp."):
                     continue
 
-                gguf_name = _hf_name_to_gguf(hf_name, arch=arch)
                 dtype = info.get("dtype", "F32")
                 shape = info.get("shape", [])
                 offsets = info.get("data_offsets", [0, 0])
+
+                # MoE per-expert projections: group by (layer, projection)
+                # instead of adding to _tensor_map directly -- they're
+                # stacked into one virtual 3-D tensor once every file has
+                # been scanned (an expert's shard may not be the first/last
+                # file for its layer).
+                moe_hit = _detect_moe_expert_tensor(stripped)
+                if moe_hit is not None:
+                    stacked_name, expert_idx, _proj_key = moe_hit
+                    expert_groups.setdefault(stacked_name, {})[expert_idx] = {
+                        "dtype": dtype,
+                        "shape": list(shape),
+                        "filepath": filepath,
+                        "byte_offset": offsets[0],
+                        "byte_length": offsets[1] - offsets[0],
+                        "data_start": data_start,
+                    }
+                    continue
+
+                gguf_name = _hf_name_to_gguf(hf_name, arch=arch)
 
                 # GGUF supports at most GGML_MAX_DIMS (4) dimensions.
                 # Merge trailing dims for tensors that exceed this (e.g.
@@ -915,6 +1065,47 @@ class SafetensorsSource(ModelSource):
                     "byte_length": offsets[1] - offsets[0],
                     "data_start": data_start,
                 }
+
+        # Stack each MoE expert group into one virtual 3-D tensor: shape
+        # [n_expert, out_features, in_features], experts in ascending index
+        # order along the new leading axis (matches llama.cpp's
+        # torch.stack(..., dim=0) -- see _detect_moe_expert_tensor's docstring).
+        for gguf_name, experts_by_idx in expert_groups.items():
+            idxs = sorted(experts_by_idx.keys())
+            if idxs != list(range(len(idxs))):
+                _log.warning(
+                    "MoE expert group '%s' has non-contiguous/unexpected "
+                    "expert indices %s (expected a dense 0..%d range) -- "
+                    "stacking in ascending-index order anyway; a missing "
+                    "expert will shift every later expert into the wrong "
+                    "slot.", gguf_name, idxs, len(idxs) - 1,
+                )
+            ordered_parts = [experts_by_idx[i] for i in idxs]
+            first = ordered_parts[0]
+            for part in ordered_parts[1:]:
+                if part["dtype"] != first["dtype"]:
+                    _log.warning(
+                        "MoE expert group '%s' has mixed dtypes (%s vs %s) "
+                        "across experts -- decoding all parts to f32 "
+                        "independently, but this is unexpected.",
+                        gguf_name, first["dtype"], part["dtype"],
+                    )
+
+            per_expert_shape = list(first["shape"])
+            stacked_shape_orig = [len(ordered_parts)] + per_expert_shape
+            stacked_shape = _flatten_to_max_dims(stacked_shape_orig, max_dims=4)
+
+            self._tensor_map[gguf_name] = {
+                "hf_name": None,  # synthesized from N per-expert HF tensors
+                "gguf_name": gguf_name,
+                "dtype": first["dtype"],
+                "shape": stacked_shape,  # row-major, at most 4-D
+                "shape_orig": stacked_shape_orig,
+                "n_dims": len(stacked_shape),
+                "data_type": _ST_DTYPE_TO_GGML.get(first["dtype"], 0),
+                "is_expert_stack": True,
+                "expert_parts": ordered_parts,  # ascending expert-index order
+            }
 
         # Handle tied weights: if output.weight is missing and embeddings are tied,
         # create a reference to token_embd.weight
@@ -991,10 +1182,10 @@ class SafetensorsSource(ModelSource):
         if info is None:
             return None
 
+        if info.get("is_expert_stack"):
+            return self._read_stacked_experts(info)
+
         dtype = info["dtype"]
-        np_dtype = _ST_DTYPE_NUMPY.get(dtype)
-        if np_dtype is None:
-            return None
 
         # Use memory-mapped I/O for zero-copy reads
         mmap = self._get_mmap(info["filepath"])
@@ -1002,15 +1193,9 @@ class SafetensorsSource(ModelSource):
         end = start + info["byte_length"]
         buf = mmap[start:end]
 
-        if dtype == "F32":
-            flat = np.frombuffer(buf, dtype=np.float32).copy()
-        elif dtype == "F16":
-            flat = np.frombuffer(buf, dtype=np.float16).astype(np.float32)
-        elif dtype == "BF16":
-            raw = np.frombuffer(buf, dtype=np.uint16)
-            flat = (raw.astype(np.uint32) << 16).view(np.float32)
-        else:
-            flat = np.frombuffer(buf, dtype=np_dtype).astype(np.float32)
+        flat = _decode_st_bytes_to_f32(dtype, buf)
+        if flat is None:
+            return None
 
         # NORM-rope arches: llama.cpp expects Q/K rows interleaved.
         n_head = self.get_qk_permute_heads(tensor_name)
@@ -1018,6 +1203,29 @@ class SafetensorsSource(ModelSource):
             shaped = flat.reshape(info["shape"])
             flat = _permute_qk_rows(shaped, n_head).reshape(-1)
         return flat
+
+    def _read_stacked_experts(self, info: Dict[str, Any]) -> Optional[np.ndarray]:
+        """Read a virtual stacked-MoE-expert tensor (see ``_detect_moe_expert_tensor``).
+
+        Each expert's 2-D weight is decoded to a flat f32 array individually,
+        then concatenated in ascending expert-index order. Because
+        ``read_tensor_f32`` always returns a FLAT array and the stacked axis
+        is a new LEADING axis, simple concatenation in index order already
+        produces the correct row-major memory layout for
+        ``[n_expert, out_features, in_features]`` -- no reshape/transpose
+        needed.
+        """
+        parts = []
+        for part in info["expert_parts"]:
+            mmap = self._get_mmap(part["filepath"])
+            start = part["data_start"] + part["byte_offset"]
+            end = start + part["byte_length"]
+            buf = mmap[start:end]
+            flat = _decode_st_bytes_to_f32(part["dtype"], buf)
+            if flat is None:
+                return None
+            parts.append(flat)
+        return np.concatenate(parts)
 
     def _get_mmap(self, filepath: str):
         """Get or create a memory-mapped view of a safetensors file."""
