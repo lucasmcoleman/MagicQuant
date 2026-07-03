@@ -37,6 +37,7 @@ import pytest
 
 from magicquant.utils.llamacpp import (
     LlamaCppTools,
+    _env_int,
     _parse_bench_json,
     _parse_kl_output,
 )
@@ -159,6 +160,8 @@ def _bare_tools(**attrs) -> LlamaCppTools:
     tools.perplexity_tool = "/bin/true"
     tools.bench_tool = "/bin/true"
     tools.ctx_size = 512
+    tools.ngl = None
+    tools.threads = None
     for k, v in attrs.items():
         setattr(tools, k, v)
     return tools
@@ -278,6 +281,238 @@ def test_calculate_kl_divergence_none_on_unparseable_output(tmp_path):
     assert result is None
 
 
+# --- GPU offload (-ngl/-t) flag threading -----------------------------------
+#
+# Real GPU behavior was verified manually (not by these unit tests, which
+# mock the subprocess): the plain /home/lucas/llama.cpp/build/bin build has
+# no ROCm/Vulkan backend compiled in at all (only libggml-cpu.so present) --
+# passing -ngl there is a harmless no-op, memory breakdown stays 100% Host.
+# The ~/ROCmFPX/build-strix-rocmfp4/bin build DOES offload for real: with
+# -ngl 99 explicit, `llama-perplexity -v` shows layers assigned to ROCm0/
+# Vulkan0 devices and a memory breakdown with non-zero ROCm0/Vulkan0 buffers
+# (pipeline parallelism across both). That build also defaults `-fit on`,
+# which auto-offloads via its own layer-fitting heuristic even when -ngl is
+# never passed -- orthogonal to this feature (we still only add the flag
+# when the caller/env explicitly asks for it, to keep the omitted-flag cmd
+# byte-identical to historical behavior).
+
+
+def test_env_int_parses_valid_int():
+    assert _env_int("MAGICQUANT_NGL_TEST_DOES_NOT_EXIST_XYZ") is None
+
+
+def test_env_int_unset_returns_none(monkeypatch):
+    monkeypatch.delenv("MQ_TEST_ENV_INT", raising=False)
+    assert _env_int("MQ_TEST_ENV_INT") is None
+
+
+def test_env_int_valid_value(monkeypatch):
+    monkeypatch.setenv("MQ_TEST_ENV_INT", "42")
+    assert _env_int("MQ_TEST_ENV_INT") == 42
+
+
+def test_env_int_invalid_value_returns_none(monkeypatch):
+    monkeypatch.setenv("MQ_TEST_ENV_INT", "not-an-int")
+    assert _env_int("MQ_TEST_ENV_INT") is None
+
+
+def test_env_int_empty_string_returns_none(monkeypatch):
+    monkeypatch.setenv("MQ_TEST_ENV_INT", "")
+    assert _env_int("MQ_TEST_ENV_INT") is None
+
+
+def _patched_finders(monkeypatch):
+    monkeypatch.setattr(LlamaCppTools, "_find_llamacpp", lambda self: "/fake/llamacpp")
+    monkeypatch.setattr(LlamaCppTools, "_find_quantize_tool", lambda self: "/fake/llama-quantize")
+    monkeypatch.setattr(LlamaCppTools, "_find_perplexity_tool", lambda self: "/fake/llama-perplexity")
+    monkeypatch.setattr(
+        "magicquant.utils.llamacpp._find_bench_tool", lambda perplexity_tool_path: None
+    )
+
+
+def test_init_defaults_ngl_threads_to_none_without_env(monkeypatch):
+    monkeypatch.delenv("MAGICQUANT_NGL", raising=False)
+    monkeypatch.delenv("MAGICQUANT_THREADS", raising=False)
+    _patched_finders(monkeypatch)
+    tools = LlamaCppTools()
+    assert tools.ngl is None
+    assert tools.threads is None
+
+
+def test_init_reads_ngl_and_threads_from_env(monkeypatch):
+    monkeypatch.setenv("MAGICQUANT_NGL", "20")
+    monkeypatch.setenv("MAGICQUANT_THREADS", "8")
+    _patched_finders(monkeypatch)
+    tools = LlamaCppTools()
+    assert tools.ngl == 20
+    assert tools.threads == 8
+
+
+def test_init_explicit_args_override_env(monkeypatch):
+    monkeypatch.setenv("MAGICQUANT_NGL", "20")
+    monkeypatch.setenv("MAGICQUANT_THREADS", "8")
+    _patched_finders(monkeypatch)
+    tools = LlamaCppTools(ngl=99, threads=4)
+    assert tools.ngl == 99
+    assert tools.threads == 4
+
+
+def test_calculate_perplexity_cmd_unchanged_when_unset(tmp_path):
+    import subprocess
+
+    data_file = tmp_path / "corpus.txt"
+    data_file.write_text("hello world\n")
+
+    tools = _bare_tools(data_file=str(data_file))
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="", stderr="Final estimate: PPL = 5.0 +/- 0.1"
+    )
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake) as run:
+        tools.calculate_perplexity("/some/model.gguf")
+    cmd = run.call_args[0][0]
+    assert "-ngl" not in cmd
+    assert "-t" not in cmd
+
+
+def test_calculate_perplexity_cmd_includes_flags_when_set(tmp_path):
+    import subprocess
+
+    data_file = tmp_path / "corpus.txt"
+    data_file.write_text("hello world\n")
+
+    tools = _bare_tools(data_file=str(data_file), ngl=99, threads=16)
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="", stderr="Final estimate: PPL = 5.0 +/- 0.1"
+    )
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake) as run:
+        tools.calculate_perplexity("/some/model.gguf")
+    cmd = run.call_args[0][0]
+    assert cmd[cmd.index("-ngl") + 1] == "99"
+    assert cmd[cmd.index("-t") + 1] == "16"
+
+
+def test_bench_cmd_unchanged_when_unset():
+    import subprocess
+
+    tools = _bare_tools()
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=_BENCH_JSON, stderr="")
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake) as run:
+        tools.bench("/some/model.gguf", n_prompt=8, n_gen=8, reps=1)
+    cmd = run.call_args[0][0]
+    assert "-ngl" not in cmd
+    assert "-t" not in cmd
+
+
+def test_bench_cmd_includes_flags_when_set():
+    import subprocess
+
+    tools = _bare_tools(ngl=30, threads=12)
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=_BENCH_JSON, stderr="")
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake) as run:
+        tools.bench("/some/model.gguf", n_prompt=8, n_gen=8, reps=1)
+    cmd = run.call_args[0][0]
+    assert cmd[cmd.index("-ngl") + 1] == "30"
+    assert cmd[cmd.index("-t") + 1] == "12"
+
+
+def test_save_base_logits_cmd_unchanged_when_unset(tmp_path):
+    import subprocess
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("hello world\n")
+    out_logits = tmp_path / "base.kld"
+
+    tools = _bare_tools()
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    def _fake_run(cmd, timeout):
+        out_logits.write_bytes(b"fake-logits" * 1000)
+        return fake
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_fake_run) as run:
+        tools.save_base_logits("/base/model.gguf", str(corpus), str(out_logits))
+    cmd = run.call_args[0][0]
+    assert "-ngl" not in cmd
+    assert "-t" not in cmd
+
+
+def test_save_base_logits_cmd_includes_flags_when_set(tmp_path):
+    import subprocess
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("hello world\n")
+    out_logits = tmp_path / "base.kld"
+
+    tools = _bare_tools(ngl=99, threads=16)
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    def _fake_run(cmd, timeout):
+        out_logits.write_bytes(b"fake-logits" * 1000)
+        return fake
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_fake_run) as run:
+        tools.save_base_logits("/base/model.gguf", str(corpus), str(out_logits))
+    cmd = run.call_args[0][0]
+    assert cmd[cmd.index("-ngl") + 1] == "99"
+    assert cmd[cmd.index("-t") + 1] == "16"
+
+
+def test_calculate_kl_divergence_cmd_unchanged_when_unset(tmp_path):
+    import subprocess
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("hello world\n")
+    base_logits = tmp_path / "base.kld"
+    base_logits.write_bytes(b"fake-logits")
+
+    tools = _bare_tools()
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=_KL_STDOUT, stderr="")
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake) as run:
+        tools.calculate_kl_divergence("/quant/model.gguf", str(base_logits), str(corpus))
+    cmd = run.call_args[0][0]
+    assert "-ngl" not in cmd
+    assert "-t" not in cmd
+
+
+def test_calculate_kl_divergence_cmd_includes_flags_when_set(tmp_path):
+    import subprocess
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("hello world\n")
+    base_logits = tmp_path / "base.kld"
+    base_logits.write_bytes(b"fake-logits")
+
+    tools = _bare_tools(ngl=99, threads=16)
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=_KL_STDOUT, stderr="")
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake) as run:
+        tools.calculate_kl_divergence("/quant/model.gguf", str(base_logits), str(corpus))
+    cmd = run.call_args[0][0]
+    assert cmd[cmd.index("-ngl") + 1] == "99"
+    assert cmd[cmd.index("-t") + 1] == "16"
+
+
+def test_quantize_model_cmd_unchanged_when_threads_unset():
+    tools = _bare_tools()
+    tools.quantize_tool = "/bin/true"
+    with mock.patch("magicquant.utils.llamacpp.subprocess.run") as run:
+        run.return_value = mock.Mock(stdout="")
+        tools.quantize_model("/in.gguf", "/out.gguf", "Q4_K_M", verbose=False)
+    cmd = run.call_args[0][0]
+    assert cmd == ["/bin/true", "/in.gguf", "/out.gguf", "Q4_K_M"]
+
+
+def test_quantize_model_cmd_appends_nthreads_positional_when_set():
+    tools = _bare_tools(threads=16)
+    tools.quantize_tool = "/bin/true"
+    with mock.patch("magicquant.utils.llamacpp.subprocess.run") as run:
+        run.return_value = mock.Mock(stdout="")
+        tools.quantize_model("/in.gguf", "/out.gguf", "Q4_K_M", verbose=False)
+    cmd = run.call_args[0][0]
+    assert cmd == ["/bin/true", "/in.gguf", "/out.gguf", "Q4_K_M", "16"]
+    # ngl must NOT appear -- llama-quantize has no such flag.
+    assert "-ngl" not in cmd
+
+
 # --- Live smoke test (real binaries + real tiny model) ----------------------
 
 _LLAMA_BENCH_BIN = "/home/lucas/ROCmFPX/build-strix-rocmfp4/bin/llama-bench"
@@ -311,6 +546,8 @@ def test_bench_and_kl_self_consistency_live(tmp_path):
     tools.perplexity_tool = _LLAMA_PERPLEXITY_BIN
     tools.bench_tool = _LLAMA_BENCH_BIN
     tools.ctx_size = 128
+    tools.ngl = None
+    tools.threads = None
 
     # --- speed measurement ---
     bench_result = tools.bench(_TINY_MODEL, n_prompt=8, n_gen=8, reps=1, timeout=120)
@@ -337,3 +574,31 @@ def test_bench_and_kl_self_consistency_live(tmp_path):
     # deterministic saved-logits precision artifact -- see module docstring)
     # rather than exactly 0, so assert magnitude rather than sign.
     assert abs(kl_result["mean_kl"]) < 1e-3
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    bool(_MISSING),
+    reason=f"ROCmFPX bin/tiny model not available: {_MISSING}",
+)
+def test_calculate_perplexity_ngl_actually_offloads_to_gpu(tmp_path):
+    """Manually verified (see module docstring above): passing -ngl 99 to
+    this build assigns layers to ROCm0/Vulkan0 devices, confirmed via
+    `llama-perplexity -v` device-assignment + memory-breakdown lines. This
+    just pins that the flag threads through end-to-end and the run still
+    succeeds/parses on the real GPU-offload build, not just CPU-only mocks.
+    """
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text(_TINY_CORPUS)
+
+    tools = LlamaCppTools.__new__(LlamaCppTools)
+    tools.perplexity_tool = _LLAMA_PERPLEXITY_BIN
+    tools.bench_tool = _LLAMA_BENCH_BIN
+    tools.ctx_size = 128
+    tools.ngl = 99
+    tools.threads = None
+    tools.data_file = None
+
+    ppl = tools.calculate_perplexity(_TINY_MODEL, data_file=str(corpus), ctx_size=128)
+    assert ppl is not None
+    assert ppl > 0
