@@ -231,12 +231,27 @@ _HF_TO_GGUF_PATTERNS = [
     # Shared expert(s) (DeepSeek/Qwen MoE): always-on expert(s) that run
     # alongside the routed ones. Each is already a single HF tensor per
     # projection (no per-expert axis), so it maps 1:1 like any other tensor.
+    # DeepSeek/DeepSeek2 use the plural "shared_experts"; Qwen2MoE/Llama4 use
+    # the singular "shared_expert" (confirmed against llama.cpp's
+    # gguf-py/gguf/tensor_mapping.py FFN_{GATE,UP,DOWN}_SHEXP entries).
     (r"^model\.layers\.(\d+)\.mlp\.shared_experts\.gate_proj\.weight$",
      lambda m: f"blk.{m.group(1)}.ffn_gate_shexp.weight"),
     (r"^model\.layers\.(\d+)\.mlp\.shared_experts\.up_proj\.weight$",
      lambda m: f"blk.{m.group(1)}.ffn_up_shexp.weight"),
     (r"^model\.layers\.(\d+)\.mlp\.shared_experts\.down_proj\.weight$",
      lambda m: f"blk.{m.group(1)}.ffn_down_shexp.weight"),
+    (r"^model\.layers\.(\d+)\.mlp\.shared_expert\.gate_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.ffn_gate_shexp.weight"),
+    (r"^model\.layers\.(\d+)\.mlp\.shared_expert\.up_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.ffn_up_shexp.weight"),
+    (r"^model\.layers\.(\d+)\.mlp\.shared_expert\.down_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.ffn_down_shexp.weight"),
+    # Qwen2MoE's shared-expert gate: a [1, hidden] linear producing the
+    # per-token sigmoid weight that blends the shared expert's output in.
+    # GGUF stores it as a 1-D {n_embd} tensor (llama-model.cpp QWEN2MOE
+    # loader requires it unconditionally, no TENSOR_NOT_REQUIRED).
+    (r"^model\.layers\.(\d+)\.mlp\.shared_expert_gate\.weight$",
+     lambda m: f"blk.{m.group(1)}.ffn_gate_inp_shexp.weight"),
     # Granite MoE Hybrid: fused expert tensors + shared MLP + Mamba
     (r"^model\.layers\.(\d+)\.block_sparse_moe\.input_linear\.weight$",
      lambda m: f"blk.{m.group(1)}.ffn_gate_up_exps.weight"),
@@ -555,6 +570,29 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
         rope_theta = rope_params.get("rope_theta")
         if rope_theta is not None:
             meta[f"{arch}.rope.freq_base"] = float(rope_theta)
+
+    # ── MoE metadata (qwen2moe/qwen3moe/mixtral/etc.) ──
+    # llama.cpp reads expert_count/expert_used_count generically for every
+    # arch (llama-model.cpp load_hparams, optional=true) but ASSERTS on
+    # n_expert_used>0 whenever n_expert>0, and sizes the ffn_*_exps tensor
+    # creation off hparams.n_expert -- without these keys a from-safetensors
+    # MoE pack has real 3-D expert tensors on disk but hparams.n_expert==0,
+    # so llama.cpp either mis-sizes or refuses the tensors as "not found".
+    # HF field names per llama.cpp convert_hf_to_gguf.py's base TextModel
+    # (num_local_experts/num_experts, num_experts_per_tok/num_experts_per_token)
+    # and Qwen2MoeModel (moe_intermediate_size, shared_expert_intermediate_size).
+    n_experts = effective.get("num_local_experts", effective.get("num_experts"))
+    if n_experts is not None:
+        meta[f"{arch}.expert_count"] = int(n_experts)
+    n_experts_used = effective.get("num_experts_per_tok", effective.get("num_experts_per_token"))
+    if n_experts_used is not None:
+        meta[f"{arch}.expert_used_count"] = int(n_experts_used)
+    moe_ffn_len = effective.get("moe_intermediate_size")
+    if moe_ffn_len is not None:
+        meta[f"{arch}.expert_feed_forward_length"] = int(moe_ffn_len)
+    shared_ffn_len = effective.get("shared_expert_intermediate_size")
+    if shared_ffn_len is not None:
+        meta[f"{arch}.expert_shared_feed_forward_length"] = int(shared_ffn_len)
 
     # ── Architecture-specific metadata ──
     # Qwen3.5 requires several additional keys that llama.cpp checks for:
