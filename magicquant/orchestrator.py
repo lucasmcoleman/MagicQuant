@@ -500,6 +500,23 @@ class MagicQuantOrchestrator:
                     mean_abs_residual=round(avg_residual, 4),
                 )
 
+        # A measured search whose every candidate build/measure failed must
+        # not report success: self._measured stays empty, _select_final_
+        # survivors would return {}, and _save_results would still write a
+        # valid-looking search_results.json with zero measurements -- an
+        # overnight run that silently accomplished nothing. Fail loudly
+        # instead of falling through to Step 5.
+        if measurement_rounds > 0 and not self._measured:
+            raise RuntimeError(
+                "Measured search completed all "
+                f"{measurement_rounds} round(s) but produced zero successful "
+                "measurements (every candidate build or perplexity "
+                "measurement failed). Refusing to write search_results.json "
+                "as if this were a normal partial run -- check the "
+                "llama.cpp build, disk space, and per-candidate build errors "
+                "logged above."
+            )
+
         # ── Step 5: Select final survivors per tier ──
         tiered = self._select_final_survivors(baseline_size_gb)
 

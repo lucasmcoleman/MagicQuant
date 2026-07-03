@@ -34,6 +34,13 @@ from magicquant.quant.converters import (
 )
 from magicquant.quant.schemes import get_all_schemes
 
+# ggml_type_name -> bits_per_weight, derived from the scheme registry so the
+# block-32 fallback's low/high-bit split (see _block32_fallback) can never
+# drift from the registry the way the old hand-maintained tuple did.
+_GGML_NAME_TO_BPW: Dict[str, float] = {
+    s.ggml_type_name: s.bits_per_weight for s in get_all_schemes()
+}
+
 
 # ggml_type enum values used in GGUF tensor info
 GGML_TYPE = {
@@ -241,10 +248,19 @@ def _block32_fallback(target_ggml_name: str, row_size: int, group: str) -> str:
     needed — SSM/linear-attention conv operands (group ``S``, which llama.cpp
     requires in F32) — or when the row isn't even 32-divisible (no block-32
     scheme fits either).
+
+    "Low-bit" is derived from the registry's ``bits_per_weight`` rather than a
+    hand-maintained name tuple, so a target ends up on the correct side by its
+    actual size class instead of by whether someone remembered to list it here
+    (the previous hard-coded tuple never grew to cover the IQ2/IQ3/IQ4 family,
+    misrouting them to the much larger Q8_0 fallback). The 4.5 bpw threshold
+    keeps the original 5 members (Q2_K, Q3_K, Q4_K, IQ4_NL, MXFP4, all <= 4.5
+    bpw) on the low-bit side, above Q5_K (5.5 bpw) and everything higher.
     """
     if group == "S" or row_size % 32 != 0:
         return "F32"
-    low_bit = target_ggml_name in ("Q2_K", "Q3_K", "Q4_K", "IQ4_NL", "MXFP4")
+    bpw = _GGML_NAME_TO_BPW.get(target_ggml_name)
+    low_bit = bpw is not None and bpw <= 4.5
     return "MXFP4" if low_bit else "Q8_0"
 
 

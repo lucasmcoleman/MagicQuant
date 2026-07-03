@@ -63,7 +63,14 @@ def calibrated_noise_factor(scheme_name: str) -> Optional[float]:
     it, or the recorded value isn't a finite number.
     """
     data = _load()
-    entry = data.get(scheme_name)
+    # The calibration tool writes a nested `{"schemes": {name: {...}}}`
+    # envelope alongside run metadata (model/corpus/date/baseline_ppl); a
+    # bare `{name: {...}}` dict is also accepted so hand-written fixtures
+    # keep working.
+    schemes = data.get("schemes", data)
+    if not isinstance(schemes, dict):
+        return None
+    entry = schemes.get(scheme_name)
     if not isinstance(entry, dict):
         return None
 
