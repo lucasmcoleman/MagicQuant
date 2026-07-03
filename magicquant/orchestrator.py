@@ -12,7 +12,7 @@ The core loop:
 
 import json
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from collections import defaultdict
 
@@ -80,6 +80,27 @@ class MagicQuantOrchestrator:
         # search_results.json so a run can be reproduced / A-B compared.
         self._search_seed: Optional[int] = None
 
+        # Importance matrix cache: {gguf_tensor_name: importance_vector} once
+        # resolved via enable_imatrix(), or None (unweighted quantization,
+        # the historical default). Applied to EVERY create_hybrid_gguf call
+        # this orchestrator makes from here on -- candidate builds during a
+        # measured search AND final tier generation, regardless of which
+        # search path produced the config. Never blocks the pipeline: a
+        # capture failure just leaves this None.
+        self._imatrix: Optional[Dict[str, Any]] = None
+        # Path to base-model logits saved via llama-perplexity
+        # --kl-divergence-base, when enable_kl=True in run_measured_search.
+        # None means KL-divergence scoring is inactive.
+        self._kl_base_logits_path: Optional[str] = None
+        # Corpus the base logits above were captured over -- every candidate's
+        # KL calculation during the measured-search loop must reuse this
+        # exact corpus to be comparable.
+        self._kl_corpus_path: Optional[str] = None
+        # Weight applied to |mean_kl| when blending KL into final-survivor
+        # selection (see _select_final_survivors). Only has any effect when
+        # a candidate actually has a "kl" measurement recorded.
+        self._kl_weight: float = 0.0
+
     def _apply_seed(self, seed: Optional[int]) -> None:
         """Seed the RNGs once for a reproducible search.
 
@@ -100,6 +121,40 @@ class MagicQuantOrchestrator:
             _np.random.seed(seed & 0xFFFFFFFF)
         except Exception:
             pass
+
+    def enable_imatrix(self, corpus_path: Optional[str] = None, **kwargs) -> bool:
+        """Capture (or load a cached) importance matrix for the source model
+        and cache it on ``self._imatrix`` for every subsequent
+        ``create_hybrid_gguf`` call this orchestrator makes -- candidate
+        builds during ``run_measured_search`` AND final tier generation via
+        ``generate_hybrid_model``/``generate_tiered_models`` -- regardless of
+        which search path (measured or prediction-only) produced the config.
+
+        Requires ``self.source_model_path`` to be a GGUF (imatrix capture
+        only reads GGUF); a safetensors source returns False and leaves
+        quantization unweighted, same as never calling this at all.
+
+        Returns True if an imatrix is now active, False otherwise (source
+        isn't GGUF, or capture/load failed -- logged as a warning, never
+        raised: this must never block the pipeline).
+        """
+        from magicquant.imatrix import ensure_imatrix
+
+        self._imatrix = ensure_imatrix(
+            self.source_model_path, corpus_path=corpus_path, **kwargs
+        )
+        if self._imatrix is None:
+            log.warning(
+                "imatrix not active (source isn't GGUF, or capture failed) "
+                "-- quantizing unweighted",
+                stage="imatrix", source=self.source_model_path,
+            )
+        else:
+            log.info(
+                "imatrix active", stage="imatrix",
+                n_tensors=len(self._imatrix),
+            )
+        return self._imatrix is not None
 
     @property
     def llama_tools(self) -> Optional[LlamaCppTools]:
@@ -128,6 +183,11 @@ class MagicQuantOrchestrator:
         enable_rocmfpx: bool = False,
         enable_iq: bool = False,
         seed: Optional[int] = None,
+        use_imatrix: bool = False,
+        imatrix_corpus: Optional[str] = None,
+        enable_kl: bool = False,
+        kl_weight: float = 0.1,
+        enable_speed_bench: bool = False,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run the full Predict -> Measure -> Learn loop.
@@ -140,12 +200,30 @@ class MagicQuantOrchestrator:
             candidates_per_round: How many configs to actually build and
                 measure per round (tier winners + epsilon-greedy picks)
             verbose: Print progress
+            use_imatrix: capture/reuse an importance matrix and weight every
+                candidate build + final tier generation with it (see
+                ``enable_imatrix``). Off by default (unweighted, historical
+                behavior).
+            imatrix_corpus: calibration corpus for imatrix capture; None uses
+                the bundled default (magicquant/data/calib_corpus.txt).
+            enable_kl: also measure real KL-divergence-to-base for each
+                candidate (via llama-perplexity's built-in --kl-divergence)
+                and blend it into final-survivor selection. Off by default.
+            kl_weight: weight applied to |mean_kl| when blending into
+                selection (see _select_final_survivors); only meaningful
+                when enable_kl=True.
+            enable_speed_bench: also measure real tokens/sec per candidate
+                via llama-bench (informational; recorded in search_results
+                .json, not fed into per-generation prediction scoring --
+                bench-ing the full population every generation isn't
+                tractable, only the small measured set is). Off by default.
 
         Returns:
             (all_configs, tiered_best) where tiered_best maps tier names
             to the best *measured* config for that tier.
         """
         self._apply_seed(seed)
+        self._kl_weight = kl_weight if enable_kl else 0.0
         if verbose:
             log.info(
                 "MagicQuant Measured Hybrid Search",
@@ -184,6 +262,40 @@ class MagicQuantOrchestrator:
                 "(run_full_search) if no llama.cpp is available."
             )
         self.baseline_provenance = "measured"
+
+        # ── Step 1b: optional imatrix + KL base logits ──
+        # Both are best-effort: a failure here degrades to the historical
+        # behavior (unweighted quant / no KL score) rather than aborting a
+        # real measured search over a secondary quality signal.
+        if use_imatrix:
+            self.enable_imatrix(imatrix_corpus)
+
+        if enable_kl:
+            # Reuse the SAME corpus already configured for baseline-PPL
+            # measurement (not imatrix_corpus, a separate calibration-corpus
+            # concept) -- KL only means something when base and candidate are
+            # compared over identical text.
+            corpus = self.llama_tools._resolve_data_file(None)
+            if corpus is None:
+                log.warning(
+                    "enable_kl requested but no calibration corpus resolved "
+                    "-- skipping KL-divergence scoring", stage="kl",
+                )
+            else:
+                base_logits_path = str(self.output_dir / "_kl_base_logits.kld")
+                saved = self.llama_tools.save_base_logits(
+                    self.source_model_path, corpus, base_logits_path,
+                    ctx_size=self.llama_tools.ctx_size,
+                )
+                if saved:
+                    self._kl_base_logits_path = base_logits_path
+                    self._kl_corpus_path = corpus
+                    log.info("KL base logits saved", stage="kl", path=base_logits_path)
+                else:
+                    log.warning(
+                        "Could not save base logits -- disabling KL-divergence "
+                        "scoring for this run", stage="kl",
+                    )
 
         # ── Step 2: Sensitivity probing ──
         if verbose:
@@ -326,6 +438,17 @@ class MagicQuantOrchestrator:
                         "size_gb": candidate_path.stat().st_size / (1024 ** 3),
                     }
 
+                    # Optional secondary signals -- both best-effort (None on
+                    # failure), scored in _select_final_survivors alongside
+                    # measured_loss rather than gating the candidate at all.
+                    if enable_kl and self._kl_base_logits_path:
+                        self._measured[config_key]["kl"] = self.llama_tools.calculate_kl_divergence(
+                            path, self._kl_base_logits_path, self._kl_corpus_path,
+                            ctx_size=self.llama_tools.ctx_size,
+                        )
+                    if enable_speed_bench:
+                        self._measured[config_key]["bench"] = self.llama_tools.bench(path)
+
                     # Active learning: feed residual back
                     self.predictor.record_residual(config, residual)
 
@@ -427,10 +550,24 @@ class MagicQuantOrchestrator:
                 quant_config={"base": base_quant, "groups": config},
                 verbose=False,
                 adapter_path=self.adapter_path,
+                imatrix=self._imatrix,
             )
         except Exception as exc:
             log.error("Build failed", stage="build", error=str(exc), exc_info=exc)
             return None
+
+    def _selection_score(self, info: Dict) -> float:
+        """Ranking key for tier-winner selection: measured_loss, optionally
+        blended with |mean_kl| when a "kl" measurement is present (only true
+        when ``enable_kl=True`` was passed to ``run_measured_search`` AND
+        base-logits capture succeeded for this run). ``self._kl_weight`` is
+        0.0 whenever KL scoring is inactive, so this is a no-op in that case.
+        """
+        score = info["measured_loss"]
+        kl = info.get("kl")
+        if kl and kl.get("mean_kl") is not None:
+            score += self._kl_weight * abs(kl["mean_kl"])
+        return score
 
     def _select_final_survivors(self, baseline_gb: float) -> Dict[str, Dict]:
         """From all measured configs, pick the best per tier."""
@@ -442,8 +579,8 @@ class MagicQuantOrchestrator:
         result = {}
         for tier in ["Q8", "Q6", "Q5", "Q4", "Q3", "Q2"]:
             if tier in by_tier:
-                # Best = lowest measured loss within the tier
-                best = min(by_tier[tier], key=lambda x: x["measured_loss"])
+                # Best = lowest measured_loss, optionally KL-blended
+                best = min(by_tier[tier], key=self._selection_score)
                 result[tier] = best
         return result
 
@@ -469,6 +606,8 @@ class MagicQuantOrchestrator:
                     "predicted_loss": v.get("predicted_loss"),
                     "residual": v.get("residual"),
                     "size_gb": v.get("size_gb"),
+                    "kl": v.get("kl"),
+                    "bench": v.get("bench"),
                 }
                 for k, v in self._measured.items()
             },
@@ -510,12 +649,22 @@ class MagicQuantOrchestrator:
         enable_rocmfpx: bool = False,
         enable_iq: bool = False,
         seed: Optional[int] = None,
+        use_imatrix: bool = False,
+        imatrix_corpus: Optional[str] = None,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run prediction-only evolutionary search (no real measurements).
         Use run_measured_search() for the full Predict->Measure->Learn loop.
+
+        use_imatrix/imatrix_corpus: prediction-only search never builds
+        candidate GGUFs, so this has no effect on the search itself -- it
+        only makes generate_hybrid_model/generate_tiered_models (called
+        afterward with this same orchestrator) quantize with an importance
+        matrix instead of unweighted. Off by default; safe for the fixture.
         """
         self._apply_seed(seed)
+        if use_imatrix:
+            self.enable_imatrix(imatrix_corpus)
         if verbose:
             log.info(
                 "MagicQuant Prediction-Only Search",
@@ -648,6 +797,7 @@ class MagicQuantOrchestrator:
                 quant_config={"base": base_quant, "groups": config},
                 verbose=True,
                 adapter_path=self.adapter_path,
+                imatrix=self._imatrix,
             )
             if not Path(result).is_file():
                 return None
