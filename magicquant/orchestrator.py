@@ -441,13 +441,29 @@ class MagicQuantOrchestrator:
                     # Optional secondary signals -- both best-effort (None on
                     # failure), scored in _select_final_survivors alongside
                     # measured_loss rather than gating the candidate at all.
+                    # calculate_kl_divergence/bench only catch
+                    # CalledProcessError/TimeoutExpired internally; a missing
+                    # or wrong-arch binary raises OSError/FileNotFoundError,
+                    # which must not abort the rest of the search.
                     if enable_kl and self._kl_base_logits_path:
-                        self._measured[config_key]["kl"] = self.llama_tools.calculate_kl_divergence(
-                            path, self._kl_base_logits_path, self._kl_corpus_path,
-                            ctx_size=self.llama_tools.ctx_size,
-                        )
+                        try:
+                            self._measured[config_key]["kl"] = self.llama_tools.calculate_kl_divergence(
+                                path, self._kl_base_logits_path, self._kl_corpus_path,
+                                ctx_size=self.llama_tools.ctx_size,
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                "KL-divergence measurement failed for candidate; "
+                                "continuing without it", stage="kl", error=str(exc),
+                            )
                     if enable_speed_bench:
-                        self._measured[config_key]["bench"] = self.llama_tools.bench(path)
+                        try:
+                            self._measured[config_key]["bench"] = self.llama_tools.bench(path)
+                        except Exception as exc:
+                            log.warning(
+                                "Speed bench failed for candidate; continuing "
+                                "without it", stage="bench", error=str(exc),
+                            )
 
                     # Active learning: feed residual back
                     self.predictor.record_residual(config, residual)
@@ -579,8 +595,28 @@ class MagicQuantOrchestrator:
         result = {}
         for tier in ["Q8", "Q6", "Q5", "Q4", "Q3", "Q2"]:
             if tier in by_tier:
-                # Best = lowest measured_loss, optionally KL-blended
-                best = min(by_tier[tier], key=self._selection_score)
+                candidates = by_tier[tier]
+                # A candidate whose KL measurement failed (calculate_kl_
+                # divergence raised or returned None) must never look BETTER
+                # than the worst candidate that actually measured KL in this
+                # tier -- otherwise a measurement failure gets rewarded over
+                # real (if poor) data. Only kicks in when at least one
+                # sibling in the tier has KL data; falls back to plain
+                # _selection_score (no-op when kl_weight is 0) otherwise.
+                kl_vals = [
+                    abs(c["kl"]["mean_kl"]) for c in candidates
+                    if c.get("kl") and c["kl"].get("mean_kl") is not None
+                ]
+                worst_kl = max(kl_vals) if kl_vals else None
+
+                def _score(info, worst_kl=worst_kl):
+                    score = self._selection_score(info)
+                    has_kl = info.get("kl") and info["kl"].get("mean_kl") is not None
+                    if worst_kl is not None and not has_kl:
+                        score += self._kl_weight * worst_kl
+                    return score
+
+                best = min(candidates, key=_score)
                 result[tier] = best
         return result
 

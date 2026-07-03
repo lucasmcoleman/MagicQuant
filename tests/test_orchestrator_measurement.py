@@ -196,6 +196,70 @@ def test_select_final_survivors_kl_blend_changes_tier_winner():
     assert result[tier]["config"] == {"E": "Q4_K"}
 
 
+def test_select_final_survivors_failed_kl_cannot_beat_worst_real_kl():
+    # A candidate whose KL measurement failed ("kl" missing/None) must never
+    # look better than the worst candidate that actually measured KL in the
+    # same tier -- otherwise a measurement failure is rewarded over real
+    # (if poor) data.
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch._kl_weight = 1.0
+    orch._measured = {
+        "failed": {
+            "config": {"E": "FAILED"}, "measured_loss": 0.05, "size_gb": 4.0,
+        },
+        "good": {
+            "config": {"E": "GOOD"}, "measured_loss": 0.05, "size_gb": 4.0,
+            "kl": {"mean_kl": 0.01},
+        },
+        "bad": {
+            "config": {"E": "BAD"}, "measured_loss": 0.05, "size_gb": 4.0,
+            "kl": {"mean_kl": 0.5},
+        },
+    }
+    result = orch._select_final_survivors(baseline_gb=8.0)
+    tier = orch._classify_tier(4.0, 8.0)
+    assert result[tier]["config"] == {"E": "GOOD"}
+
+
+def test_select_final_survivors_no_kl_data_falls_back_to_measured_loss():
+    # When nothing in the tier has KL data (enable_kl=False, the default),
+    # selection must be unaffected -- exactly the pre-KL behavior.
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch._kl_weight = 0.0
+    orch._measured = {
+        "a": {"config": {"E": "WORSE"}, "measured_loss": 0.20, "size_gb": 4.0},
+        "b": {"config": {"E": "BETTER"}, "measured_loss": 0.05, "size_gb": 4.0},
+    }
+    result = orch._select_final_survivors(baseline_gb=8.0)
+    tier = orch._classify_tier(4.0, 8.0)
+    assert result[tier]["config"] == {"E": "BETTER"}
+
+
+def test_measured_search_survives_kl_and_bench_raising_oserror(tmp_path, monkeypatch):
+    # A missing/wrong-arch binary raises OSError/FileNotFoundError from
+    # subprocess.run, which calculate_kl_divergence/bench don't catch
+    # internally -- the orchestrator's measured-search loop must swallow it
+    # per-candidate rather than aborting the whole search.
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+
+    def raise_oserror(*a, **k):
+        raise FileNotFoundError("llama-bench: exec format error")
+
+    monkeypatch.setattr(fake_tools, "calculate_kl_divergence", raise_oserror)
+    monkeypatch.setattr(fake_tools, "bench", raise_oserror)
+
+    all_configs, tiered = orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        enable_kl=True, enable_speed_bench=True,
+    )
+
+    assert orch._measured, "search must still produce measured candidates"
+    for info in orch._measured.values():
+        assert "kl" not in info
+        assert "bench" not in info
+
+
 def test_save_results_persists_kl_and_bench_fields(tmp_path):
     orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
     orch.output_dir = tmp_path
