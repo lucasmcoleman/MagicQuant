@@ -31,6 +31,22 @@ def test_high_bit_target_falls_back_to_q8_0():
     assert _block32_fallback("Q5_K", row_size=128, group="Q") == "Q8_0"
 
 
+def test_sub_4bit_iq_targets_fall_back_to_mxfp4_not_q8_0():
+    # M1 regression: IQ2/IQ3 (2.06-3.44 bpw) are sub-4-bit, robust-tier
+    # schemes -- they must land on the MXFP4 (4.25 bpw) side of the
+    # fallback, not silently balloon to Q8_0 (8.5 bpw, a ~2x size blow-up).
+    assert _block32_fallback("IQ2_XXS", row_size=128, group="X") == "MXFP4"
+    assert _block32_fallback("IQ3_S", row_size=128, group="D") == "MXFP4"
+
+
+def test_iq4_family_falls_back_to_mxfp4():
+    # IQ4_XS/IQ4_NL (4.25/4.5 bpw) sit right at the low-bit/high-bit
+    # boundary the old hand-maintained tuple only partially covered
+    # (IQ4_NL was listed, IQ4_XS was not).
+    assert _block32_fallback("IQ4_XS", row_size=128, group="U") == "MXFP4"
+    assert _block32_fallback("IQ4_NL", row_size=128, group="U") == "MXFP4"
+
+
 def test_ssm_group_stays_f32():
     # SSM conv1d operands must be F32 (llama.cpp asserts).
     assert _block32_fallback("Q4_K", row_size=128, group="S") == "F32"
