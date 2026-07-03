@@ -23,6 +23,17 @@ _BENCH_TIMEOUT = 300       # 5 minutes for llama-bench pp/tg speed measurement
 _MIN_LOGITS_FILE_BYTES = 4096
 
 
+def _env_int(name: str) -> Optional[int]:
+    """Parse an optional int env var; unset/empty/invalid -> None (flag omitted)."""
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 class LlamaCppTools:
     """Interface to llama.cpp quantization tools."""
 
@@ -31,6 +42,8 @@ class LlamaCppTools:
         llamacpp_path: Optional[str] = None,
         data_file: Optional[str] = None,
         ctx_size: int = 512,
+        ngl: Optional[int] = None,
+        threads: Optional[int] = None,
     ):
         """
         Initialize llama.cpp tools wrapper.
@@ -42,6 +55,14 @@ class LlamaCppTools:
                 will look in common locations relative to the llama.cpp dir.
             ctx_size: Context size for perplexity evaluation (default 512
                 for fast evaluation; increase for more accurate results).
+            ngl: Number of layers to offload to GPU (``-ngl``) for the
+                perplexity/bench subprocess calls. *None* (default) omits
+                the flag entirely, matching historical CPU-only behavior.
+                Falls back to the ``MAGICQUANT_NGL`` env var when not given.
+            threads: CPU thread count (``-t`` for perplexity/bench,
+                trailing positional ``nthreads`` for quantize). *None*
+                (default) omits it, matching historical behavior. Falls
+                back to the ``MAGICQUANT_THREADS`` env var when not given.
         """
         self.llamacpp_path = llamacpp_path or self._find_llamacpp()
         self.quantize_tool = self._find_quantize_tool()
@@ -49,6 +70,26 @@ class LlamaCppTools:
         self.bench_tool = _find_bench_tool(self.perplexity_tool)
         self.data_file = data_file
         self.ctx_size = ctx_size
+        self.ngl = ngl if ngl is not None else _env_int("MAGICQUANT_NGL")
+        self.threads = threads if threads is not None else _env_int("MAGICQUANT_THREADS")
+
+    def _gpu_flags(self) -> List[str]:
+        """``-ngl``/``-t`` flags for perplexity/bench, omitted when unset.
+
+        Reads via getattr (not self.ngl/self.threads directly) so callers
+        that construct a bare instance with ``LlamaCppTools.__new__`` and
+        set only the attributes they care about (a pattern several existing
+        tests use) keep the pre-this-feature omitted-flag behavior instead
+        of hitting an AttributeError.
+        """
+        flags: List[str] = []
+        ngl = getattr(self, "ngl", None)
+        threads = getattr(self, "threads", None)
+        if ngl is not None:
+            flags += ["-ngl", str(ngl)]
+        if threads is not None:
+            flags += ["-t", str(threads)]
+        return flags
 
     def _find_llamacpp(self) -> str:
         """Auto-detect llama.cpp installation."""
@@ -185,6 +226,11 @@ class LlamaCppTools:
             output_path,
             quant_type,
         ]
+        # llama-quantize has no -ngl (quantization doesn't run inference);
+        # nthreads is a trailing positional, not a flag.
+        threads = getattr(self, "threads", None)
+        if threads is not None:
+            cmd.append(str(threads))
 
         if verbose:
             print(f"Running: {' '.join(cmd)}")
@@ -266,7 +312,7 @@ class LlamaCppTools:
             "--ctx-size", str(effective_ctx),
             "--batch-size", "512",
             "--ubatch-size", "128",
-        ]
+        ] + self._gpu_flags()
 
         if verbose:
             print(f"Calculating perplexity for {Path(model_path).name}...")
@@ -335,7 +381,7 @@ class LlamaCppTools:
             "-n", str(n_gen),
             "-r", str(reps),
             "-o", "json",
-        ]
+        ] + self._gpu_flags()
 
         try:
             result = self._run_perplexity_subprocess(cmd, timeout=timeout)
@@ -387,7 +433,7 @@ class LlamaCppTools:
             "--kl-divergence-base", out_logits_path,
             "--ctx-size", str(ctx_size),
             "--chunks", str(chunks),
-        ]
+        ] + self._gpu_flags()
 
         try:
             self._run_perplexity_subprocess(cmd, timeout=timeout)
@@ -453,7 +499,7 @@ class LlamaCppTools:
             "--kl-divergence-base", base_logits_path,
             "--ctx-size", str(ctx_size),
             "--chunks", str(chunks),
-        ]
+        ] + self._gpu_flags()
 
         try:
             result = self._run_perplexity_subprocess(cmd, timeout=timeout)
