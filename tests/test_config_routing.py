@@ -17,7 +17,10 @@ def _args(**kw):
     base = dict(
         model="model.gguf", output_dir=None, llamacpp_path=None, adapter=None,
         target_quant=None, generations=None, population=None, rounds=None,
-        candidates=None,
+        candidates=None, patience=None,
+        use_imatrix=None, imatrix_corpus=None, enable_kl=None, kl_weight=None,
+        enable_speed_bench=None, enable_rocmfpx=None, enable_iq=None,
+        seed=None,
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -47,6 +50,154 @@ def test_unified_default_is_30_80(monkeypatch):
 def test_model_path_threaded(monkeypatch):
     settings = _settings_from_args(_args(model="/tmp/foo.gguf"))
     assert settings.source_model_path == "/tmp/foo.gguf"
+
+
+# ── orchestrator knobs (use_imatrix, enable_kl, enable_rocmfpx, ...) ────────
+
+
+def test_orchestrator_knobs_default_off(monkeypatch):
+    for var in (
+        "MAGICQUANT_USE_IMATRIX", "MAGICQUANT_IMATRIX_CORPUS",
+        "MAGICQUANT_ENABLE_KL", "MAGICQUANT_KL_WEIGHT",
+        "MAGICQUANT_ENABLE_SPEED_BENCH", "MAGICQUANT_ENABLE_ROCMFPX",
+        "MAGICQUANT_ENABLE_IQ", "MAGICQUANT_SEED",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    settings = _settings_from_args(_args())
+    assert settings.use_imatrix is False
+    assert settings.imatrix_corpus is None
+    assert settings.enable_kl is False
+    assert settings.kl_weight == 0.1
+    assert settings.enable_speed_bench is False
+    assert settings.enable_rocmfpx is False
+    assert settings.enable_iq is False
+    assert settings.seed is None
+
+
+def test_orchestrator_knobs_env_honored(monkeypatch):
+    monkeypatch.setenv("MAGICQUANT_USE_IMATRIX", "true")
+    monkeypatch.setenv("MAGICQUANT_IMATRIX_CORPUS", "/tmp/corpus.txt")
+    monkeypatch.setenv("MAGICQUANT_ENABLE_KL", "true")
+    monkeypatch.setenv("MAGICQUANT_KL_WEIGHT", "0.5")
+    monkeypatch.setenv("MAGICQUANT_ENABLE_SPEED_BENCH", "true")
+    monkeypatch.setenv("MAGICQUANT_ENABLE_ROCMFPX", "true")
+    monkeypatch.setenv("MAGICQUANT_ENABLE_IQ", "true")
+    monkeypatch.setenv("MAGICQUANT_SEED", "42")
+
+    settings = _settings_from_args(_args())
+
+    assert settings.use_imatrix is True
+    assert settings.imatrix_corpus == "/tmp/corpus.txt"
+    assert settings.enable_kl is True
+    assert settings.kl_weight == 0.5
+    assert settings.enable_speed_bench is True
+    assert settings.enable_rocmfpx is True
+    assert settings.enable_iq is True
+    assert settings.seed == 42
+
+
+def test_orchestrator_knobs_cli_overrides_env(monkeypatch):
+    monkeypatch.setenv("MAGICQUANT_USE_IMATRIX", "true")
+    monkeypatch.setenv("MAGICQUANT_KL_WEIGHT", "0.5")
+    monkeypatch.setenv("MAGICQUANT_SEED", "42")
+
+    settings = _settings_from_args(
+        _args(use_imatrix=False, kl_weight=0.9, seed=7)
+    )
+
+    assert settings.use_imatrix is False
+    assert settings.kl_weight == 0.9
+    assert settings.seed == 7
+
+
+# ── cmd_search forwarding to the orchestrator ───────────────────────────────
+
+
+class _FakeSearchOrchestrator:
+    """Captures the kwargs cmd_search forwards to run_measured_search /
+    run_full_search without running any real search."""
+
+    last = None
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.measured_calls = []
+        self.full_calls = []
+        type(self).last = self
+
+    def run_measured_search(self, **kwargs):
+        self.measured_calls.append(kwargs)
+        return [], {}
+
+    def run_full_search(self, **kwargs):
+        self.full_calls.append(kwargs)
+        return [], {}
+
+
+def _search_args(**kw):
+    base = dict(
+        model="/tmp/base.gguf", output_dir=None, llamacpp_path=None,
+        adapter=None, target_quant=None, generations=None, population=None,
+        rounds=None, candidates=None, patience=None,
+        use_imatrix=None, imatrix_corpus=None, enable_kl=None,
+        kl_weight=None, enable_speed_bench=None, enable_rocmfpx=None,
+        enable_iq=None, seed=None,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def test_cmd_search_forwards_knobs_to_run_measured_search(monkeypatch):
+    monkeypatch.setattr(
+        "magicquant.orchestrator.MagicQuantOrchestrator", _FakeSearchOrchestrator
+    )
+
+    cli.cmd_search(_search_args(
+        rounds=1,
+        use_imatrix=True, imatrix_corpus="/tmp/corpus.txt",
+        enable_kl=True, kl_weight=0.7, enable_speed_bench=True,
+        enable_rocmfpx=True, enable_iq=True, seed=42,
+    ))
+
+    orch = _FakeSearchOrchestrator.last
+    assert orch is not None
+    assert len(orch.measured_calls) == 1
+    call = orch.measured_calls[0]
+    assert call["use_imatrix"] is True
+    assert call["imatrix_corpus"] == "/tmp/corpus.txt"
+    assert call["enable_kl"] is True
+    assert call["kl_weight"] == 0.7
+    assert call["enable_speed_bench"] is True
+    assert call["enable_rocmfpx"] is True
+    assert call["enable_iq"] is True
+    assert call["seed"] == 42
+
+
+def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
+    monkeypatch.setattr(
+        "magicquant.orchestrator.MagicQuantOrchestrator", _FakeSearchOrchestrator
+    )
+
+    cli.cmd_search(_search_args(
+        rounds=0,
+        use_imatrix=True, imatrix_corpus="/tmp/corpus.txt",
+        enable_kl=True, kl_weight=0.7, enable_speed_bench=True,
+        enable_rocmfpx=True, enable_iq=True, seed=42,
+    ))
+
+    orch = _FakeSearchOrchestrator.last
+    assert orch is not None
+    assert len(orch.full_calls) == 1
+    call = orch.full_calls[0]
+    assert call["use_imatrix"] is True
+    assert call["imatrix_corpus"] == "/tmp/corpus.txt"
+    assert call["enable_rocmfpx"] is True
+    assert call["enable_iq"] is True
+    assert call["seed"] == 42
+    # run_full_search has no KL / speed-bench params -- must not be forwarded.
+    assert "enable_kl" not in call
+    assert "kl_weight" not in call
+    assert "enable_speed_bench" not in call
 
 
 # ── cmd_generate routing (M5 finish) ────────────────────────────────────────

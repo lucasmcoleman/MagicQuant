@@ -153,6 +153,14 @@ def _settings_from_args(args: argparse.Namespace):
     _maybe("measurement_rounds", "rounds")
     _maybe("candidates_per_round", "candidates")
     _maybe("patience", "patience")
+    _maybe("use_imatrix", "use_imatrix")
+    _maybe("imatrix_corpus", "imatrix_corpus")
+    _maybe("enable_kl", "enable_kl")
+    _maybe("kl_weight", "kl_weight")
+    _maybe("enable_speed_bench", "enable_speed_bench")
+    _maybe("enable_rocmfpx", "enable_rocmfpx")
+    _maybe("enable_iq", "enable_iq")
+    _maybe("seed", "seed")
 
     # MagicQuantSettings() reads env/.env first; explicit kwargs (CLI) win.
     return MagicQuantSettings(**overrides)
@@ -183,6 +191,14 @@ def cmd_search(args: argparse.Namespace) -> None:
             candidates_per_round=settings.candidates_per_round,
             verbose=settings.verbose,
             patience=settings.patience,
+            use_imatrix=settings.use_imatrix,
+            imatrix_corpus=settings.imatrix_corpus,
+            enable_kl=settings.enable_kl,
+            kl_weight=settings.kl_weight,
+            enable_speed_bench=settings.enable_speed_bench,
+            enable_rocmfpx=settings.enable_rocmfpx,
+            enable_iq=settings.enable_iq,
+            seed=settings.seed,
         )
     else:
         # Prediction-only search (fast, no llama.cpp required)
@@ -192,6 +208,11 @@ def cmd_search(args: argparse.Namespace) -> None:
             population_size=settings.population_size,
             verbose=settings.verbose,
             patience=settings.patience,
+            use_imatrix=settings.use_imatrix,
+            imatrix_corpus=settings.imatrix_corpus,
+            enable_rocmfpx=settings.enable_rocmfpx,
+            enable_iq=settings.enable_iq,
+            seed=settings.seed,
         )
 
     results_path = Path(settings.output_dir) / "search_results.json"
@@ -613,6 +634,61 @@ def main() -> None:
     search_parser.add_argument(
         "--adapter",
         help="Path to LoRA adapter directory",
+    )
+    search_parser.add_argument(
+        "--use-imatrix",
+        action="store_true",
+        default=None,
+        help="Capture/reuse an importance matrix and weight candidate builds "
+             "with it (default: MAGICQUANT_USE_IMATRIX or off)",
+    )
+    search_parser.add_argument(
+        "--imatrix-corpus",
+        default=None,
+        help="Calibration corpus for imatrix capture "
+             "(default: MAGICQUANT_IMATRIX_CORPUS or the bundled default)",
+    )
+    search_parser.add_argument(
+        "--enable-kl",
+        action="store_true",
+        default=None,
+        help="Also measure real KL-divergence-to-base per candidate and blend "
+             "it into survivor selection (default: MAGICQUANT_ENABLE_KL or off)",
+    )
+    search_parser.add_argument(
+        "--kl-weight",
+        type=float,
+        default=None,
+        help="Weight applied to |mean_kl| when blending into selection "
+             "(default: MAGICQUANT_KL_WEIGHT or 0.1)",
+    )
+    search_parser.add_argument(
+        "--enable-speed-bench",
+        action="store_true",
+        default=None,
+        help="Also measure real tokens/sec per candidate via llama-bench "
+             "(default: MAGICQUANT_ENABLE_SPEED_BENCH or off)",
+    )
+    search_parser.add_argument(
+        "--enable-rocmfpx",
+        action="store_true",
+        default=None,
+        help="Let the search also explore AMD-native ROCmFPX fork types "
+             "(default: MAGICQUANT_ENABLE_ROCMFPX or off)",
+    )
+    search_parser.add_argument(
+        "--enable-iq",
+        action="store_true",
+        default=None,
+        help="Let the search also explore IQ-family quant types "
+             "(default: MAGICQUANT_ENABLE_IQ or off)",
+    )
+    search_parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible search "
+             "(default: MAGICQUANT_SEED or unset = nondeterministic)",
     )
     search_parser.add_argument(
         "--dry-run",

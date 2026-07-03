@@ -34,6 +34,17 @@ class MagicQuantSettings(BaseSettings):
     tiers: list[str] = ["Q4", "Q5", "Q6"]
     verify: bool = False
     verbose: bool = True
+    # Orchestrator knobs (run_measured_search / run_full_search) -- off by
+    # default so the historical unweighted/no-KL/no-bench behavior is
+    # unchanged unless explicitly opted into.
+    use_imatrix: bool = False
+    imatrix_corpus: Optional[str] = None
+    enable_kl: bool = False
+    kl_weight: float = 0.1
+    enable_speed_bench: bool = False
+    enable_rocmfpx: bool = False
+    enable_iq: bool = False
+    seed: Optional[int] = None
 
     model_config = {
         "env_prefix": "MAGICQUANT_",
