@@ -384,14 +384,23 @@ class EvolutionarySurvivor:
 
             # Build per-scheme weights: start with the class weight, then
             # divide it across all schemes in that category, inversely
-            # weighted by noise_factor (cleaner schemes preferred).
+            # weighted by noise_factor (cleaner schemes preferred), and
+            # normalize within the category so each category's *total*
+            # sampling mass equals its documented cat_weight regardless of
+            # how many schemes share it.
+            inv_noise = [1.0 / (1.0 + s.noise_factor) for s in all_schemes]
+            cat_inv_noise_totals: Dict[str, float] = {}
+            for s, w in zip(all_schemes, inv_noise):
+                cat_inv_noise_totals[s.category] = cat_inv_noise_totals.get(s.category, 0.0) + w
+
             scheme_weights = []
-            for s in all_schemes:
+            for s, w in zip(all_schemes, inv_noise):
                 cat_weight = class_weights.get(s.category, 0.0)
-                # Within a category, give cleaner (lower noise) schemes more weight.
-                # noise_factor=0 (BF16) gets factor 2.0; high-noise gets factor near 0.
-                # Normalize within a category later.
-                scheme_weights.append(cat_weight * (1.0 / (1.0 + s.noise_factor)))
+                cat_total = cat_inv_noise_totals.get(s.category, 0.0)
+                if cat_total > 0:
+                    scheme_weights.append(cat_weight * (w / cat_total))
+                else:
+                    scheme_weights.append(0.0)
 
             # Avoid all-zeros pathology
             if sum(scheme_weights) == 0:
