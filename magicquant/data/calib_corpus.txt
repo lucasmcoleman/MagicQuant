@@ -68,3 +68,137 @@ microorganisms to break down sugars into new compounds. Spices, gathered from
 seeds, bark, roots, and flowers, have historically been valuable enough to
 drive long-distance trade, and they remain central to distinguishing one
 regional cuisine from another even when the base ingredients are similar.
+
+The history of navigation illustrates how practical problems drive theory.
+Sailors first steered by coastlines and stars, then by compass and dead
+reckoning, accumulating errors over long passages. The longitude problem —
+knowing how far east or west a ship had traveled — resisted solution for
+centuries because it required either precise astronomical tables or a clock
+that kept accurate time at sea. John Harrison's marine chronometers solved it
+mechanically, while lunar-distance methods solved it observationally, and the
+rivalry between the two approaches shaped both instrument making and
+mathematical astronomy. Modern positioning inverts the old problem: instead of
+observing celestial bodies whose motion is known, receivers time signals from
+satellites whose positions are broadcast, trading tables and clockwork for
+atomic clocks and relativistic corrections.
+
+A database index resembles the index of a printed book. Rather than scanning
+every page for a topic, a reader consults an ordered list that maps terms to
+page numbers. B-tree indexes keep keys sorted in shallow, wide trees so that
+lookups, insertions, and range scans all complete in logarithmic time, while
+hash indexes trade range queries away for constant-time exact matches.
+Choosing indexes is a balancing act: each additional index accelerates some
+queries but slows every write, since the index must be maintained alongside
+the table. Query planners weigh these costs using statistics about data
+distribution, and a stale histogram can push the planner toward a plan that
+was optimal for data that no longer exists.
+
+Photosynthesis proceeds in two coupled stages. In the light-dependent
+reactions, chlorophyll absorbs photons and uses the energy to split water,
+releasing oxygen and pumping protons across the thylakoid membrane; the
+resulting gradient drives the synthesis of ATP, while excited electrons reduce
+NADP+ to NADPH. In the Calvin cycle, those energy carriers power the fixation
+of carbon dioxide into three-carbon sugars, which the plant assembles into
+glucose, starch, and cellulose. The enzyme at the heart of fixation, rubisco,
+is famously inefficient and sometimes binds oxygen instead of carbon dioxide,
+an error that photorespiration must expensively clean up. C4 and CAM plants
+evolved anatomical and temporal workarounds that concentrate carbon dioxide
+around rubisco, which is why maize thrives in hot climates that stress wheat.
+
+Central banks conduct monetary policy chiefly by influencing short-term
+interest rates. When a central bank buys government securities, it credits the
+reserves of commercial banks, increasing the supply of money available for
+lending and nudging rates downward; selling securities does the opposite.
+Lower rates encourage borrowing and investment but risk inflation if demand
+outruns the economy's capacity, while higher rates cool spending at the cost
+of slower growth and higher unemployment. Because these effects arrive with
+long and variable lags, policymakers act on forecasts rather than on current
+conditions, and the credibility of their commitment to price stability shapes
+expectations, which in turn shape the very inflation they are trying to
+control.
+
+The violin's voice comes from coupled vibrations. A bowed string alone moves
+too little air to be heard across a room; its energy passes through the bridge
+into the top plate, whose larger surface pushes usefully against the air,
+while the sound post transmits motion to the back plate and the f-holes let
+the air inside the body resonate like a Helmholtz cavity. Makers tune the
+thickness and arching of the plates by ear and by flexing them in their hands,
+because wood varies from tree to tree; two instruments built from the same
+plans can differ audibly. Varnish, long credited with acoustic magic, matters
+mostly for protection and appearance, though an excessively thick or stiff
+coat can damp the plates' vibration.
+
+Glaciers are rivers of ice that flow under their own weight. Snow that
+survives the summer compacts into firn and eventually into glacial ice, which
+deforms plastically under pressure and slides over bedrock lubricated by
+meltwater. As a glacier advances it plucks rock from the valley floor and
+grinds it into flour-fine sediment, carving U-shaped valleys, horns, and
+cirques; when it retreats it abandons moraines, erratic boulders, and
+outwash plains that record its former extent. Ice cores drilled from thick
+glaciers and ice sheets preserve trapped air bubbles, volcanic ash layers, and
+isotopic signatures that together reconstruct hundreds of thousands of years
+of climate history, making glaciers both agents and archives of environmental
+change.
+
+Fermentation in bread baking is a controlled collaboration with yeast. The
+organisms consume sugars freed by enzymes from damaged starch and exhale
+carbon dioxide, which inflates the gluten network that kneading develops;
+alcohol and organic acids produced along the way contribute flavor that fast,
+heavily yeasted doughs never acquire. Sourdough cultures add lactic acid
+bacteria to the partnership, souring the crumb and strengthening the dough's
+keeping qualities. Temperature is the baker's throttle: cold retards
+fermentation, letting flavor development outpace gas production overnight in
+the refrigerator, while warmth accelerates both, so the same formula can yield
+different breads depending entirely on schedule.
+
+Operating systems mediate between programs that believe they own the machine
+and hardware that must be shared. Virtual memory gives each process a private
+address space, with the memory-management unit translating virtual to physical
+addresses page by page and the kernel paging cold data to disk when RAM runs
+short. Schedulers juggle runnable threads across cores, balancing throughput
+against latency and fairness; a desktop favors the interactive task that just
+received a keystroke, while a batch server maximizes total work per hour. File
+systems impose names, directories, and permissions on flat arrays of blocks,
+journaling their metadata so that a crash mid-write leaves the structure
+recoverable rather than corrupt.
+
+The Silk Road was less a single road than a shifting mesh of caravan routes
+linking China to the Mediterranean through Central Asia. Silk moved west, but
+so did paper, gunpowder, and porcelain; horses, glassware, wool, and silver
+moved east, and ideas traveled in every direction — Buddhism into China,
+astronomy and mathematics between Persia, India, and the Islamic world. Few
+merchants walked the whole distance; goods changed hands at oasis towns whose
+prosperity rose and fell with the security of the routes. The same corridors
+carried the Black Death westward in the fourteenth century, a reminder that
+networks efficient at moving valuables are equally efficient at moving
+everything else.
+
+Antibiotic resistance is evolution observed in real time. A bacterial
+population exposed to a drug is a selection experiment: susceptible cells die,
+and any mutant that happens to pump the drug out, degrade it, or alter its
+target survives to found the next generation. Resistance genes hop between
+species on plasmids, so a gene selected in livestock can surface later in a
+hospital pathogen. Stewardship — completing courses, reserving last-resort
+drugs, and abandoning antibiotics for viral infections — slows the process
+but cannot stop it, which is why research pipelines for new antibiotic classes
+and alternatives such as phage therapy remain a public health priority.
+
+Cartographers must flatten a sphere, and every method of doing so lies about
+something. Mercator's projection preserves angles, which made it beloved of
+navigators sailing rhumb lines, but it inflates areas toward the poles until
+Greenland rivals Africa. Equal-area projections keep sizes honest while
+distorting shapes; compromise projections spread the error around so that
+nothing is exact but nothing is grotesque. The choice of projection is
+therefore a choice about which truth matters for the map's purpose, and the
+same is true of every dashboard and chart: deciding what to show faithfully
+means deciding what to let distort.
+
+Bees communicate the location of food through the waggle dance. A returning
+forager traces a figure-eight on the vertical comb, and the angle of the
+central run relative to gravity encodes the direction of the source relative
+to the sun, while the duration of the waggle encodes distance. Followers read
+the dance in the dark of the hive through touch and vibration, then fly the
+advertised vector and correct for wind drift on the wing. The dance is honest
+advertising: foragers dance longer and more vigorously for richer sources, so
+the colony's collective attention flows toward the best patches without any
+bee holding a map of the whole landscape.

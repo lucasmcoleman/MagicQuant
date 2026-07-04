@@ -127,3 +127,21 @@ def test_default_corpus_bundled_and_nontrivial():
     assert size > 1024, f"expected bundled corpus > 1KB, got {size} bytes"
     text = imatrix.DEFAULT_CORPUS_PATH.read_text(encoding="utf-8")
     assert len(text.split()) > 100
+
+
+def test_default_corpus_meets_llama_imatrix_minimum():
+    """llama-imatrix refuses to run with fewer than 2*ctx_size tokens (1024 at
+    the default ctx 512). The original 4.7KB bundled corpus tokenized to only
+    926 Qwen tokens, so default-settings capture ALWAYS failed (found in a
+    real validation run 2026-07-03). English prose tokenizes at roughly 1.3
+    tokens/word across common BPE vocabularies, so require enough words for
+    ~2x the minimum as a tokenizer-independent guard against the corpus
+    shrinking below usability again.
+    """
+    text = imatrix.DEFAULT_CORPUS_PATH.read_text(encoding="utf-8")
+    words = len(text.split())
+    assert words >= 1600, (
+        f"bundled corpus has {words} words (~{int(words * 1.3)} tokens); "
+        f"llama-imatrix needs >=1024 tokens at default ctx 512, and we want "
+        f"~2x headroom for tokenizer variation"
+    )
