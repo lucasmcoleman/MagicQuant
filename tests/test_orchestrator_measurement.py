@@ -342,6 +342,98 @@ def test_save_results_defaults_kl_and_bench_to_none_when_absent(tmp_path):
     assert entry["bench"] is None
 
 
+def test_measurement_chunks_applied_to_llama_tools(tmp_path, monkeypatch):
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        measurement_chunks=7,
+    )
+
+    assert fake_tools.ppl_chunks == 7
+
+
+def test_measurement_chunks_none_leaves_ppl_chunks_untouched(tmp_path, monkeypatch):
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools.ppl_chunks = "untouched"
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+    )
+
+    assert fake_tools.ppl_chunks == "untouched"
+
+
+def test_run_full_search_measurement_chunks_is_symmetric(tmp_path, monkeypatch):
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+
+    orch.run_full_search(
+        max_generations=2, population_size=8, verbose=False,
+        measurement_chunks=9,
+    )
+
+    assert fake_tools.ppl_chunks == 9
+
+
+# ── _save_results "measurement" metadata block ──────────────────────────────
+
+
+def test_save_results_measurement_metadata_full(tmp_path, monkeypatch):
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools.ppl_chunks = 10
+    orch.output_dir.mkdir(parents=True, exist_ok=True)
+    (orch.output_dir / "sensitivity.json").write_text(
+        json.dumps({"probing_provenance": "measured"})
+    )
+    orch.baseline_ppl = 5.0
+    orch.baseline_provenance = "measured"
+    orch._search_seed = None
+    orch._imatrix = {"a": object(), "b": object()}
+    orch._kl_base_logits_path = str(tmp_path / "_kl_base_logits.kld")
+    orch._kl_weight = 0.3
+    orch._measured = {}
+
+    orch._save_results([], {})
+
+    saved = json.loads((orch.output_dir / "search_results.json").read_text())
+    meta = saved["measurement"]
+    assert meta["chunks"] == 10
+    assert meta["ctx_size"] == fake_tools.ctx_size
+    assert meta["corpus"] == "/fake/corpus.txt"
+    assert meta["imatrix_active"] is True
+    assert meta["imatrix_n_tensors"] == 2
+    assert meta["kl_enabled"] is True
+    assert meta["kl_weight"] == 0.3
+    assert meta["probing_provenance"] == "measured"
+
+
+def test_save_results_measurement_metadata_defaults_for_bare_state(tmp_path):
+    # Older/bare orchestrator state (no _llama_tools, no _imatrix, no KL
+    # attributes at all -- as produced by __new__ in several tests above)
+    # must not crash _save_results.
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch.output_dir = tmp_path
+    orch.baseline_ppl = 5.0
+    orch.baseline_provenance = "prediction-only"
+    orch._search_seed = None
+    orch._measured = {}
+
+    orch._save_results([], {})
+
+    saved = json.loads((tmp_path / "search_results.json").read_text())
+    meta = saved["measurement"]
+    assert meta["chunks"] is None
+    assert meta["ctx_size"] is None
+    assert meta["corpus"] is None
+    assert meta["imatrix_active"] is False
+    assert meta["imatrix_n_tensors"] is None
+    assert meta["kl_enabled"] is False
+    assert meta["kl_weight"] == 0.0
+    assert meta["probing_provenance"] is None
+
+
 def test_enable_imatrix_uses_sibling_of_perplexity_tool(tmp_path, monkeypatch):
     """enable_imatrix must aim llama-imatrix at the SAME llama.cpp build as
     the perplexity tool -- ensure_imatrix's PATH fallback can resolve to a

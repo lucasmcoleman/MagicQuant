@@ -20,7 +20,7 @@ def _args(**kw):
         candidates=None, patience=None,
         use_imatrix=None, imatrix_corpus=None, enable_kl=None, kl_weight=None,
         enable_speed_bench=None, enable_rocmfpx=None, enable_iq=None,
-        seed=None,
+        seed=None, measurement_chunks=None,
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -110,6 +110,27 @@ def test_orchestrator_knobs_cli_overrides_env(monkeypatch):
     assert settings.seed == 7
 
 
+# ── measurement_chunks (measurement-corpus-size setting) ────────────────────
+
+
+def test_measurement_chunks_default_none(monkeypatch):
+    monkeypatch.delenv("MAGICQUANT_MEASUREMENT_CHUNKS", raising=False)
+    settings = _settings_from_args(_args())
+    assert settings.measurement_chunks is None
+
+
+def test_measurement_chunks_env_honored(monkeypatch):
+    monkeypatch.setenv("MAGICQUANT_MEASUREMENT_CHUNKS", "12")
+    settings = _settings_from_args(_args())
+    assert settings.measurement_chunks == 12
+
+
+def test_measurement_chunks_cli_overrides_env(monkeypatch):
+    monkeypatch.setenv("MAGICQUANT_MEASUREMENT_CHUNKS", "12")
+    settings = _settings_from_args(_args(measurement_chunks=5))
+    assert settings.measurement_chunks == 5
+
+
 # ── cmd_search forwarding to the orchestrator ───────────────────────────────
 
 
@@ -141,7 +162,7 @@ def _search_args(**kw):
         rounds=None, candidates=None, patience=None,
         use_imatrix=None, imatrix_corpus=None, enable_kl=None,
         kl_weight=None, enable_speed_bench=None, enable_rocmfpx=None,
-        enable_iq=None, seed=None,
+        enable_iq=None, seed=None, measurement_chunks=None,
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -157,6 +178,7 @@ def test_cmd_search_forwards_knobs_to_run_measured_search(monkeypatch):
         use_imatrix=True, imatrix_corpus="/tmp/corpus.txt",
         enable_kl=True, kl_weight=0.7, enable_speed_bench=True,
         enable_rocmfpx=True, enable_iq=True, seed=42,
+        measurement_chunks=8,
     ))
 
     orch = _FakeSearchOrchestrator.last
@@ -171,6 +193,7 @@ def test_cmd_search_forwards_knobs_to_run_measured_search(monkeypatch):
     assert call["enable_rocmfpx"] is True
     assert call["enable_iq"] is True
     assert call["seed"] == 42
+    assert call["measurement_chunks"] == 8
 
 
 def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
@@ -183,6 +206,7 @@ def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
         use_imatrix=True, imatrix_corpus="/tmp/corpus.txt",
         enable_kl=True, kl_weight=0.7, enable_speed_bench=True,
         enable_rocmfpx=True, enable_iq=True, seed=42,
+        measurement_chunks=8,
     ))
 
     orch = _FakeSearchOrchestrator.last
@@ -194,6 +218,7 @@ def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
     assert call["enable_rocmfpx"] is True
     assert call["enable_iq"] is True
     assert call["seed"] == 42
+    assert call["measurement_chunks"] == 8
     # run_full_search has no KL / speed-bench params -- must not be forwarded.
     assert "enable_kl" not in call
     assert "kl_weight" not in call

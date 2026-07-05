@@ -161,6 +161,7 @@ def _settings_from_args(args: argparse.Namespace):
     _maybe("enable_rocmfpx", "enable_rocmfpx")
     _maybe("enable_iq", "enable_iq")
     _maybe("seed", "seed")
+    _maybe("measurement_chunks", "measurement_chunks")
 
     # MagicQuantSettings() reads env/.env first; explicit kwargs (CLI) win.
     return MagicQuantSettings(**overrides)
@@ -199,6 +200,7 @@ def cmd_search(args: argparse.Namespace) -> None:
             enable_rocmfpx=settings.enable_rocmfpx,
             enable_iq=settings.enable_iq,
             seed=settings.seed,
+            measurement_chunks=settings.measurement_chunks,
         )
     else:
         # Prediction-only search (fast, no llama.cpp required)
@@ -213,6 +215,7 @@ def cmd_search(args: argparse.Namespace) -> None:
             enable_rocmfpx=settings.enable_rocmfpx,
             enable_iq=settings.enable_iq,
             seed=settings.seed,
+            measurement_chunks=settings.measurement_chunks,
         )
 
     results_path = Path(settings.output_dir) / "search_results.json"
@@ -689,6 +692,16 @@ def main() -> None:
         default=None,
         help="Random seed for reproducible search "
              "(default: MAGICQUANT_SEED or unset = nondeterministic)",
+    )
+    search_parser.add_argument(
+        "--measurement-chunks",
+        dest="measurement_chunks",
+        type=int,
+        default=None,
+        help="Cap perplexity/KL passes to this many ctx-size chunks instead "
+             "of the whole corpus, trading statistical resolution for "
+             "wall-clock time (default: MAGICQUANT_MEASUREMENT_CHUNKS or "
+             "unset = whole corpus)",
     )
     search_parser.add_argument(
         "--dry-run",

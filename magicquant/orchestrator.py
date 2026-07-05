@@ -207,6 +207,7 @@ class MagicQuantOrchestrator:
         enable_kl: bool = False,
         kl_weight: float = 0.1,
         enable_speed_bench: bool = False,
+        measurement_chunks: Optional[int] = None,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run the full Predict -> Measure -> Learn loop.
@@ -236,6 +237,11 @@ class MagicQuantOrchestrator:
                 .json, not fed into per-generation prediction scoring --
                 bench-ing the full population every generation isn't
                 tractable, only the small measured set is). Off by default.
+            measurement_chunks: cap every perplexity/KL pass in this run to
+                this many ctx_size-token chunks instead of the whole corpus
+                (overrides LlamaCppTools' own MAGICQUANT_PPL_CHUNKS env
+                fallback when set). None (default) measures the whole
+                corpus every pass.
 
         Returns:
             (all_configs, tiered_best) where tiered_best maps tier names
@@ -260,6 +266,8 @@ class MagicQuantOrchestrator:
                 "run_measured_search requires llama.cpp. Install it or use "
                 "prediction-only mode (--rounds 0)."
             )
+        if measurement_chunks is not None:
+            self.llama_tools.ppl_chunks = measurement_chunks
 
         # ── Step 1: Baseline perplexity ──
         if verbose:
@@ -658,6 +666,47 @@ class MagicQuantOrchestrator:
                 result[tier] = best
         return result
 
+    def _measurement_metadata(self) -> Dict[str, Any]:
+        """Describe the conditions under which this run's numbers were
+        measured, so results from different runs are never silently compared.
+
+        Every field is read via ``getattr``/``.get`` with a fallback -- this
+        must not raise for a prediction-only run (no ``_llama_tools``, no
+        ``_imatrix``) or for older orchestrator state built via ``__new__``
+        that predates these attributes entirely.
+        """
+        llama = getattr(self, "_llama_tools", None)
+        corpus = None
+        if llama is not None:
+            try:
+                corpus = llama._resolve_data_file(None)
+            except Exception:
+                corpus = None
+
+        imatrix = getattr(self, "_imatrix", None)
+
+        probing_provenance = None
+        output_dir = getattr(self, "output_dir", None)
+        if output_dir is not None:
+            try:
+                sensitivity_path = Path(output_dir) / "sensitivity.json"
+                if sensitivity_path.is_file():
+                    sensitivity_data = json.loads(sensitivity_path.read_text())
+                    probing_provenance = sensitivity_data.get("probing_provenance")
+            except Exception:
+                probing_provenance = None
+
+        return {
+            "chunks": getattr(llama, "ppl_chunks", None),
+            "ctx_size": getattr(llama, "ctx_size", None),
+            "corpus": corpus,
+            "imatrix_active": imatrix is not None,
+            "imatrix_n_tensors": len(imatrix) if imatrix else None,
+            "kl_enabled": bool(getattr(self, "_kl_base_logits_path", None)),
+            "kl_weight": getattr(self, "_kl_weight", 0.0),
+            "probing_provenance": probing_provenance,
+        }
+
     def _save_results(self, all_configs, tiered):
         """Persist search results and measurements to JSON.
 
@@ -673,6 +722,7 @@ class MagicQuantOrchestrator:
             "baseline_provenance": self.baseline_provenance,
             "probing_provenance": self.probing_provenance,
             "seed": self._search_seed,
+            "measurement": self._measurement_metadata(),
             "measurements": {
                 k: {
                     "config": v["config"],
@@ -726,6 +776,7 @@ class MagicQuantOrchestrator:
         seed: Optional[int] = None,
         use_imatrix: bool = False,
         imatrix_corpus: Optional[str] = None,
+        measurement_chunks: Optional[int] = None,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run prediction-only evolutionary search (no real measurements).
@@ -736,6 +787,11 @@ class MagicQuantOrchestrator:
         only makes generate_hybrid_model/generate_tiered_models (called
         afterward with this same orchestrator) quantize with an importance
         matrix instead of unweighted. Off by default; safe for the fixture.
+
+        measurement_chunks: cap the (single) baseline perplexity pass to
+        this many ctx_size-token chunks instead of the whole corpus.
+        Symmetric with run_measured_search's knob of the same name; a no-op
+        when llama.cpp is unavailable (no baseline pass runs at all).
         """
         self._apply_seed(seed)
         if use_imatrix:
@@ -753,6 +809,8 @@ class MagicQuantOrchestrator:
         # verified.
         _llama = self.llama_tools
         if _llama is not None:
+            if measurement_chunks is not None:
+                _llama.ppl_chunks = measurement_chunks
             self.baseline_ppl = _llama.calculate_perplexity(
                 self.source_model_path, verbose=verbose
             )
