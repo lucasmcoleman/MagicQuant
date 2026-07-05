@@ -36,7 +36,11 @@ class TensorGroupClassifier:
         'N': [r'_norm\.weight$', r'layernorm', r'_norm\.bias$',
               r'q_norm\.weight$', r'k_norm\.weight$'],
         'E': [r'token_embd\.weight'],
-        'H': [r'^output\.weight$', r'lm_head\.weight', r'mtp\.'],
+        # mtp./nextn.: multi-token-prediction layers (llama.cpp names them
+        # blk.N.nextn.{eh_proj,embed_tokens,shared_head...} across GLM/DeepSeek/
+        # Qwen3.5 MTP arches). Head-adjacent: they predict tokens, so treat them
+        # with H's sensitivity rather than inventing a new group.
+        'H': [r'^output\.weight$', r'lm_head\.weight', r'mtp\.', r'nextn\.'],
         # MoE experts. GGUF names them ffn_{up,gate,down}_exps — the prior
         # `ffn.*expert` (literal "expert") missed them, so ffn_up_exps/ffn_gate_exps
         # fell through to dense group U. ffn_gate_up_exps (fused) needs its own pattern.
@@ -45,7 +49,9 @@ class TensorGroupClassifier:
         'R': [r'ffn_gate_inp', r'router', r'block_sparse_moe\.router'],
         'Q': [r'attn_q\.weight', r'attn_qkv\.weight'],
         'K': [r'attn_k\.weight', r'attn_v\.weight'],
-        'O': [r'attn_output\.weight'],
+        # attn_gate: Qwen3.5 gated attention -- a per-head gate multiplied into
+        # the attention output, so it shares O's sensitivity band.
+        'O': [r'attn_output\.weight', r'attn_gate\.weight'],
         'S': [r'linear_attn\.', r'mamba\.', r'ssm\.', r'ssm_'],
         'U': [r'ffn_up', r'ffn_gate(?!_inp)', r'ffn_up_shared',
               r'shared_mlp\.input_linear'],
@@ -65,13 +71,13 @@ class TensorGroupClassifier:
     _HEURISTIC_KEYWORDS = {
         'N': ['norm', 'layernorm', 'rmsnorm'],
         'E': ['embed', 'embd', 'wte'],
-        'H': ['lm_head'],
+        'H': ['lm_head', 'nextn', 'mtp'],
         'R': ['router', 'gate_inp', 'gating'],
         'X': ['expert', 'moe'],
         'S': ['ssm', 'mamba', 'conv1d', 'dt_bias', 'a_log', 'recurrence'],
         'Q': ['q_proj', 'query'],
         'K': ['k_proj', 'v_proj', 'key', 'value'],
-        'O': ['o_proj', 'out_proj', 'attn_output', 'attn_out'],
+        'O': ['o_proj', 'out_proj', 'attn_output', 'attn_out', 'attn_gate'],
         'U': ['up_proj', 'gate_proj', 'input_linear', 'in_proj',
               'ffn_up', 'ffn_gate', 'w1', 'w3'],
         'D': ['down_proj', 'output_linear', 'ffn_down', 'w2'],

@@ -49,3 +49,24 @@ def test_moe_experts_not_in_dense_groups(clf):
     for n in ("blk.0.ffn_up_exps.weight", "blk.0.ffn_gate_exps.weight",
               "blk.0.ffn_down_exps.weight", "blk.0.ffn_gate_up_exps.weight"):
         assert clf.classify_tensor(n) == "X"
+
+
+def test_qwen35_mtp_and_gated_attention_not_unknown(clf):
+    """Regression for the Qwopus3.6-27B-v2-MTP failure mode: the two tensor
+    families a real Qwen3.5 MTP GGUF carries that the classifier didn't know
+    (verified against the actual model, 2026-07-04). UNKNOWN tensors hard-fail
+    the writer's pre-scan, killing the whole pack.
+    """
+    # llama.cpp names MTP layers blk.N.nextn.* across GLM/DeepSeek/Qwen MTP
+    # arches; head-adjacent (they predict tokens), same treatment as mtp.*
+    assert clf.classify_tensor("blk.46.nextn.eh_proj.weight") == "H"
+    assert clf.classify_tensor("blk.46.nextn.shared_head.head.weight") == "H"
+    # Qwen3.5 gated attention: per-head gate multiplied into attention output
+    assert clf.classify_tensor("blk.0.attn_gate.weight") == "O"
+
+
+def test_nextn_norms_stay_out_of_matrix_groups(clf):
+    # nextn's tiny 1-D norms classify as H via the explicit nextn. pattern;
+    # harmless either way (the writer's 1-D compat rule forces norms to F32),
+    # but pin the current behavior so a re-ordering doesn't silently change it.
+    assert clf.classify_tensor("blk.46.nextn.enorm.weight") == "H"
