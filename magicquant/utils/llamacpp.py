@@ -72,6 +72,12 @@ class LlamaCppTools:
         self.ctx_size = ctx_size
         self.ngl = ngl if ngl is not None else _env_int("MAGICQUANT_NGL")
         self.threads = threads if threads is not None else _env_int("MAGICQUANT_THREADS")
+        # Cap on ctx_size-token chunks per perplexity/KL pass (--chunks).
+        # None = whole corpus (historical). A full wikitext pass on a 27B
+        # takes ~55 min on this box and a measured search needs ~20 of them;
+        # capping trades some statistical resolution for tractable wall-clock
+        # while keeping every measurement in the run on the same corpus slice.
+        self.ppl_chunks = _env_int("MAGICQUANT_PPL_CHUNKS")
 
     def _gpu_flags(self) -> List[str]:
         """``-ngl``/``-t`` flags for perplexity/bench, omitted when unset.
@@ -334,6 +340,9 @@ class LlamaCppTools:
             "--batch-size", "512",
             "--ubatch-size", "128",
         ] + self._gpu_flags()
+        ppl_chunks = getattr(self, "ppl_chunks", None)
+        if ppl_chunks is not None:
+            cmd += ["--chunks", str(ppl_chunks)]
 
         if verbose:
             print(f"Calculating perplexity for {Path(model_path).name}...")
@@ -453,7 +462,7 @@ class LlamaCppTools:
             "-f", corpus_path,
             "--kl-divergence-base", out_logits_path,
             "--ctx-size", str(ctx_size),
-            "--chunks", str(chunks),
+            "--chunks", str(chunks if chunks != -1 else (getattr(self, "ppl_chunks", None) or -1)),
         ] + self._gpu_flags()
 
         try:
@@ -519,7 +528,7 @@ class LlamaCppTools:
             "--kl-divergence",
             "--kl-divergence-base", base_logits_path,
             "--ctx-size", str(ctx_size),
-            "--chunks", str(chunks),
+            "--chunks", str(chunks if chunks != -1 else (getattr(self, "ppl_chunks", None) or -1)),
         ] + self._gpu_flags()
 
         try:

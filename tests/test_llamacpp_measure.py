@@ -629,3 +629,60 @@ def test_resolve_data_file_still_prefers_wikitext(tmp_path):
     tools.llamacpp_path = str(tmp_path)
     tools.data_file = None
     assert tools._resolve_data_file(None) == str(wiki.resolve())
+
+
+def test_ppl_chunks_env_caps_all_measurement_passes(tmp_path, monkeypatch):
+    """MAGICQUANT_PPL_CHUNKS must cap perplexity AND both KL passes so every
+    measurement in a run uses the same corpus slice (a full-corpus pass on a
+    27B is ~55 min on this box; a measured search needs ~20 passes)."""
+    monkeypatch.setenv("MAGICQUANT_PPL_CHUNKS", "150")
+    monkeypatch.setattr(LlamaCppTools, "_find_llamacpp", lambda self: str(tmp_path))
+    monkeypatch.setattr(LlamaCppTools, "_find_quantize_tool", lambda self: "/bin/true")
+    monkeypatch.setattr(LlamaCppTools, "_find_perplexity_tool", lambda self: "/bin/true")
+    tools = LlamaCppTools()
+    assert tools.ppl_chunks == 150
+
+    corpus = tmp_path / "c.txt"; corpus.write_text("hi")
+    model = tmp_path / "m.gguf"; model.write_bytes(b"g")
+    captured = {}
+
+    def fake_run(cmd, timeout):
+        captured["cmd"] = cmd
+        import subprocess
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tools, "_run_perplexity_subprocess", fake_run)
+    tools.data_file = str(corpus)
+
+    tools.calculate_perplexity(str(model), verbose=False)
+    assert captured["cmd"][captured["cmd"].index("--chunks") + 1] == "150"
+
+    tools.save_base_logits(str(model), str(corpus), str(tmp_path / "o.kld"))
+    assert captured["cmd"][captured["cmd"].index("--chunks") + 1] == "150"
+
+    tools.calculate_kl_divergence(str(model), str(tmp_path / "o.kld"), str(corpus))
+    assert captured["cmd"][captured["cmd"].index("--chunks") + 1] == "150"
+
+
+def test_ppl_chunks_unset_keeps_historical_behavior(tmp_path, monkeypatch):
+    monkeypatch.delenv("MAGICQUANT_PPL_CHUNKS", raising=False)
+    tools = LlamaCppTools.__new__(LlamaCppTools)
+    tools.llamacpp_path = str(tmp_path)
+    tools.perplexity_tool = "/bin/true"
+    tools.ctx_size = 512
+    tools.data_file = None
+    corpus = tmp_path / "c.txt"; corpus.write_text("hi")
+    tools.data_file = str(corpus)
+    captured = {}
+
+    def fake_run(cmd, timeout):
+        captured["cmd"] = cmd
+        import subprocess
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(tools, "_run_perplexity_subprocess", fake_run)
+    tools.calculate_perplexity(str(tmp_path / "m.gguf"), verbose=False)
+    assert "--chunks" not in captured["cmd"]
+
+    tools.calculate_kl_divergence(str(tmp_path / "m.gguf"), "b.kld", str(corpus))
+    assert captured["cmd"][captured["cmd"].index("--chunks") + 1] == "-1"
