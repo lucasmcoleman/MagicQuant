@@ -1,0 +1,73 @@
+{
+  "baseline_ppl": 6.5722,
+  "sensitivity": {
+    "E": 0.10000000000000009,
+    "H": 0.09000000000000008,
+    "Q": 0.06000000000000005,
+    "K": 0.054999999999999986,
+    "O": 0.08000000000000007,
+    "U": 0.030000000000000027,
+    "D": 0.03499999999999997,
+    "S": 0.006755728675329485
+  },
+  "normalized_weights": {
+    "E": 0.21893540402879522,
+    "H": 0.1970418636259157,
+    "Q": 0.13136124241727712,
+    "K": 0.12041447221583723,
+    "O": 0.17514832322303617,
+    "U": 0.06568062120863856,
+    "D": 0.0766273914100782,
+    "S": 0.01479068187042177
+  },
+  "probes": [
+    {
+      "group": "E",
+      "aggressive_scheme": "Q4_K_M",
+      "probe_ppl": 7.22942,
+      "sensitivity": 0.10000000000000009
+    },
+    {
+      "group": "H",
+      "aggressive_scheme": "Q4_K_M",
+      "probe_ppl": 7.163698,
+      "sensitivity": 0.09000000000000008
+    },
+    {
+      "group": "Q",
+      "aggressive_scheme": "Q4_K_M",
+      "probe_ppl": 6.966532,
+      "sensitivity": 0.06000000000000005
+    },
+    {
+      "group": "K",
+      "aggressive_scheme": "Q4_K_M",
+      "probe_ppl": 6.9336709999999995,
+      "sensitivity": 0.054999999999999986
+    },
+    {
+      "group": "O",
+      "aggressive_scheme": "Q4_K_M",
+      "probe_ppl": 7.097976,
+      "sensitivity": 0.08000000000000007
+    },
+    {
+      "group": "U",
+      "aggressive_scheme": "Q4_K_M",
+      "probe_ppl": 6.769366,
+      "sensitivity": 0.030000000000000027
+    },
+    {
+      "group": "D",
+      "aggressive_scheme": "Q4_K_M",
+      "probe_ppl": 6.802226999999999,
+      "sensitivity": 0.03499999999999997
+    },
+    {
+      "group": "S",
+      "aggressive_scheme": "Q4_K_M",
+      "probe_ppl": 6.6166,
+      "sensitivity": 0.006755728675329485
+    }
+  ]
+}

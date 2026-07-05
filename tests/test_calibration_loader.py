@@ -114,3 +114,52 @@ def test_cache_is_populated_after_first_load(tmp_path, monkeypatch):
     assert calibration.calibrated_noise_factor("Q8_0") == 1.0
 
     calibration._reset_cache()
+
+
+# ── calibrated_speed_multiplier (opt-in speed-calibration route) ────────
+
+def test_no_calibration_file_speed_multiplier_returns_none(tmp_path, monkeypatch):
+    missing = tmp_path / "does_not_exist.json"
+    monkeypatch.setattr(calibration, "_CALIBRATION_PATH", missing)
+    calibration._reset_cache()
+
+    assert calibration.calibrated_speed_multiplier("IQ4_NL") is None
+
+    scorer = PredictiveScorer(sensitivity_weights={})
+    registry_value = get_scheme_by_name("IQ4_NL").speed_multiplier
+    assert scorer._speed_for("IQ4_NL") == registry_value
+
+
+def test_calibration_file_overrides_speed_multiplier(tmp_path, monkeypatch):
+    calib_path = tmp_path / "calibration_results.json"
+    calib_path.write_text(json.dumps({
+        "schemes": {
+            "IQ4_NL": {"speed_multiplier": 1.8, "status": "bench"},
+        },
+    }))
+    monkeypatch.setattr(calibration, "_CALIBRATION_PATH", calib_path)
+    calibration._reset_cache()
+
+    assert calibration.calibrated_speed_multiplier("IQ4_NL") == 1.8
+
+    scorer = PredictiveScorer(sensitivity_weights={})
+    assert scorer._speed_for("IQ4_NL") == 1.8
+    assert get_scheme_by_name("IQ4_NL").speed_multiplier != 1.8
+
+
+def test_calibrated_speed_multiplier_independent_of_noise_factor():
+    """The two calibrated_* lookups read different keys off the same entry
+    -- a speed-only entry must not accidentally satisfy the noise lookup."""
+    calibration._reset_cache()
+
+    def _fake_load():
+        return {"schemes": {"Q4_K_M": {"speed_multiplier": 2.0}}}
+
+    orig_load = calibration._load
+    calibration._load = _fake_load
+    try:
+        assert calibration.calibrated_speed_multiplier("Q4_K_M") == 2.0
+        assert calibration.calibrated_noise_factor("Q4_K_M") is None
+    finally:
+        calibration._load = orig_load
+        calibration._reset_cache()

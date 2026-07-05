@@ -1,0 +1,296 @@
+{
+  "baseline_ppl": 6.5722,
+  "baseline_provenance": "measured",
+  "seed": null,
+  "measurements": {
+    "D:Q6_K|E:BF16|H:BF16|K:Q8_0|O:BF16|Q:Q6_K|S:Q5_K|U:BF16": {
+      "config": {
+        "E": "BF16",
+        "H": "BF16",
+        "Q": "Q6_K",
+        "K": "Q8_0",
+        "O": "BF16",
+        "U": "BF16",
+        "D": "Q6_K",
+        "S": "Q5_K"
+      },
+      "ppl": 6.6266,
+      "measured_loss": 0.008277289187791033,
+      "predicted_loss": 0.6223615122472843,
+      "residual": -0.6140842230594933,
+      "size_gb": 38.568812757730484,
+      "kl": {
+        "mean_kl": 0.006575,
+        "max_kl": 8.047438,
+        "p90_kl": 0.01075
+      },
+      "bench": null
+    },
+    "D:Q5_K|E:BF16|H:BF16|K:Q8_0|O:BF16|Q:Q8_0|S:Q5_K|U:Q4_K_M": {
+      "config": {
+        "E": "BF16",
+        "H": "BF16",
+        "Q": "Q8_0",
+        "K": "Q8_0",
+        "O": "BF16",
+        "U": "Q4_K_M",
+        "D": "Q5_K",
+        "S": "Q5_K"
+      },
+      "ppl": 6.649,
+      "measured_loss": 0.011685584735705004,
+      "predicted_loss": 0.8215927299134878,
+      "residual": -0.8099071451777827,
+      "size_gb": 23.149005323648453,
+      "kl": {
+        "mean_kl": 0.013186,
+        "max_kl": 13.668515,
+        "p90_kl": 0.021571
+      },
+      "bench": null
+    },
+    "D:MXFP4_MOE|E:BF16|H:BF16|K:BF16|O:BF16|Q:Q8_0|S:IQ4_NL|U:IQ4_XS": {
+      "config": {
+        "E": "BF16",
+        "H": "BF16",
+        "Q": "Q8_0",
+        "K": "BF16",
+        "O": "BF16",
+        "U": "IQ4_XS",
+        "D": "MXFP4_MOE",
+        "S": "IQ4_NL"
+      },
+      "ppl": 6.7637,
+      "measured_loss": 0.02913788381363934,
+      "predicted_loss": 0.7633659461206107,
+      "residual": -0.7342280623069714,
+      "size_gb": 21.945849806070328,
+      "kl": {
+        "mean_kl": 0.026377,
+        "max_kl": 16.549751,
+        "p90_kl": 0.047106
+      },
+      "bench": null
+    },
+    "D:IQ3_S|E:BF16|H:Q8_0|K:BF16|O:Q8_0|Q:Q6_K|S:Q3_K|U:IQ3_XXS": {
+      "config": {
+        "E": "BF16",
+        "H": "Q8_0",
+        "Q": "Q6_K",
+        "K": "BF16",
+        "O": "Q8_0",
+        "U": "IQ3_XXS",
+        "D": "IQ3_S",
+        "S": "Q3_K"
+      },
+      "ppl": 6.8974,
+      "measured_loss": 0.049481147865250694,
+      "predicted_loss": 1.771879382655594,
+      "residual": -1.7223982347903435,
+      "size_gb": 15.856391340494156,
+      "kl": {
+        "mean_kl": 0.059725,
+        "max_kl": 24.650873,
+        "p90_kl": 0.111485
+      },
+      "bench": null
+    },
+    "D:Q6_K|E:BF16|H:BF16|K:BF16|O:BF16|Q:Q8_0|S:IQ4_NL|U:MXFP4_MOE": {
+      "config": {
+        "E": "BF16",
+        "H": "BF16",
+        "Q": "Q8_0",
+        "K": "BF16",
+        "O": "BF16",
+        "U": "MXFP4_MOE",
+        "D": "Q6_K",
+        "S": "IQ4_NL"
+      },
+      "ppl": 6.6499,
+      "measured_loss": 0.011822525181826497,
+      "predicted_loss": 0.6188685794616061,
+      "residual": -0.6070460542797796,
+      "size_gb": 23.50548878312111,
+      "kl": {
+        "mean_kl": 0.027945,
+        "max_kl": 12.095656,
+        "p90_kl": 0.049705
+      },
+      "bench": null
+    },
+    "D:IQ4_NL|E:BF16|H:BF16|K:BF16|O:BF16|Q:Q8_0|S:Q5_K|U:MXFP4_MOE": {
+      "config": {
+        "E": "BF16",
+        "H": "BF16",
+        "Q": "Q8_0",
+        "K": "BF16",
+        "O": "BF16",
+        "U": "MXFP4_MOE",
+        "D": "IQ4_NL",
+        "S": "Q5_K"
+      },
+      "ppl": 6.6788,
+      "measured_loss": 0.016219835062840488,
+      "predicted_loss": 0.7296398602213938,
+      "residual": -0.7134200251585533,
+      "size_gb": 22.292987257242203,
+      "kl": {
+        "mean_kl": 0.030829,
+        "max_kl": 15.57684,
+        "p90_kl": 0.055324
+      },
+      "bench": null
+    },
+    "D:IQ4_XS|E:BF16|H:Q8_0|K:Q8_0|O:Q8_0|Q:Q6_K|S:IQ3_XXS|U:IQ3_S": {
+      "config": {
+        "E": "BF16",
+        "H": "Q8_0",
+        "Q": "Q6_K",
+        "K": "Q8_0",
+        "O": "Q8_0",
+        "U": "IQ3_S",
+        "D": "IQ4_XS",
+        "S": "IQ3_XXS"
+      },
+      "ppl": 6.8353,
+      "measured_loss": 0.04003225708286427,
+      "predicted_loss": 1.6407855384441141,
+      "residual": -1.60075328136125,
+      "size_gb": 16.687613874673843,
+      "kl": {
+        "mean_kl": 0.041092,
+        "max_kl": 19.255823,
+        "p90_kl": 0.072312
+      },
+      "bench": null
+    }
+  },
+  "tiered_survivors": {
+    "Q8": {
+      "config": {
+        "E": "BF16",
+        "H": "BF16",
+        "Q": "Q6_K",
+        "K": "Q8_0",
+        "O": "BF16",
+        "U": "BF16",
+        "D": "Q6_K",
+        "S": "Q5_K"
+      },
+      "ppl": 6.6266,
+      "measured_loss": 0.008277289187791033,
+      "size_gb": 38.568812757730484
+    },
+    "Q6": {
+      "config": {
+        "E": "BF16",
+        "H": "BF16",
+        "Q": "Q8_0",
+        "K": "Q8_0",
+        "O": "BF16",
+        "U": "Q4_K_M",
+        "D": "Q5_K",
+        "S": "Q5_K"
+      },
+      "ppl": 6.649,
+      "measured_loss": 0.011685584735705004,
+      "size_gb": 23.149005323648453
+    },
+    "Q5": {
+      "config": {
+        "E": "BF16",
+        "H": "BF16",
+        "Q": "Q8_0",
+        "K": "BF16",
+        "O": "BF16",
+        "U": "MXFP4_MOE",
+        "D": "IQ4_NL",
+        "S": "Q5_K"
+      },
+      "ppl": 6.6788,
+      "measured_loss": 0.016219835062840488,
+      "size_gb": 22.292987257242203
+    },
+    "Q4": {
+      "config": {
+        "E": "BF16",
+        "H": "Q8_0",
+        "Q": "Q6_K",
+        "K": "Q8_0",
+        "O": "Q8_0",
+        "U": "IQ3_S",
+        "D": "IQ4_XS",
+        "S": "IQ3_XXS"
+      },
+      "ppl": 6.8353,
+      "measured_loss": 0.04003225708286427,
+      "size_gb": 16.687613874673843
+    }
+  },
+  "tiered": {
+    "Q8": {
+      "config": {
+        "E": "BF16",
+        "H": "BF16",
+        "Q": "Q6_K",
+        "K": "Q8_0",
+        "O": "BF16",
+        "U": "BF16",
+        "D": "Q6_K",
+        "S": "Q5_K"
+      },
+      "ppl": 6.6266,
+      "measured_loss": 0.008277289187791033,
+      "predicted_loss": 0.6223615122472843,
+      "size_gb": 38.568812757730484
+    },
+    "Q6": {
+      "config": {
+        "E": "BF16",
+        "H": "BF16",
+        "Q": "Q8_0",
+        "K": "Q8_0",
+        "O": "BF16",
+        "U": "Q4_K_M",
+        "D": "Q5_K",
+        "S": "Q5_K"
+      },
+      "ppl": 6.649,
+      "measured_loss": 0.011685584735705004,
+      "predicted_loss": 0.8215927299134878,
+      "size_gb": 23.149005323648453
+    },
+    "Q5": {
+      "config": {
+        "E": "BF16",
+        "H": "BF16",
+        "Q": "Q8_0",
+        "K": "BF16",
+        "O": "BF16",
+        "U": "MXFP4_MOE",
+        "D": "IQ4_NL",
+        "S": "Q5_K"
+      },
+      "ppl": 6.6788,
+      "measured_loss": 0.016219835062840488,
+      "predicted_loss": 0.7296398602213938,
+      "size_gb": 22.292987257242203
+    },
+    "Q4": {
+      "config": {
+        "E": "BF16",
+        "H": "Q8_0",
+        "Q": "Q6_K",
+        "K": "Q8_0",
+        "O": "Q8_0",
+        "U": "IQ3_S",
+        "D": "IQ4_XS",
+        "S": "IQ3_XXS"
+      },
+      "ppl": 6.8353,
+      "measured_loss": 0.04003225708286427,
+      "predicted_loss": 1.6407855384441141,
+      "size_gb": 16.687613874673843
+    }
+  }
+}

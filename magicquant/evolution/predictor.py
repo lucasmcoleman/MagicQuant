@@ -11,13 +11,18 @@ with non-linear collapse penalties for compressing multiple sensitive layers.
 
 Noise factors are calibrated against published perplexity benchmarks.
 Compression ratios are derived from actual ggml block format byte sizes.
+
+When constructed with `imatrix_active=True` (the search/build is quantizing
+with an importance matrix), noise factors for imatrix-consuming schemes
+(k_quant, iq_quant) get a discount that MXFP4/rocmfpx/float schemes don't --
+see `magicquant.quant.schemes.effective_noise_factor`.
 """
 
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 
 from magicquant.quant import calibration
-from magicquant.quant.schemes import get_scheme_by_name
+from magicquant.quant.schemes import effective_noise_factor, get_scheme_by_name
 
 
 class PredictiveScorer:
@@ -41,12 +46,20 @@ class PredictiveScorer:
         sensitivity_weights: Dict[str, float],
         parameter_counts: Optional[Dict[str, int]] = None,
         baseline_size_gb: float = 0,
-        baseline_tps: float = 0
+        baseline_tps: float = 0,
+        imatrix_active: bool = False,
     ):
         self.sensitivity_weights = sensitivity_weights
         self.parameter_counts = parameter_counts or {}
         self.baseline_size_gb = baseline_size_gb
         self.baseline_tps = baseline_tps
+        # Whether this search/build is quantizing with an importance matrix.
+        # Gates the noise discount in `_noise_factor_for` (via
+        # magicquant.quant.schemes.effective_noise_factor) for schemes whose
+        # ggml encoder actually consumes one -- k_quant/iq_quant, not
+        # MXFP4/rocmfpx/float. Off by default: preserves every caller that
+        # doesn't pass this (including the seed42 regression fixture).
+        self.imatrix_active = imatrix_active
 
         # Learnable residual cache for active learning
         self.residual_cache: Dict[str, float] = {}
@@ -216,18 +229,26 @@ class PredictiveScorer:
     def _make_config_key(self, group_schemes: Dict[str, str]) -> str:
         return "|".join(f"{g}:{group_schemes[g]}" for g in sorted(group_schemes))
 
-    @staticmethod
-    def _noise_factor_for(scheme: str) -> float:
+    def _noise_factor_for(self, scheme: str) -> float:
         """Prefer an empirically calibrated noise_factor (from
         tools/calibration_results.json, when present) over the static
-        registry value; fall back to 3.0 if the scheme is unknown to both."""
+        registry value; fall back to 3.0 if the scheme is unknown to both.
+
+        When `self.imatrix_active`, the result is routed through
+        `effective_noise_factor` so schemes whose ggml encoder actually
+        consumes an imatrix (k_quant/iq_quant) get the imatrix noise
+        discount -- schemes that ignore it (MXFP4, rocmfpx, float) don't.
+        An unknown scheme (ValueError below) has no registry entry to read
+        `uses_imatrix` off, so it falls back unscaled.
+        """
         calibrated = calibration.calibrated_noise_factor(scheme)
-        if calibrated is not None:
-            return calibrated
         try:
-            return get_scheme_by_name(scheme).noise_factor
+            scheme_obj = get_scheme_by_name(scheme)
         except ValueError:
-            return 3.0
+            return calibrated if calibrated is not None else 3.0
+        return effective_noise_factor(
+            scheme_obj, self.imatrix_active, base_noise_factor=calibrated
+        )
 
     @staticmethod
     def _compression_for(scheme: str) -> float:
@@ -239,7 +260,19 @@ class PredictiveScorer:
 
     @staticmethod
     def _speed_for(scheme: str) -> float:
-        """Look up speed_multiplier from registry; fallback to 1.5 if unknown."""
+        """Prefer an empirically calibrated speed_multiplier (from
+        tools/calibration_results.json, when present) over the static
+        registry value; fall back to 1.5 if the scheme is unknown to both.
+
+        The registry value is what feeds the seed-pinned evolution fixture
+        (predict_tps -> score_hybrid -> survival.py's selection), so real
+        bench corrections (see the speed_multiplier comments on
+        Q4_K_M/IQ4_XS/IQ4_NL/MXFP4_MOE in schemes.py) route through this
+        opt-in calibration file rather than changing the registry default.
+        """
+        calibrated = calibration.calibrated_speed_multiplier(scheme)
+        if calibrated is not None:
+            return calibrated
         try:
             return get_scheme_by_name(scheme).speed_multiplier
         except ValueError:

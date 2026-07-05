@@ -357,6 +357,7 @@ class MagicQuantOrchestrator:
             parameter_counts=self._param_counts,
             baseline_size_gb=baseline_size_gb,
             baseline_tps=360,
+            imatrix_active=self._imatrix is not None,
         )
 
         # ── Step 4: Measured search rounds ──
@@ -803,6 +804,7 @@ class MagicQuantOrchestrator:
             parameter_counts=self._param_counts,
             baseline_size_gb=baseline_size_gb,
             baseline_tps=360,
+            imatrix_active=self._imatrix is not None,
         )
 
         survivor = EvolutionarySurvivor(

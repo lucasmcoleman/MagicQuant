@@ -1,11 +1,18 @@
-"""Loader for empirically-measured noise factors.
+"""Loader for empirically-measured noise factors (and, opt-in, speed
+multipliers).
 
 `tools/calibrate_noise_factors.py` runs an offline calibration bench
 (llama.cpp + a calibration model) and writes measured (ppl, ppl_loss,
 noise_factor) triples per scheme to `tools/calibration_results.json`. This
 module loads that file when present so the predictor/probing code can prefer
 measured noise factors over the static heuristic values in
-`magicquant/quant/schemes.py`.
+`magicquant/quant/schemes.py`. The same per-scheme entries may also carry a
+`speed_multiplier` key (read by `calibrated_speed_multiplier`) for whenever a
+real llama-bench speed calibration is merged in -- see that function's
+docstring; `schemes.py`'s static `speed_multiplier` values feed the
+seed-pinned evolution fixture directly (via PredictiveScorer.predict_tps),
+so real-bench corrections route through this opt-in file rather than editing
+the registry.
 
 The file is optional: if it doesn't exist (or is unreadable/malformed), every
 lookup here returns None and callers are expected to fall back to the
@@ -56,12 +63,10 @@ def _load() -> Dict[str, dict]:
     return _cache
 
 
-def calibrated_noise_factor(scheme_name: str) -> Optional[float]:
-    """Return the empirically measured noise_factor for `scheme_name`.
-
-    Returns None if no calibration file exists, the scheme isn't present in
-    it, or the recorded value isn't a finite number.
-    """
+def _calibrated_value(scheme_name: str, key: str) -> Optional[float]:
+    """Shared lookup: read `key` off `scheme_name`'s entry in the calibration
+    file, if present and a finite number. Backs both
+    `calibrated_noise_factor` and `calibrated_speed_multiplier`."""
     data = _load()
     # The calibration tool writes a nested `{"schemes": {name: {...}}}`
     # envelope alongside run metadata (model/corpus/date/baseline_ppl); a
@@ -74,10 +79,35 @@ def calibrated_noise_factor(scheme_name: str) -> Optional[float]:
     if not isinstance(entry, dict):
         return None
 
-    value = entry.get("noise_factor")
+    value = entry.get(key)
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
     if not math.isfinite(value):
         return None
 
     return float(value)
+
+
+def calibrated_noise_factor(scheme_name: str) -> Optional[float]:
+    """Return the empirically measured noise_factor for `scheme_name`.
+
+    Returns None if no calibration file exists, the scheme isn't present in
+    it, or the recorded value isn't a finite number.
+    """
+    return _calibrated_value(scheme_name, "noise_factor")
+
+
+def calibrated_speed_multiplier(scheme_name: str) -> Optional[float]:
+    """Return an empirically measured speed_multiplier for `scheme_name`,
+    if the calibration file's entry for it carries one.
+
+    `tools/calibrate_noise_factors.py` doesn't write this key today (it's a
+    perplexity-only calibration run) -- this is the read side of the same
+    opt-in mechanism for whenever a real llama-bench-driven speed
+    calibration is run and its results are merged into the same JSON file
+    (schemes.py documents the real bench-derived ratios that would go here;
+    see the speed_multiplier comments on Q4_K_M/IQ4_XS/IQ4_NL/MXFP4_MOE).
+    Runtime behavior is opt-in and additive: absent this key, every caller
+    falls back to the static registry value exactly as before.
+    """
+    return _calibrated_value(scheme_name, "speed_multiplier")

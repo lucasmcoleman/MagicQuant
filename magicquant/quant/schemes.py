@@ -42,6 +42,17 @@ class QuantizationScheme:
     category: SchemeCategory = "k_quant"
     is_moe_optimized: bool = False
     requires_imatrix: bool = False    # IQ-quants benefit from importance matrices
+    # Whether ggml's `quantize_<type>` function actually reads the imatrix
+    # pointer when one is passed to `ggml_quantize_chunk` -- distinct from
+    # `requires_imatrix` above, which is about whether the type can run
+    # WITHOUT one at all. A scheme can consume an imatrix without requiring
+    # it (e.g. Q4_K, IQ4_XS: better with one, fine without) or ignore an
+    # imatrix it's handed entirely (MXFP4, Q8_0, float passthroughs -- their
+    # quantize_* functions take a `quant_weights` argument and immediately
+    # discard it, `(void)quant_weights;`/`GGML_UNUSED(quant_weights);` --
+    # verified against ggml/src/ggml-quants.c). True for every k_quant and
+    # iq_quant scheme; False for float/legacy_q/mxfp4/rocmfpx.
+    uses_imatrix: bool = False
     upgrade_neighbor: Optional[str] = None    # name of next-better scheme
     downgrade_neighbor: Optional[str] = None  # name of next-smaller scheme
 
@@ -90,6 +101,7 @@ Q6_K = QuantizationScheme(
     noise_factor=2.2,
     speed_multiplier=2.2,
     category="k_quant",
+    uses_imatrix=True,
     upgrade_neighbor="Q8_0",
     downgrade_neighbor="Q5_K",
 )
@@ -102,6 +114,7 @@ Q5_K = QuantizationScheme(
     noise_factor=3.0,
     speed_multiplier=2.7,
     category="k_quant",
+    uses_imatrix=True,
     upgrade_neighbor="Q6_K",
     downgrade_neighbor="IQ4_NL",
 )
@@ -109,6 +122,16 @@ Q5_K = QuantizationScheme(
 # IQ4_NL: Non-linear lookup table optimized for weight distributions.
 # Lower noise than Q4_K_M despite same bpw because the 16 levels are
 # learned to minimize quantization error on real weight distributions.
+#
+# speed_multiplier=3.2 (near-parity with Q4_K_M's 3.4) does NOT match real
+# hardware: llama-bench on this box (fork, -ngl 99, pp512/tg64, from the
+# Qwopus3.6-27B run) measured an IQ4_NL-dominant hybrid at 122.8 pp512 vs
+# 231.6 for stock Q4_K_M -- roughly HALF the prompt-processing throughput
+# (ratio ~0.53), not the ~94% the current values imply. This value feeds
+# the seed-pinned evolution fixture (PredictiveScorer.predict_tps ->
+# score_hybrid -> survival.py selection) directly, so it is NOT changed
+# here -- see magicquant/quant/calibration.py's calibrated_speed_multiplier
+# for the opt-in route a real calibration file would use instead.
 IQ4_NL = QuantizationScheme(
     name="IQ4_NL",
     ggml_type_name="IQ4_NL",
@@ -117,6 +140,7 @@ IQ4_NL = QuantizationScheme(
     noise_factor=3.8,
     speed_multiplier=3.2,
     category="iq_quant",
+    uses_imatrix=True,
     upgrade_neighbor="Q5_K",
     downgrade_neighbor="MXFP4_MOE",
 )
@@ -125,6 +149,11 @@ IQ4_NL = QuantizationScheme(
 # Non-uniform FP4 levels (0, 0.5, 1, 1.5, 2, 3, 4, 6) are denser near
 # zero, naturally matching the Gaussian-like weight distribution of
 # transformers. Lower noise than integer Q4 at slightly better compression.
+#
+# speed_multiplier=3.8 is UNCHANGED (same fixture constraint as IQ4_NL
+# above), but note for context: the real bench data above didn't include a
+# pure MXFP4-dominant hybrid, so this value hasn't been directly checked
+# against hardware the way Q4_K_M/IQ4_XS/IQ4_NL have been.
 MXFP4_MOE = QuantizationScheme(
     name="MXFP4_MOE",
     ggml_type_name="MXFP4",
@@ -138,6 +167,11 @@ MXFP4_MOE = QuantizationScheme(
     downgrade_neighbor="Q4_K_M",
 )
 
+# speed_multiplier=3.4 is our reference anchor for the real-hardware ratios
+# documented on IQ4_NL/IQ4_XS/MXFP4_MOE above/below: real llama-bench (fork,
+# -ngl 99, pp512, Qwopus3.6-27B run) measured stock Q4_K_M at 231.6 pp512 --
+# the 100% baseline those other schemes' real/registry ratios are quoted
+# against. Also fixture-pinned; not changed here.
 Q4_K_M = QuantizationScheme(
     name="Q4_K_M",
     ggml_type_name="Q4_K",
@@ -146,6 +180,7 @@ Q4_K_M = QuantizationScheme(
     noise_factor=4.5,
     speed_multiplier=3.4,
     category="k_quant",
+    uses_imatrix=True,
     upgrade_neighbor="MXFP4_MOE",
     downgrade_neighbor="Q3_K",
 )
@@ -167,6 +202,7 @@ Q3_K = QuantizationScheme(
     noise_factor=8.0,         # heuristic; calibration pending
     speed_multiplier=4.0,     # ggml SIMD encoders are fast
     category="k_quant",
+    uses_imatrix=True,
     upgrade_neighbor="Q4_K_M",
     downgrade_neighbor="Q2_K",
 )
@@ -179,6 +215,7 @@ Q2_K = QuantizationScheme(
     noise_factor=15.0,        # heuristic; calibration pending
     speed_multiplier=4.5,     # smallest blocks → fastest dispatch
     category="k_quant",
+    uses_imatrix=True,
     upgrade_neighbor="Q3_K",
     downgrade_neighbor=None,  # bottom of current registry; PR3 adds IQ-quants below
 )
@@ -196,6 +233,12 @@ Q2_K = QuantizationScheme(
 #   fp3 = 14 B/blk → 3.5 bpw; fp4 = 18 → 4.5; fp6 = 26 → 6.5; fp8 = 33 → 8.25.
 # noise_factor values are HEURISTIC, slotted next to the K-quant of matching
 # bpw (calibration pending, like Q3_K/Q2_K).
+#
+# uses_imatrix left at the False default: the fork's quantize_* internals
+# for these types haven't been independently verified to consume an
+# imatrix the way stock ggml's K/IQ-quants do (see the `uses_imatrix` field
+# docstring above), so we don't credit them the imatrix noise discount
+# without evidence either way.
 
 ROCMFP8 = QuantizationScheme(
     name="ROCMFP8",
@@ -278,6 +321,17 @@ ROCMFP3 = QuantizationScheme(
 # CRITICAL: only these NEW schemes reference existing registry entries
 # (upward, via upgrade/downgrade_neighbor) — no existing scheme's neighbor
 # fields are modified, so the default mutation chain is unchanged.
+#
+# speed_multiplier: IQ4_XS=3.3 (near-parity with Q4_K_M's 3.4) does NOT match
+# real hardware either -- same real llama-bench run referenced on IQ4_NL
+# above measured an IQ4_XS-dominant hybrid at 119.7 pp512 vs Q4_K_M's 231.6
+# (ratio ~0.52, i.e. roughly HALF, not ~97%). IQ kernels are consistently
+# ~half Q4_K's prompt-processing speed on this ROCm hardware; a real
+# calibration would proportionally scale the rest of the IQ family
+# (IQ3_S/IQ3_XXS/IQ2_S/IQ2_XS/IQ2_XXS/IQ1_M/IQ1_S below) down from their
+# current near-Q4_K_M speed_multipliers by roughly the same ~0.5 ratio. None
+# of these values are changed here (fixture constraint, see Q4_K_M/IQ4_NL
+# above); route real corrections through calibration.calibrated_speed_multiplier.
 
 IQ4_XS = QuantizationScheme(
     name="IQ4_XS",
@@ -288,6 +342,7 @@ IQ4_XS = QuantizationScheme(
     speed_multiplier=3.3,
     category="iq_quant",
     requires_imatrix=False,
+    uses_imatrix=True,
     upgrade_neighbor="MXFP4_MOE",
     downgrade_neighbor="IQ3_S",
 )
@@ -301,6 +356,7 @@ IQ3_S = QuantizationScheme(
     speed_multiplier=3.5,
     category="iq_quant",
     requires_imatrix=False,
+    uses_imatrix=True,
     upgrade_neighbor="IQ4_XS",
     downgrade_neighbor="IQ3_XXS",
 )
@@ -314,6 +370,7 @@ IQ3_XXS = QuantizationScheme(
     speed_multiplier=3.6,
     category="iq_quant",
     requires_imatrix=False,
+    uses_imatrix=True,
     upgrade_neighbor="IQ3_S",
     downgrade_neighbor="Q3_K",
 )
@@ -327,6 +384,7 @@ IQ2_S = QuantizationScheme(
     speed_multiplier=3.7,
     category="iq_quant",
     requires_imatrix=False,
+    uses_imatrix=True,
     upgrade_neighbor="IQ3_XXS",
     downgrade_neighbor="IQ2_XS",
 )
@@ -340,6 +398,7 @@ IQ2_XS = QuantizationScheme(
     speed_multiplier=3.8,
     category="iq_quant",
     requires_imatrix=True,
+    uses_imatrix=True,
     upgrade_neighbor="IQ2_S",
     downgrade_neighbor="IQ2_XXS",
 )
@@ -353,6 +412,7 @@ IQ2_XXS = QuantizationScheme(
     speed_multiplier=3.9,
     category="iq_quant",
     requires_imatrix=True,
+    uses_imatrix=True,
     upgrade_neighbor="IQ2_XS",
     downgrade_neighbor="IQ1_M",
 )
@@ -366,6 +426,7 @@ IQ1_M = QuantizationScheme(
     speed_multiplier=3.95,
     category="iq_quant",
     requires_imatrix=False,
+    uses_imatrix=True,
     upgrade_neighbor="IQ2_XXS",
     downgrade_neighbor="IQ1_S",
 )
@@ -379,6 +440,7 @@ IQ1_S = QuantizationScheme(
     speed_multiplier=4.0,
     category="iq_quant",
     requires_imatrix=True,
+    uses_imatrix=True,
     upgrade_neighbor="IQ1_M",
     downgrade_neighbor=None,
 )
@@ -453,3 +515,57 @@ def get_floor_for_group_class(group_class: str) -> str:
     group_class: "sensitive" or "robust".
     """
     return _GROUP_CLASS_FLOORS[group_class]
+
+
+# ── Imatrix-aware noise scaling ─────────────────────────────────────
+#
+# Ground truth from the completed Qwopus3.6-27B (qwen35 hybrid SSM+attention,
+# MTP) measured search, run with imatrix ON
+# (output/Qwopus3.6-27B-v2-MTP-GGUF/magicquant/search_results.json):
+# predicted_loss overestimated measured_loss by 20-100x across all 7 measured
+# configs (mean_abs_residual ~0.97), but NOT uniformly -- the config leaning
+# on IQ4_XS/IQ4_NL in FFN-up (a `uses_imatrix=True` group) measured 26x below
+# its prediction, the best (lowest) ratio of any config in the run, while
+# configs leaning on MXFP4_MOE in the same slot measured 45-52x below theirs.
+# MXFP4's ggml encoder was independently verified to IGNORE the imatrix
+# pointer entirely (byte-identical output with/without one, 2026-07-04),
+# while Q4_K/Q5_K/IQ4_XS/IQ4_NL's encoders read it and change their output.
+# So under imatrix, IQ/K-quant groups get a real quality boost MXFP4 doesn't,
+# and the static noise_factor table -- which has no imatrix concept -- can't
+# reflect that; left alone, it misranks an IQ/K-quant group as no better than
+# an MXFP4 group of similar nominal noise once an imatrix is active.
+#
+# IMATRIX_NOISE_SCALE=0.85 is a deliberately conservative (not curve-fit)
+# correction: an imatrix-consuming scheme's *effective* noise, once an
+# imatrix is active, is treated as 15% lower than its static registry value.
+# It only nudges the predictor's relative ranking toward what the run showed
+# (imatrix-aware K/IQ beats otherwise-equal MXFP4) rather than asserting a
+# precise magnitude -- the 20-100x scale of the actual overestimate is a
+# separate, much bigger problem than this ranking correction addresses (see
+# tools/fit_noise_factors.py for per-scheme calibration from measured data).
+IMATRIX_NOISE_SCALE = 0.85
+
+
+def effective_noise_factor(
+    scheme: QuantizationScheme,
+    imatrix_active: bool,
+    base_noise_factor: Optional[float] = None,
+) -> float:
+    """Return the noise factor to use for `scheme` given whether an imatrix
+    is active for this search/build.
+
+    `base_noise_factor` lets callers substitute an empirically calibrated
+    value (magicquant.quant.calibration.calibrated_noise_factor) for the
+    static `scheme.noise_factor` while still applying the same
+    imatrix-awareness gating documented at ``IMATRIX_NOISE_SCALE`` above.
+    Defaults to `scheme.noise_factor` when omitted.
+
+    Schemes with `uses_imatrix=False` (MXFP4, rocmfpx, float, legacy Q8_0)
+    are returned unscaled regardless of `imatrix_active`: their ggml encoders
+    ignore the imatrix pointer, so an active imatrix changes nothing about
+    their actual quantization noise.
+    """
+    base = scheme.noise_factor if base_noise_factor is None else base_noise_factor
+    if imatrix_active and scheme.uses_imatrix:
+        return base * IMATRIX_NOISE_SCALE
+    return base
