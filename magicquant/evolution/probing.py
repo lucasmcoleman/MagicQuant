@@ -89,6 +89,20 @@ class SensitivityProber:
 
         Returns:
             Dictionary mapping group -> sensitivity score
+
+        NOTE on the one-ahead build/measure overlap used by
+        ``MagicQuantOrchestrator.run_measured_search`` (see orchestrator.py):
+        it is NOT applied here. There, building the next candidate GGUF and
+        measuring the current one are already two separate top-level calls
+        in the loop body, so overlapping them is a small change. Here,
+        ``_probe_single_group`` -> ``_real_probe`` builds, measures, AND
+        cleans up its probe file all inside one method (with a ``finally``
+        that deletes the probe GGUF right after measuring it) -- prefetching
+        group i+1's build while group i measures would require splitting
+        ``_real_probe`` into separate build/measure phases and threading a
+        shared build-ahead queue through this loop, which is a real
+        restructuring, not a small one. Left sequential; each probe still
+        cleans up its own temporary GGUF immediately after use.
         """
         if verbose:
             print("Running Sensitivity Probes")

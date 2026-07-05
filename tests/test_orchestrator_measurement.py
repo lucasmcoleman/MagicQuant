@@ -239,6 +239,174 @@ def test_measured_search_save_base_logits_failure_falls_back_to_standalone_basel
         assert "kl" not in info
 
 
+# ── Feature 3: one-ahead build/measure overlap ──────────────────────────────
+
+
+def test_measured_search_overlaps_build_with_measurement(tmp_path, monkeypatch):
+    """While candidate i's (GPU-bound) measurement runs, candidate i+1's
+    (CPU-bound) build must already be underway on a background thread --
+    not waiting for i's measurement to finish first."""
+    import threading
+    import time as _time
+
+    monkeypatch.setattr(source_mod, "open_model_source", lambda *a, **k: _FakeSource())
+    orch = MagicQuantOrchestrator(
+        source_model_path=str(tmp_path / "nonexistent.gguf"),
+        output_dir=str(tmp_path / "out"),
+    )
+
+    events = []
+    lock = threading.Lock()
+
+    def log_event(name):
+        with lock:
+            events.append(name)
+
+    candidates_dir = tmp_path / "candidates"
+    candidates_dir.mkdir()
+    counter = {"n": 0}
+
+    def fake_build_candidate(config, name, base_quant):
+        log_event(f"build_start:{name}")
+        counter["n"] += 1
+        p = candidates_dir / f"{name}_{counter['n']}.gguf"
+        p.write_bytes(b"0" * 1024)
+        log_event(f"build_end:{name}")
+        return str(p)
+
+    monkeypatch.setattr(orch, "_build_candidate", fake_build_candidate)
+
+    class _FakeLlamaToolsOverlap:
+        ctx_size = 512
+
+        def calculate_perplexity(self, path, verbose=False, **kw):
+            # The baseline pass (Step 1c) also calls calculate_perplexity,
+            # over the source model rather than a candidate GGUF -- exclude
+            # it from the logged events so the overlap assertions below only
+            # reason about per-candidate measurements.
+            is_candidate = str(candidates_dir) in path
+            if is_candidate:
+                log_event(f"measure_start:{path}")
+            # Measurement (GPU-bound subprocess) is much slower than a build
+            # (CPU-bound, near-instant fake) -- gives the prefetch a real
+            # window to demonstrably start/finish inside it.
+            _time.sleep(0.2)
+            if is_candidate:
+                log_event(f"measure_end:{path}")
+            return 5.0
+
+        def _resolve_data_file(self, data_file=None):
+            return "/fake/corpus.txt"
+
+    orch._llama_tools = _FakeLlamaToolsOverlap()
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=3, verbose=False,
+        seed_incumbents=False,
+    )
+
+    assert len(orch._measured) >= 2, "need at least 2 real candidates to observe overlap"
+
+    build_starts = [e for e in events if e.startswith("build_start:")]
+    build_ends = [e for e in events if e.startswith("build_end:")]
+    measure_starts = [e for e in events if e.startswith("measure_start:")]
+    measure_ends = [e for e in events if e.startswith("measure_end:")]
+    assert len(build_starts) >= 2
+    assert len(measure_ends) >= 2
+
+    # Core overlap assertion: the SECOND build (the one-ahead prefetch for
+    # candidate 2) must both start AND finish before the FIRST measurement
+    # completes -- proving it ran concurrently with that measurement rather
+    # than serially after it.
+    idx_measure_end_1 = events.index(measure_ends[0])
+    idx_build_start_2 = events.index(build_starts[1])
+    idx_build_end_2 = events.index(build_ends[1])
+    assert idx_build_start_2 < idx_measure_end_1
+    assert idx_build_end_2 < idx_measure_end_1
+
+    # Results ordering identical to serial: measurements are still consumed
+    # on the main thread in candidate order (1, 2, 3, ...), never reordered.
+    assert measure_starts == sorted(measure_starts, key=events.index)
+    assert [e.split(":", 1)[1] for e in measure_starts] == sorted(
+        (e.split(":", 1)[1] for e in measure_starts), key=lambda p: events.index(f"measure_start:{p}")
+    )
+
+
+def test_measured_search_overlap_build_failure_for_one_candidate_only_skips_that_one(tmp_path, monkeypatch):
+    """A build failure for any one candidate (whether it happened to be
+    prefetched ahead or not) must surface exactly like the historical
+    serial loop: logged and skipped, without killing the rest of the
+    search."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    real_build = orch._build_candidate
+
+    def flaky_build(config, name, base_quant):
+        if "candidate2" in name:
+            return None
+        return real_build(config, name, base_quant)
+
+    monkeypatch.setattr(orch, "_build_candidate", flaky_build)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=3, verbose=False,
+        seed_incumbents=False,
+    )
+
+    # The other candidates must still have been measured despite candidate
+    # 2's build failing.
+    assert len(orch._measured) >= 2
+
+
+def test_measured_search_overlap_cleans_up_prefetched_build_on_exception(tmp_path, monkeypatch):
+    """If something raises while processing candidate i (after its build
+    already prefetched candidate i+1's), the in-flight/finished prefetch
+    build for i+1 must be joined and its candidate GGUF deleted -- the
+    candidates dir must never leak a build that was never consumed.
+
+    (Candidate i's OWN file may still leak in this scenario -- its cleanup
+    line never runs when an exception fires before reaching it, exactly
+    like the pre-existing serial loop. Only the ONE-AHEAD prefetch's
+    cleanup is this feature's contract.)
+    """
+    from magicquant.evolution.predictor import PredictiveScorer
+
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+
+    built_paths = []
+    real_build = orch._build_candidate
+
+    def tracking_build(config, name, base_quant):
+        p = real_build(config, name, base_quant)
+        built_paths.append(p)
+        return p
+
+    monkeypatch.setattr(orch, "_build_candidate", tracking_build)
+
+    calls = {"n": 0}
+    original_record_residual = PredictiveScorer.record_residual
+
+    def flaky_record_residual(self, config, residual):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated mid-processing failure")
+        return original_record_residual(self, config, residual)
+
+    monkeypatch.setattr(PredictiveScorer, "record_residual", flaky_record_residual)
+
+    with pytest.raises(RuntimeError, match="simulated mid-processing failure"):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=3, verbose=False,
+            seed_incumbents=False,
+        )
+
+    assert len(built_paths) >= 2, "expected the current candidate's build plus its one-ahead prefetch"
+    from pathlib import Path as _Path
+    assert not _Path(built_paths[1]).exists(), "the prefetched (never-consumed) build must be cleaned up"
+
+
 def test_enable_imatrix_reaches_candidate_builds(tmp_path, monkeypatch):
     orch, _ = _make_orchestrator(tmp_path, monkeypatch)
     fake_imatrix = {"blk.0.attn_q.weight": object()}

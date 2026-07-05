@@ -10,6 +10,7 @@ The core loop:
 6. Output the best verified survivor per tier
 """
 
+import concurrent.futures
 import json
 import os
 import time
@@ -559,133 +560,205 @@ class MagicQuantOrchestrator:
                     count=len(to_measure),
                 )
 
-            # 4c. Build, measure, learn
-            for i, candidate in enumerate(to_measure):
-                config = candidate["config"]
-                config_key = self._config_key(config)
+            # 4c. Build, measure, learn.
+            #
+            # One-ahead pipeline: candidate i+1's CPU-bound GGUF build runs
+            # on a single background thread while candidate i's GPU-bound
+            # measurement subprocess runs on the main thread. Everything
+            # that touches shared state -- self._measured, predictor
+            # feedback, checkpoint writes -- stays on the main thread, in
+            # the same order as the historical serial loop; only the BUILD
+            # step moves off it, one candidate ahead.
+            #
+            # Thread-safety: a background build only reads self._imatrix
+            # (a plain dict of numpy arrays populated once before this loop
+            # and never mutated afterward -- safe to read concurrently) and
+            # writes to an output path unique to its own candidate index. No
+            # other shared mutable state is touched by _build_candidate.
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-                # Skip if already measured
-                if config_key in self._measured:
+            def _submit_build(idx: int):
+                """Submit candidate idx's build unless it's out of range or
+                already measured (dedupe BEFORE submitting, same as the
+                historical serial loop). Returns (future, config, config_key)
+                or None."""
+                if idx >= len(to_measure):
+                    return None
+                cfg = to_measure[idx]["config"]
+                key = self._config_key(cfg)
+                if key in self._measured:
+                    return None
+                name = f"round{round_idx+1}_candidate{idx+1}"
+                future = executor.submit(self._build_candidate, cfg, name, target_base_quant)
+                return (future, cfg, key)
+
+            pending = _submit_build(0)
+            try:
+                for i, candidate in enumerate(to_measure):
+                    config = candidate["config"]
+                    config_key = self._config_key(config)
+
+                    job = pending
+                    # Prefetch the NEXT candidate's build now, so it overlaps
+                    # with this candidate's measurement below -- at most one
+                    # extra candidate GGUF on disk at a time (prefetch depth 1).
+                    pending = _submit_build(i + 1)
+
+                    # Skip if already measured (mirrors the historical guard;
+                    # _submit_build applies the identical check before ever
+                    # submitting a build for this index, so no orphaned build
+                    # exists for a skipped candidate).
+                    if config_key in self._measured:
+                        if verbose:
+                            log.debug(
+                                "Candidate already measured, skipping",
+                                stage="measurement",
+                                progress=f"{i+1}/{len(to_measure)}",
+                            )
+                        continue
+
                     if verbose:
-                        log.debug(
-                            "Candidate already measured, skipping",
+                        schemes = " ".join(f"{g}:{s}" for g, s in sorted(config.items()))
+                        log.info(
+                            "Building candidate",
                             stage="measurement",
                             progress=f"{i+1}/{len(to_measure)}",
+                            schemes=schemes,
                         )
-                    continue
 
-                if verbose:
-                    schemes = " ".join(f"{g}:{s}" for g, s in sorted(config.items()))
-                    log.info(
-                        "Building candidate",
-                        stage="measurement",
-                        progress=f"{i+1}/{len(to_measure)}",
-                        schemes=schemes,
-                    )
-
-                # Build GGUF
-                model_name = f"round{round_idx+1}_candidate{i+1}"
-                path = self._build_candidate(config, model_name, target_base_quant)
-
-                if path is None:
-                    continue
-
-                # Measure perplexity, fusing in the KL pass when active: a
-                # --kl-divergence run against saved base logits ALSO prints
-                # this candidate's own perplexity (Mean PPL(Q)), so when KL
-                # scoring is active we get both signals from ONE
-                # llama-perplexity invocation instead of two. Falls back to
-                # the historical standalone calculate_perplexity call when
-                # KL is off, its base logits aren't active, the KL call
-                # raised, or its result doesn't carry "ppl" -- the "KL
-                # failure must not abort/win" guarantee stays intact either
-                # way (measured entry gets ppl either way, "kl" only
-                # recorded when the KL call itself succeeded).
-                kl_result = None
-                if enable_kl and self._kl_base_logits_path:
+                    # job is None only if this index was already measured at
+                    # submit time -- but that's exactly the branch just above,
+                    # so reaching here always has a real in-flight/finished build.
+                    _future, _cfg, _key = job
                     try:
-                        kl_result = self.llama_tools.calculate_kl_divergence(
-                            path, self._kl_base_logits_path, self._kl_corpus_path,
-                            ctx_size=self.llama_tools.ctx_size,
-                        )
+                        path = _future.result()
                     except Exception as exc:
-                        log.warning(
-                            "KL-divergence measurement failed for candidate; "
-                            "continuing without it", stage="kl", error=str(exc),
-                        )
-                        kl_result = None
+                        # _build_candidate already catches its own exceptions
+                        # and returns None on failure -- this only fires for
+                        # something escaping that (e.g. a cancelled/aborted
+                        # future), and must degrade the same way: log + skip
+                        # without killing the rest of the search.
+                        log.error("Build failed", stage="build", error=str(exc), exc_info=exc)
+                        path = None
 
-                if kl_result is not None and kl_result.get("ppl") is not None:
-                    ppl = kl_result["ppl"]
-                else:
-                    ppl = self.llama_tools.calculate_perplexity(path, verbose=verbose)
+                    if path is None:
+                        continue
 
-                if ppl is not None:
-                    measured_loss = (ppl - self.baseline_ppl) / self.baseline_ppl
-                    predicted_loss = self.predictor.predict_loss(config)
-                    residual = measured_loss - predicted_loss
-
-                    # Record measurement
-                    candidate_path = Path(path)
-                    self._measured[config_key] = {
-                        "config": config,
-                        "ppl": ppl,
-                        "measured_loss": measured_loss,
-                        "predicted_loss": predicted_loss,
-                        "residual": residual,
-                        "path": path,
-                        "size_gb": candidate_path.stat().st_size / (1024 ** 3),
-                    }
-                    if config_key in incumbent_tier_by_key:
-                        self._measured[config_key]["incumbent"] = (
-                            incumbent_tier_by_key[config_key]
-                        )
-
-                    if kl_result is not None:
-                        self._measured[config_key]["kl"] = kl_result
-
-                    # Optional secondary signal -- best-effort (None on
-                    # failure), scored in _select_final_survivors alongside
-                    # measured_loss rather than gating the candidate at all.
-                    # bench() only catches CalledProcessError/TimeoutExpired
-                    # internally; a missing or wrong-arch binary raises
-                    # OSError/FileNotFoundError, which must not abort the
-                    # rest of the search.
-                    if enable_speed_bench:
+                    # Measure perplexity, fusing in the KL pass when active: a
+                    # --kl-divergence run against saved base logits ALSO
+                    # prints this candidate's own perplexity (Mean PPL(Q)), so
+                    # when KL scoring is active we get both signals from ONE
+                    # llama-perplexity invocation instead of two. Falls back
+                    # to the historical standalone calculate_perplexity call
+                    # when KL is off, its base logits aren't active, the KL
+                    # call raised, or its result doesn't carry "ppl" -- the
+                    # "KL failure must not abort/win" guarantee stays intact
+                    # either way (measured entry gets ppl either way, "kl"
+                    # only recorded when the KL call itself succeeded).
+                    kl_result = None
+                    if enable_kl and self._kl_base_logits_path:
                         try:
-                            self._measured[config_key]["bench"] = self.llama_tools.bench(path)
+                            kl_result = self.llama_tools.calculate_kl_divergence(
+                                path, self._kl_base_logits_path, self._kl_corpus_path,
+                                ctx_size=self.llama_tools.ctx_size,
+                            )
                         except Exception as exc:
                             log.warning(
-                                "Speed bench failed for candidate; continuing "
-                                "without it", stage="bench", error=str(exc),
+                                "KL-divergence measurement failed for candidate; "
+                                "continuing without it", stage="kl", error=str(exc),
+                            )
+                            kl_result = None
+
+                    if kl_result is not None and kl_result.get("ppl") is not None:
+                        ppl = kl_result["ppl"]
+                    else:
+                        ppl = self.llama_tools.calculate_perplexity(path, verbose=verbose)
+
+                    if ppl is not None:
+                        measured_loss = (ppl - self.baseline_ppl) / self.baseline_ppl
+                        predicted_loss = self.predictor.predict_loss(config)
+                        residual = measured_loss - predicted_loss
+
+                        # Record measurement
+                        candidate_path = Path(path)
+                        self._measured[config_key] = {
+                            "config": config,
+                            "ppl": ppl,
+                            "measured_loss": measured_loss,
+                            "predicted_loss": predicted_loss,
+                            "residual": residual,
+                            "path": path,
+                            "size_gb": candidate_path.stat().st_size / (1024 ** 3),
+                        }
+                        if config_key in incumbent_tier_by_key:
+                            self._measured[config_key]["incumbent"] = (
+                                incumbent_tier_by_key[config_key]
                             )
 
-                    # Active learning: feed residual back
-                    self.predictor.record_residual(config, residual)
+                        if kl_result is not None:
+                            self._measured[config_key]["kl"] = kl_result
 
-                    if verbose:
-                        log.info(
-                            "Candidate measured",
-                            stage="measurement",
-                            ppl=round(ppl, 4),
-                            measured_loss=round(measured_loss, 4),
-                            predicted_loss=round(predicted_loss, 4),
-                            residual=round(residual, 4),
-                        )
+                        # Optional secondary signal -- best-effort (None on
+                        # failure), scored in _select_final_survivors
+                        # alongside measured_loss rather than gating the
+                        # candidate at all. bench() only catches
+                        # CalledProcessError/TimeoutExpired internally; a
+                        # missing or wrong-arch binary raises
+                        # OSError/FileNotFoundError, which must not abort the
+                        # rest of the search.
+                        if enable_speed_bench:
+                            try:
+                                self._measured[config_key]["bench"] = self.llama_tools.bench(path)
+                            except Exception as exc:
+                                log.warning(
+                                    "Speed bench failed for candidate; continuing "
+                                    "without it", stage="bench", error=str(exc),
+                                )
 
-                    # Persist after EVERY successful measurement -- a kill
-                    # right after this point must resume with this candidate
-                    # already recorded, not lost.
-                    self._write_measured_checkpoint(checkpoint_path)
-                else:
-                    if verbose:
-                        log.warning("Measurement failed", stage="measurement")
+                        # Active learning: feed residual back
+                        self.predictor.record_residual(config, residual)
 
-                # Clean up candidate GGUF to save disk (keep only final survivors)
-                # We'll rebuild the final survivors at the end
-                candidate_file = Path(path)
-                if candidate_file.exists():
-                    candidate_file.unlink()
+                        if verbose:
+                            log.info(
+                                "Candidate measured",
+                                stage="measurement",
+                                ppl=round(ppl, 4),
+                                measured_loss=round(measured_loss, 4),
+                                predicted_loss=round(predicted_loss, 4),
+                                residual=round(residual, 4),
+                            )
+
+                        # Persist after EVERY successful measurement -- a kill
+                        # right after this point must resume with this candidate
+                        # already recorded, not lost.
+                        self._write_measured_checkpoint(checkpoint_path)
+                    else:
+                        if verbose:
+                            log.warning("Measurement failed", stage="measurement")
+
+                    # Clean up candidate GGUF to save disk (keep only final survivors)
+                    # We'll rebuild the final survivors at the end
+                    candidate_file = Path(path)
+                    if candidate_file.exists():
+                        candidate_file.unlink()
+            finally:
+                # Any prefetched build still outstanding (e.g. we're bailing
+                # out via an exception raised somewhere above) must be
+                # joined and its candidate GGUF cleaned up -- the candidates
+                # dir must never leak a finished-but-unconsumed prefetch
+                # build.
+                if pending is not None:
+                    _future, _cfg, _key = pending
+                    _future.cancel()
+                    try:
+                        _leaked_path = _future.result()
+                    except Exception:
+                        _leaked_path = None
+                    if _leaked_path:
+                        _leaked = Path(_leaked_path)
+                        if _leaked.exists():
+                            _leaked.unlink()
+                executor.shutdown(wait=True)
 
             # 4d. Log round summary
             if verbose and self._measured:
