@@ -208,6 +208,7 @@ class MagicQuantOrchestrator:
         kl_weight: float = 0.1,
         enable_speed_bench: bool = False,
         measurement_chunks: Optional[int] = None,
+        seed_incumbents: bool = True,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run the full Predict -> Measure -> Learn loop.
@@ -242,6 +243,17 @@ class MagicQuantOrchestrator:
                 (overrides LlamaCppTools' own MAGICQUANT_PPL_CHUNKS env
                 fallback when set). None (default) measures the whole
                 corpus every pass.
+            seed_incumbents: seed the evolutionary search (every round) with
+                llama.cpp's own Q4_K_M/Q5_K_M/Q6_K incumbent mixtures (see
+                ``magicquant.incumbents``), restricted to the groups this
+                search actually varies. On by default so a measured run can
+                never silently lose to "what stock llama-quantize would have
+                done anyway" (see magicquant.incumbents' module docstring for
+                the real run that motivated this). Round 1 additionally
+                force-measures every incumbent ahead of the normal
+                tier-winner/epsilon picks (deduped against them), so every
+                run records a real measurement for each one -- those entries
+                carry an "incumbent": tier tag in search_results.json.
 
         Returns:
             (all_configs, tiered_best) where tiered_best maps tier names
@@ -376,6 +388,15 @@ class MagicQuantOrchestrator:
             imatrix_active=self._imatrix is not None,
         )
 
+        # ── Step 3b: incumbent seeding ──
+        # Build llama.cpp's own Q4_K_M/Q5_K_M/Q6_K mixtures (restricted to the
+        # groups this search actually varies) so the evolutionary search is
+        # anchored to "what stock llama-quantize would have done anyway" --
+        # see magicquant.incumbents' module docstring for why this matters.
+        seed_configs, incumbent_tier_by_key = self._build_incumbent_seeds(
+            seed_incumbents
+        )
+
         # ── Step 4: Measured search rounds ──
         all_configs = []
 
@@ -400,7 +421,8 @@ class MagicQuantOrchestrator:
             )
 
             round_configs = survivor.run_evolution(
-                groups=self._search_groups, verbose=verbose, patience=patience
+                groups=self._search_groups, verbose=verbose, patience=patience,
+                seed_configs=seed_configs if seed_configs else None,
             )
             all_configs.extend(round_configs)
 
@@ -408,6 +430,24 @@ class MagicQuantOrchestrator:
             to_measure = self._select_measurement_candidates(
                 round_configs, baseline_size_gb, candidates_per_round
             )
+
+            # Round 1 force-measures every incumbent ahead of the normal
+            # picks (deduped against them and against anything already
+            # measured), so every run records a real measurement for "what
+            # stock llama-quantize would have done" regardless of whether
+            # the evolutionary search happened to rediscover it on its own.
+            if round_idx == 0 and seed_configs:
+                already_key = {
+                    self._config_key(c["config"]) for c in to_measure
+                }
+                forced = []
+                for cfg in seed_configs:
+                    key = self._config_key(cfg)
+                    if key in already_key or key in self._measured:
+                        continue
+                    already_key.add(key)
+                    forced.append({"config": cfg})
+                to_measure = forced + to_measure
 
             if verbose:
                 log.info(
@@ -466,6 +506,10 @@ class MagicQuantOrchestrator:
                         "path": path,
                         "size_gb": candidate_path.stat().st_size / (1024 ** 3),
                     }
+                    if config_key in incumbent_tier_by_key:
+                        self._measured[config_key]["incumbent"] = (
+                            incumbent_tier_by_key[config_key]
+                        )
 
                     # Optional secondary signals -- both best-effort (None on
                     # failure), scored in _select_final_survivors alongside
@@ -574,25 +618,49 @@ class MagicQuantOrchestrator:
         baseline_gb: float,
         n: int,
     ) -> List[Dict]:
-        """Pick the best candidates to actually build and measure."""
-        # Get tier winners
+        """Pick the best candidates to actually build and measure.
+
+        Every discovered tier band contributes its winner unconditionally --
+        tier winners are never truncated away by a small ``n`` or crowded
+        out by epsilon-greedy random picks. ``n`` caps the *epsilon*
+        exploration budget on top of the guaranteed tier winners, not the
+        total: if more tiers were discovered than ``n``, every tier winner
+        still ships (this round just measures more than ``n`` candidates).
+        """
         tiered = self._pick_best_per_tier(configs, baseline_gb)
-        candidates = list(tiered.values())
+        tier_winners = list(tiered.values())
+        winner_keys = {self._config_key(c["config"]) for c in tier_winners}
 
-        # Add epsilon-greedy: random picks that might be surprise winners
-        import random
-        remaining = [c for c in configs if c not in candidates]
-        if remaining and len(candidates) < n:
-            random.shuffle(remaining)
-            candidates.extend(remaining[:n - len(candidates)])
-
-        # Skip already-measured configs
-        candidates = [
-            c for c in candidates
+        # Tier winners already measured in a prior round don't need a
+        # rebuild, but they still "count" as covering their band.
+        to_build = [
+            c for c in tier_winners
             if self._config_key(c["config"]) not in self._measured
         ]
 
-        return candidates[:n]
+        # Epsilon-greedy: random picks from the rest of the discovered pool,
+        # filling up to n total on top of the guaranteed tier winners.
+        import random
+        remaining = [
+            c for c in configs
+            if self._config_key(c["config"]) not in winner_keys
+            and self._config_key(c["config"]) not in self._measured
+        ]
+        budget = max(0, n - len(to_build))
+        if remaining and budget:
+            random.shuffle(remaining)
+            seen = {self._config_key(c["config"]) for c in to_build}
+            for c in remaining:
+                key = self._config_key(c["config"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                to_build.append(c)
+                budget -= 1
+                if budget <= 0:
+                    break
+
+        return to_build
 
     def _build_candidate(
         self, config: Dict[str, str], name: str, base_quant: str
@@ -733,6 +801,7 @@ class MagicQuantOrchestrator:
                     "size_gb": v.get("size_gb"),
                     "kl": v.get("kl"),
                     "bench": v.get("bench"),
+                    "incumbent": v.get("incumbent"),
                 }
                 for k, v in self._measured.items()
             },
@@ -777,6 +846,7 @@ class MagicQuantOrchestrator:
         use_imatrix: bool = False,
         imatrix_corpus: Optional[str] = None,
         measurement_chunks: Optional[int] = None,
+        seed_incumbents: bool = True,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run prediction-only evolutionary search (no real measurements).
@@ -792,6 +862,12 @@ class MagicQuantOrchestrator:
         this many ctx_size-token chunks instead of the whole corpus.
         Symmetric with run_measured_search's knob of the same name; a no-op
         when llama.cpp is unavailable (no baseline pass runs at all).
+
+        seed_incumbents: same seeding as run_measured_search (see its
+        docstring and magicquant.incumbents), minus the force-measurement --
+        this path never measures anything real, it only seeds the
+        evolutionary search's population so the incumbent mixtures are
+        always among the discovered/scored configs. On by default.
         """
         self._apply_seed(seed)
         if use_imatrix:
@@ -875,6 +951,10 @@ class MagicQuantOrchestrator:
             imatrix_active=self._imatrix is not None,
         )
 
+        seed_configs, _incumbent_tier_by_key = self._build_incumbent_seeds(
+            seed_incumbents
+        )
+
         survivor = EvolutionarySurvivor(
             predictor=self.predictor,
             baseline_config={"E": "BF16", "H": "BF16"},
@@ -886,7 +966,8 @@ class MagicQuantOrchestrator:
         )
 
         best_configs = survivor.run_evolution(
-            groups=self._search_groups, verbose=verbose, patience=patience
+            groups=self._search_groups, verbose=verbose, patience=patience,
+            seed_configs=seed_configs if seed_configs else None,
         )
         tiered = self._pick_best_per_tier(best_configs, baseline_size_gb)
 
@@ -1031,6 +1112,41 @@ class MagicQuantOrchestrator:
     @staticmethod
     def _config_key(config: Dict[str, str]) -> str:
         return "|".join(f"{g}:{config[g]}" for g in sorted(config))
+
+    def _build_incumbent_seeds(
+        self, seed_incumbents: bool
+    ) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
+        """Build llama.cpp's own per-tier incumbent mixtures (see
+        ``magicquant.incumbents``), restricted to the groups this search
+        actually varies (``self._search_groups``, which must already be set
+        by the time this is called).
+
+        Returns ``(seed_configs, incumbent_tier_by_key)``: the restricted
+        config dicts to feed straight into
+        ``EvolutionarySurvivor.run_evolution(seed_configs=...)``, and a
+        ``config_key -> tier`` map used to tag forced measurements as
+        ``"incumbent"`` in search_results.json. Both are empty when
+        ``seed_incumbents`` is False.
+        """
+        seed_configs: List[Dict[str, str]] = []
+        incumbent_tier_by_key: Dict[str, str] = {}
+        if not seed_incumbents:
+            return seed_configs, incumbent_tier_by_key
+
+        from magicquant.incumbents import get_incumbent_config, INCUMBENT_TIERS
+
+        for tier in ["Q4", "Q5", "Q6"]:
+            if tier not in INCUMBENT_TIERS:
+                continue
+            incumbent = get_incumbent_config(tier)
+            restricted = {
+                g: s for g, s in incumbent.items() if g in self._search_groups
+            }
+            if not restricted:
+                continue
+            seed_configs.append(restricted)
+            incumbent_tier_by_key[self._config_key(restricted)] = tier
+        return seed_configs, incumbent_tier_by_key
 
     @staticmethod
     def _classify_tier(size_gb: float, baseline_gb: float) -> str:

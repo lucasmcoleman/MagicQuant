@@ -20,11 +20,18 @@ import copy
 from magicquant.quant.schemes import (
     get_all_schemes, get_scheme_by_name, get_floor_for_group_class
 )
+from magicquant.quant.tiers import classify_tier
+from magicquant.logging import get_logger
+
+log = get_logger(__name__)
 
 
 # Ordered from highest quality (lowest noise) to most compressed (highest noise).
 # Derived from the canonical scheme registry — see magicquant.quant.schemes.
 SCHEME_QUALITY_ORDER: List[str] = [s.name for s in get_all_schemes()]
+
+# Set form of the same registry, for O(1) seed-config scheme validation.
+_KNOWN_SCHEME_NAMES = frozenset(SCHEME_QUALITY_ORDER)
 
 
 class EvolutionarySurvivor:
@@ -138,6 +145,7 @@ class EvolutionarySurvivor:
         verbose: bool = True,
         patience: Optional[int] = None,
         min_improvement: float = 1e-4,
+        seed_configs: Optional[List[Dict[str, str]]] = None,
     ) -> List[Dict]:
         """Run the evolutionary search.
 
@@ -152,17 +160,55 @@ class EvolutionarySurvivor:
                 seed-pinned refactor-regression fixture stable.
             min_improvement: minimum increase in the best composite_score that
                 counts as progress for the patience counter.
+            seed_configs: externally-supplied group-configs (e.g. llama.cpp's
+                own incumbent mixtures, see ``magicquant.incumbents``) to
+                inject into the initial population alongside the normal seeds.
+                Each config is validated -- every scheme name must exist in
+                the registry, else the whole config is logged and skipped
+                (a partially-repaired seed isn't a meaningful one). Validated
+                seeds are also scored and recorded into the returned
+                discovered-configs list immediately, so they're always
+                scoreable candidates even if a later generation's tournament
+                never re-selects them as a tier winner. ``None`` (the
+                default) injects nothing and leaves this byte-identical to
+                the historical behavior -- required for the seed-pinned
+                refactor-regression fixture.
         """
         if groups is None:
             groups = self.DEFAULT_GROUPS
 
         population = self._initialize_population(groups)
 
+        validated_seeds = self._validate_seed_configs(seed_configs) if seed_configs else []
+        if validated_seeds:
+            population = [
+                {'config': copy.deepcopy(c)} for c in validated_seeds
+            ] + population
+
         if verbose:
             print(f"Initialized population of {len(population)} candidates")
 
         best_configs = []
         seen_keys = set()  # O(1) membership instead of O(n*m) re-serialization
+
+        if validated_seeds:
+            # Score seeds immediately and record them as discovered configs
+            # right away -- guarantees they're in the returned list even if
+            # they never win a tournament (e.g. crowded out by mutants in a
+            # tier that already has 3 stronger candidates).
+            scored_seeds = self._predict_population(
+                [{'config': copy.deepcopy(c)} for c in validated_seeds]
+            )
+            baseline_gb = self.predictor.baseline_size_gb
+            for cand in scored_seeds:
+                key = str(sorted(cand['config'].items()))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                cand['tier'] = classify_tier(
+                    cand.get('predicted_size_gb', 0), baseline_gb
+                )
+                best_configs.append(cand)
 
         best_score_so_far = float("-inf")
         gens_without_improvement = 0
@@ -219,6 +265,28 @@ class EvolutionarySurvivor:
 
         best_configs.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
         return best_configs
+
+    @staticmethod
+    def _validate_seed_configs(
+        seed_configs: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        """Validate externally-injected seed configs before admitting them to
+        the population: every scheme name must exist in the registry. A
+        config carrying even one unknown scheme is logged and dropped whole
+        -- a seed's value is in its complete per-group layout, not a
+        partially-repaired guess.
+        """
+        validated = []
+        for cfg in seed_configs:
+            unknown = [s for s in cfg.values() if s not in _KNOWN_SCHEME_NAMES]
+            if unknown:
+                log.warning(
+                    "Seed config has unknown scheme(s), skipping",
+                    config=cfg, unknown=unknown,
+                )
+                continue
+            validated.append(dict(cfg))
+        return validated
 
     # ------------------------------------------------------------------
     # Population initialization
