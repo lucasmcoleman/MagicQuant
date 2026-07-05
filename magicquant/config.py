@@ -45,6 +45,10 @@ class MagicQuantSettings(BaseSettings):
     enable_rocmfpx: bool = False
     enable_iq: bool = False
     seed: Optional[int] = None
+    # Cap on ctx_size-token chunks per perplexity/KL pass during a measured
+    # search (forwarded to LlamaCppTools.ppl_chunks, overriding its own
+    # MAGICQUANT_PPL_CHUNKS env fallback when set). None = whole corpus.
+    measurement_chunks: Optional[int] = None
 
     model_config = {
         "env_prefix": "MAGICQUANT_",
