@@ -602,3 +602,30 @@ def test_calculate_perplexity_ngl_actually_offloads_to_gpu(tmp_path):
     ppl = tools.calculate_perplexity(_TINY_MODEL, data_file=str(corpus), ctx_size=128)
     assert ppl is not None
     assert ppl > 0
+
+
+def test_resolve_data_file_falls_back_to_bundled_corpus(tmp_path, capsys):
+    """A llama.cpp dir with no wikitext nearby must fall back to the bundled
+    calibration corpus (with a warning) instead of returning None -- an
+    otherwise-valid measured search died on this when llamacpp_path pointed
+    at a ROCmFPX build dir (2026-07-04)."""
+    from magicquant.imatrix import DEFAULT_CORPUS_PATH
+
+    tools = LlamaCppTools.__new__(LlamaCppTools)
+    tools.llamacpp_path = str(tmp_path / "fork-build")
+    tools.data_file = None
+
+    resolved = tools._resolve_data_file(None)
+    assert resolved == str(DEFAULT_CORPUS_PATH.resolve())
+    assert "falling back to the bundled calibration corpus" in capsys.readouterr().out
+
+
+def test_resolve_data_file_still_prefers_wikitext(tmp_path):
+    wiki = tmp_path / "wikitext-2-raw" / "wiki.test.raw"
+    wiki.parent.mkdir(parents=True)
+    wiki.write_text("real corpus")
+
+    tools = LlamaCppTools.__new__(LlamaCppTools)
+    tools.llamacpp_path = str(tmp_path)
+    tools.data_file = None
+    assert tools._resolve_data_file(None) == str(wiki.resolve())

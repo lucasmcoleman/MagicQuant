@@ -189,6 +189,27 @@ class LlamaCppTools:
             if p.is_file():
                 return str(p.resolve())
 
+        # Last resort: MagicQuant's bundled calibration corpus. Much smaller
+        # than wikitext (noisier per-candidate PPL, though baseline and
+        # candidates stay internally comparable since they share it), but far
+        # better than aborting a configured run because this particular
+        # llama.cpp build dir doesn't happen to have wikitext next to it
+        # (bit for real when llamacpp_path pointed at a ROCmFPX build dir).
+        try:
+            from magicquant.imatrix import DEFAULT_CORPUS_PATH
+
+            if DEFAULT_CORPUS_PATH.is_file():
+                print(
+                    f"WARNING: no wikitext corpus found near {self.llamacpp_path} "
+                    f"-- falling back to the bundled calibration corpus "
+                    f"({DEFAULT_CORPUS_PATH.name}). For stabler perplexity "
+                    "comparisons, place wikitext-2-raw/wiki.test.raw in the "
+                    "llama.cpp dir or pass data_file=<path>."
+                )
+                return str(DEFAULT_CORPUS_PATH.resolve())
+        except ImportError:
+            pass
+
         # Nothing found -- print a clear message
         print(
             "ERROR: No perplexity data file found.\n"
