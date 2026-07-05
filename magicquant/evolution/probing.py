@@ -59,6 +59,14 @@ class SensitivityProber:
         self.sensitivity_results: Dict[str, float] = {}
         self.probe_models: List[Dict] = []
 
+        # How the sensitivity weights above were obtained: "measured" (every
+        # probe got a real llama-perplexity reading), "partial" (some probes
+        # fell back to the heuristic estimate), or "heuristic" (ALL of them
+        # did -- the search then ran entirely on static empirical guesses,
+        # not this model's actual behavior). Set by probe_all_groups; "unknown"
+        # until then. Threaded into search_results.json by the orchestrator.
+        self.probing_provenance: str = "unknown"
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -87,10 +95,13 @@ class SensitivityProber:
             print(f"Baseline PPL: {self.baseline_ppl}")
             print()
 
+        measured_count = 0
         for group in groups:
-            ppl = self._probe_single_group(
+            ppl, measured = self._probe_single_group(
                 group, aggressive_scheme, keep_scheme, verbose
             )
+            if measured:
+                measured_count += 1
 
             sensitivity = max(0.0, ppl - self.baseline_ppl) / self.baseline_ppl
 
@@ -100,11 +111,32 @@ class SensitivityProber:
                 "aggressive_scheme": aggressive_scheme,
                 "probe_ppl": ppl,
                 "sensitivity": sensitivity,
+                "measured": measured,
             })
 
             if verbose:
                 print(f"  Group '{group}': PPL={ppl:.4f}, "
                       f"Sensitivity={sensitivity:.4f}")
+
+        total = len(groups)
+        if measured_count == total:
+            self.probing_provenance = "measured"
+        elif measured_count == 0:
+            self.probing_provenance = "heuristic"
+            if total > 0:
+                _log.warning(
+                    "sensitivity probing produced ZERO real measurements -- "
+                    "weights are heuristic (every probe fell back; the "
+                    "evolutionary search will run on static empirical "
+                    "guesses, not this model's actual quantization behavior)"
+                )
+                if verbose:
+                    print(
+                        "WARNING: sensitivity probing produced ZERO real "
+                        "measurements -- weights are heuristic"
+                    )
+        else:
+            self.probing_provenance = "partial"
 
         return self.sensitivity_results
 
@@ -134,6 +166,7 @@ class SensitivityProber:
             "sensitivity": self.sensitivity_results,
             "normalized_weights": self.get_normalized_weights(),
             "probes": self.probe_models,
+            "probing_provenance": self.probing_provenance,
         }
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w") as f:
@@ -149,13 +182,17 @@ class SensitivityProber:
         scheme: str,
         keep_scheme: str,
         verbose: bool = True,
-    ) -> float:
+    ) -> Tuple[float, bool]:
         """
         Create a probe GGUF where only *group* is quantised with *scheme*
         and all others stay at *keep_scheme*, then measure perplexity.
 
         Falls back to heuristic estimation when no perplexity_calculator or
         no writable source model is available.
+
+        Returns (ppl, measured) -- ``measured`` is True only for a real
+        llama-perplexity reading, False for any heuristic estimate (used by
+        probe_all_groups to stamp probing_provenance).
         """
         if verbose:
             print(f"  Probing group '{group}' with {scheme}...")
@@ -168,7 +205,7 @@ class SensitivityProber:
             return self._real_probe(group, scheme, keep_scheme, verbose)
 
         # Fallback: heuristic estimate
-        return self._heuristic_probe(group, scheme)
+        return self._heuristic_probe(group, scheme), False
 
     def _real_probe(
         self,
@@ -176,7 +213,7 @@ class SensitivityProber:
         scheme: str,
         keep_scheme: str,
         verbose: bool,
-    ) -> float:
+    ) -> Tuple[float, bool]:
         """Build a real probe GGUF, run perplexity, clean up."""
         from magicquant.gguf.writer import create_hybrid_gguf
 
@@ -227,9 +264,9 @@ class SensitivityProber:
                 if verbose:
                     print(f"    WARNING: PPL measurement failed for group '{group}', "
                           "falling back to heuristic")
-                return self._heuristic_probe(group, scheme)
+                return self._heuristic_probe(group, scheme), False
 
-            return ppl
+            return ppl, True
 
         except ValueError as exc:
             # ValueErrors come from the writer's contract guards (pre-quantized
@@ -252,7 +289,7 @@ class SensitivityProber:
             )
             if verbose:
                 print(f"    Probe failed ({exc}), using heuristic")
-            return self._heuristic_probe(group, scheme)
+            return self._heuristic_probe(group, scheme), False
 
         finally:
             # Clean up temporary probe file

@@ -267,6 +267,7 @@ def test_save_results_persists_kl_and_bench_fields(tmp_path):
     orch.output_dir = tmp_path
     orch.baseline_ppl = 5.0
     orch.baseline_provenance = "measured"
+    orch.probing_provenance = "measured"
     orch._search_seed = None
     orch._measured = {
         "a": {
@@ -328,6 +329,7 @@ def test_save_results_defaults_kl_and_bench_to_none_when_absent(tmp_path):
     orch.output_dir = tmp_path
     orch.baseline_ppl = 5.0
     orch.baseline_provenance = "prediction-only"
+    orch.probing_provenance = "unknown"
     orch._search_seed = None
     orch._measured = {
         "a": {"config": {"E": "BF16"}, "predicted_loss": 0.09, "size_gb": 4.0},

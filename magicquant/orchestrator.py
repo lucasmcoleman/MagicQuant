@@ -62,6 +62,13 @@ class MagicQuantOrchestrator:
         # config from a guessed one.
         self.baseline_provenance: str = "unknown"
         self.sensitivity_weights: Optional[Dict[str, float]] = None
+        # How self.sensitivity_weights was obtained: "measured" (every probe
+        # got a real llama-perplexity reading), "partial" (some fell back),
+        # or "heuristic" (ALL fell back -- the whole search then ran on
+        # static empirical guesses, not this model's actual behavior). Copied
+        # from SensitivityProber.probing_provenance right after probing;
+        # stamped into search_results.json alongside baseline_provenance.
+        self.probing_provenance: str = "unknown"
         self.predictor: Optional[PredictiveScorer] = None
 
         # Track all measured configs across rounds
@@ -339,6 +346,7 @@ class MagicQuantOrchestrator:
 
         prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
         self.sensitivity_weights = prober.get_normalized_weights()
+        self.probing_provenance = prober.probing_provenance
         prober.save_results(str(self.output_dir / "sensitivity.json"))
 
         if verbose:
@@ -663,6 +671,7 @@ class MagicQuantOrchestrator:
         results = {
             "baseline_ppl": self.baseline_ppl,
             "baseline_provenance": self.baseline_provenance,
+            "probing_provenance": self.probing_provenance,
             "seed": self._search_seed,
             "measurements": {
                 k: {
@@ -794,6 +803,7 @@ class MagicQuantOrchestrator:
 
         prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
         self.sensitivity_weights = prober.get_normalized_weights()
+        self.probing_provenance = prober.probing_provenance
         prober.save_results(str(self.output_dir / "sensitivity.json"))
 
         # (_estimate_model_size also populates self._param_counts per group.)

@@ -27,6 +27,7 @@ from typing import Dict, List, Any, Optional
 from pathlib import Path
 import collections
 import concurrent.futures
+import re
 import struct
 import os
 import time
@@ -337,6 +338,28 @@ def _encode_entry(source, entry, imatrix=None) -> bytes:
     return blob
 
 
+# Tensor-name shapes (within group "S") that llama.cpp's own converter
+# (convert_hf_to_gguf.py's tensor_force_quant ladder, MODEL_TENSOR.SSM_CONV1D
+# / _Q / _K / _V) forces to F32 unconditionally -- these are the SSM/KDA conv
+# weight (and its bias), never a quantizable projection matrix. The ggml-cuda
+# ssm_conv kernel hard-asserts the conv weight's row stride is sizeof(float)
+# (ggml-cuda/ssm-conv.cu), so a target of BF16/F16 is just as fatal as a
+# quantized one -- this rule must win regardless of the group's configured
+# scheme being a float type, unlike the block-32 fallback above (which only
+# ever runs for quantized targets; a float target has block_size==1 and never
+# reaches it). Matches both the canonical GGUF name (ssm_conv1d[_qkv]) and the
+# Kimi-Linear HF name (q_conv1d/k_conv1d/v_conv1d) in case a source hasn't
+# been canonicalized yet.
+_SSM_F32_REQUIRED_NAME_RE = re.compile(
+    r"(?:^|[._])conv1d(?:_[qkv])?(?:[._]|$)", re.IGNORECASE,
+)
+
+
+def _is_f32_required_ssm_operand(name: str) -> bool:
+    """Is ``name`` an SSM conv-weight operand llama.cpp requires in F32?"""
+    return bool(_SSM_F32_REQUIRED_NAME_RE.search(name))
+
+
 def _read_encode_worker(source, entries, result_queue, imatrix=None):
     """
     Background thread: reads each tensor from source, encodes to ggml bytes,
@@ -642,6 +665,27 @@ class GGUFWriter:
                 scheme = group_schemes.get(group, base_quant)
                 target_ggml_name = scheme_map.get(scheme, "Q4_0")
                 target_ggml_id = GGML_TYPE.get(target_ggml_name, GGML_TYPE["Q4_0"])
+
+                # SSM conv-weight operands (ssm_conv1d / ssm_conv1d_{q,k,v})
+                # must be F32 no matter what scheme group S was configured
+                # with -- see _is_f32_required_ssm_operand. This has to run
+                # BEFORE the block-size fallback below: a float scheme (BF16/
+                # F16) has block_size==1, so that check is skipped entirely
+                # and would otherwise let a BF16-designated conv weight
+                # through untouched (the real bug this guards against).
+                if group == "S" and target_ggml_name != "F32" and _is_f32_required_ssm_operand(name):
+                    if verbose:
+                        print(f"  [COMPAT] {name}: SSM conv operand requires F32 "
+                              f"(llama.cpp kernel constraint), overriding {target_ggml_name}")
+                    self._fallbacks.append({
+                        "tensor": name,
+                        "group": group,
+                        "requested": target_ggml_name,
+                        "actual": "F32",
+                        "reason": "f32-required-operand",
+                    })
+                    target_ggml_name = "F32"
+                    target_ggml_id = GGML_TYPE["F32"]
 
                 # 1D tensors (norms, biases) must stay at F32.  llama.cpp
                 # uses f32 binary ops (e.g. element-wise mul in RMSNorm) and
