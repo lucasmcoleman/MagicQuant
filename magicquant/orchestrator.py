@@ -213,6 +213,7 @@ class MagicQuantOrchestrator:
         enable_rocmfpx: bool = False,
         enable_iq: bool = False,
         head_aggressive: bool = False,
+        stream_aware: bool = False,
         seed: Optional[int] = None,
         use_imatrix: bool = False,
         imatrix_corpus: Optional[str] = None,
@@ -559,6 +560,7 @@ class MagicQuantOrchestrator:
                 enable_rocmfpx=enable_rocmfpx,
                 enable_iq=enable_iq,
                 head_aggressive=head_aggressive,
+                stream_aware=stream_aware,
             )
 
             round_configs = survivor.run_evolution(
@@ -1236,6 +1238,7 @@ class MagicQuantOrchestrator:
         enable_rocmfpx: bool = False,
         enable_iq: bool = False,
         head_aggressive: bool = False,
+        stream_aware: bool = False,
         seed: Optional[int] = None,
         use_imatrix: bool = False,
         imatrix_corpus: Optional[str] = None,
@@ -1362,6 +1365,7 @@ class MagicQuantOrchestrator:
             enable_rocmfpx=enable_rocmfpx,
             enable_iq=enable_iq,
             head_aggressive=head_aggressive,
+            stream_aware=stream_aware,
         )
 
         best_configs = survivor.run_evolution(

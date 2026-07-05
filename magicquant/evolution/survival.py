@@ -98,6 +98,12 @@ class EvolutionarySurvivor:
     # Groups that are sensitive to quantization ("brain" layers)
     _HIGH_SENSITIVITY = {'E', 'H', 'O', 'R'}
 
+    # Streamed matmul groups: their full weight is read every generated token
+    # (unlike E/token_embd, which is row-gathered, and N/norms, which are
+    # tiny). ``stream_aware`` moves their BF16/F16 mass onto Q8_0 -- measured
+    # PPL-neutral but -16% size / +18% tg on a real 27B (2026-07-05).
+    _STREAM_AWARE_GROUPS = frozenset({'H', 'Q', 'K', 'O'})
+
     # Groups that are robust to quantization (FFN / experts)
     _LOW_SENSITIVITY = {'U', 'D', 'X'}
 
@@ -119,6 +125,7 @@ class EvolutionarySurvivor:
         enable_rocmfpx: bool = False,
         enable_iq: bool = False,
         head_aggressive: bool = False,
+        stream_aware: bool = False,
     ):
         self.predictor = predictor
         self.baseline_config = baseline_config
@@ -148,6 +155,18 @@ class EvolutionarySurvivor:
         # -- is unchanged; every other group's sampling is untouched by this
         # flag regardless of its value.
         self.head_aggressive = head_aggressive
+        # When True, random-config sampling for every STREAMED matmul group
+        # (_STREAM_AWARE_GROUPS = H/Q/K/O -- read in full every generated
+        # token, unlike row-gathered token_embd) moves its BF16/F16 (float)
+        # probability mass onto Q8_0. Measured on a real 27B (2026-07-05):
+        # replacing BF16 with Q8_0 on the streamed groups was PPL-identical
+        # (6.6107 -> 6.6106) but -16% size and +18% tg -- BF16 there is pure
+        # bandwidth waste. This supersedes head_aggressive for the 'H' group
+        # when both are set: Q8_0 is the measured sweet spot (head_aggressive's
+        # Q6_K/Q5_K target was PPL-equal but ~25% SLOWER at prompt processing).
+        # A bias, not a hard exclusion; off by default so the standard search
+        # and its seed-pinned fixture are unchanged.
+        self.stream_aware = stream_aware
 
         self.history: List[Dict] = []
         self.tier_winners: Dict[str, Dict] = {}
@@ -440,6 +459,23 @@ class EvolutionarySurvivor:
         "head_aggressive": 0.10,
     }
 
+    @staticmethod
+    def _stream_shift(class_weights: Dict[str, float]) -> Dict[str, float]:
+        """Return a copy of ``class_weights`` with most BF16/F16 (``float``)
+        probability mass moved onto Q8_0 (``legacy_q``).
+
+        For a streamed matmul group, Q8_0 is PPL-equal to BF16 (measured) at
+        half the bytes, so BF16 there is pure bandwidth waste. A tiny float
+        residual is kept so BF16 stays reachable -- a bias, not a hard
+        exclusion, mirroring head_aggressive.
+        """
+        shifted = dict(class_weights)
+        float_mass = shifted.get("float", 0.0)
+        residual = min(float_mass, 0.02)
+        shifted["float"] = residual
+        shifted["legacy_q"] = shifted.get("legacy_q", 0.0) + (float_mass - residual)
+        return shifted
+
     def _class_weights(self, group_key: str) -> Dict[str, float]:
         """Return the category-weight dict for a group class ('brain',
         'attention', 'ffn', or 'head_aggressive' for the opt-in H-only
@@ -485,7 +521,14 @@ class EvolutionarySurvivor:
         all_schemes = [s for s in all_schemes if not s.requires_imatrix]
 
         for g in groups:
-            if g == 'H' and self.head_aggressive:
+            if self.stream_aware and g in self._STREAM_AWARE_GROUPS:
+                # Streamed matmul group: shift BF16/F16 mass onto Q8_0. Takes
+                # precedence over head_aggressive for 'H' (Q8_0 is the measured
+                # sweet spot; head_aggressive's Q6_K target was PPL-equal but
+                # slower at prompt processing). Base class by sensitivity.
+                base_key = "brain" if g in self._HIGH_SENSITIVITY else "attention"
+                class_weights = self._stream_shift(self._class_weights(base_key))
+            elif g == 'H' and self.head_aggressive:
                 class_weights = self._class_weights("head_aggressive")
             elif g in self._HIGH_SENSITIVITY:
                 class_weights = self._class_weights("brain")
