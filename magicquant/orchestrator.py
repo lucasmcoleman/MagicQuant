@@ -855,6 +855,7 @@ class MagicQuantOrchestrator:
 
         # Save all results
         self._save_results(all_configs, tiered)
+        self._write_pareto_report()
 
         # Run completed successfully -- the checkpoint's job is done.
         checkpoint_path.unlink(missing_ok=True)
@@ -1185,6 +1186,42 @@ class MagicQuantOrchestrator:
         results_path = self.output_dir / "search_results.json"
         results_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
 
+    def _write_pareto_report(self) -> None:
+        """Additive, read-only Pareto-frontier report over this run's
+        measurements.
+
+        The size-band tiers in search_results.json hide the real
+        size/quality/(speed) tradeoff -- e.g. a Q6 tier can cost +11 GB and
+        -60% generation speed for 0.6% better perplexity, a trade nobody
+        would consciously choose. This surfaces it: writes pareto.json (the
+        non-dominated candidate list, see magicquant.pareto.pareto_frontier)
+        next to search_results.json, and logs the human-readable table at
+        INFO.
+
+        Pure reporting -- never touches search/selection state and must
+        never fail the run: any error here is logged and swallowed. Guarded
+        with getattr so bare-``__new__`` test orchestrators (missing
+        output_dir or _measured entirely, e.g. ones that call
+        ``_save_results`` directly without going through a real ``run_*``
+        search) are skipped rather than crashing.
+        """
+        output_dir = getattr(self, "output_dir", None)
+        measured = getattr(self, "_measured", None)
+        if output_dir is None or measured is None:
+            return
+        try:
+            from magicquant.pareto import pareto_frontier, format_pareto_report
+
+            frontier = pareto_frontier(measured)
+            pareto_path = Path(output_dir) / "pareto.json"
+            pareto_path.write_text(json.dumps(frontier, indent=2), encoding="utf-8")
+            log.info(format_pareto_report(measured))
+        except Exception as exc:
+            log.warning(
+                "Pareto report generation failed (non-fatal)",
+                stage="pareto", error=str(exc), exc_info=exc,
+            )
+
     # ------------------------------------------------------------------
     # Prediction-only search (no llama.cpp needed)
     # ------------------------------------------------------------------
@@ -1344,6 +1381,7 @@ class MagicQuantOrchestrator:
         # measured path saved — the prediction-only path silently produced
         # nothing to hand off.
         self._save_results(best_configs, tiered)
+        self._write_pareto_report()
 
         return best_configs, tiered
 
