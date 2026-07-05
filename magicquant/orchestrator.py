@@ -109,6 +109,15 @@ class MagicQuantOrchestrator:
         # selection (see _select_final_survivors). Only has any effect when
         # a candidate actually has a "kl" measurement recorded.
         self._kl_weight: float = 0.0
+        # When True, _select_final_survivors re-ranks WITHIN a tier's
+        # near-tied candidates (measured_loss within self._speed_epsilon
+        # relative of the tier's best) by measured tg throughput instead of
+        # taking the flat quality-best. Off by default -- today's plain
+        # KL-blended measured_loss selection, unchanged. See
+        # run_measured_search's speed_aware/speed_epsilon params and
+        # _speed_aware_pick.
+        self._speed_aware: bool = False
+        self._speed_epsilon: float = 0.005
 
     def _apply_seed(self, seed: Optional[int]) -> None:
         """Seed the RNGs once for a reproducible search.
@@ -203,12 +212,15 @@ class MagicQuantOrchestrator:
         patience: Optional[int] = None,
         enable_rocmfpx: bool = False,
         enable_iq: bool = False,
+        head_aggressive: bool = False,
         seed: Optional[int] = None,
         use_imatrix: bool = False,
         imatrix_corpus: Optional[str] = None,
         enable_kl: bool = False,
         kl_weight: float = 0.1,
         enable_speed_bench: bool = False,
+        speed_aware: bool = False,
+        speed_epsilon: float = 0.005,
         measurement_chunks: Optional[int] = None,
         seed_incumbents: bool = True,
         resume: bool = True,
@@ -241,6 +253,28 @@ class MagicQuantOrchestrator:
                 .json, not fed into per-generation prediction scoring --
                 bench-ing the full population every generation isn't
                 tractable, only the small measured set is). Off by default.
+            head_aggressive: bias the evolutionary search's random-config
+                sampling for the 'H' (LM head / output.weight) group only
+                toward the smaller K-quants (Q6_K/Q5_K/Q8_0) and away from
+                BF16 -- see ``EvolutionarySurvivor.__init__`` and
+                ``_HEAD_AGGRESSIVE_CLASS_WEIGHTS`` for the rationale
+                (output.weight streams in full every tg token, so its
+                precision is a bandwidth tax the PPL objective never sees).
+                A bias, not a hard exclusion. Off by default (unchanged
+                sampling for every group, including H).
+            speed_aware: within each tier, when candidates carry bench data
+                (see ``enable_speed_bench``), prefer the candidate with the
+                best measured tg throughput among those whose measured_loss
+                is within ``speed_epsilon`` relative of the tier's best
+                instead of the flat quality-best (see
+                ``_select_final_survivors`` / ``_speed_aware_pick``). Pure
+                post-hoc re-ranking of already-recorded measurements -- no
+                extra GPU calls. Off by default, and a no-op even when True
+                if no candidate in a tier has bench data (falls back to
+                today's plain measured_loss/KL-blended selection).
+            speed_epsilon: relative measured_loss tolerance (default 0.005 =
+                0.5%) defining "near-tied" for ``speed_aware``. Only
+                meaningful when ``speed_aware=True``.
             measurement_chunks: cap every perplexity/KL pass in this run to
                 this many ctx_size-token chunks instead of the whole corpus
                 (overrides LlamaCppTools' own MAGICQUANT_PPL_CHUNKS env
@@ -279,6 +313,8 @@ class MagicQuantOrchestrator:
         """
         self._apply_seed(seed)
         self._kl_weight = kl_weight if enable_kl else 0.0
+        self._speed_aware = speed_aware
+        self._speed_epsilon = speed_epsilon
         if verbose:
             log.info(
                 "MagicQuant Measured Hybrid Search",
@@ -522,6 +558,7 @@ class MagicQuantOrchestrator:
                 epsilon=0.2,
                 enable_rocmfpx=enable_rocmfpx,
                 enable_iq=enable_iq,
+                head_aggressive=head_aggressive,
             )
 
             round_configs = survivor.run_evolution(
@@ -965,12 +1002,43 @@ class MagicQuantOrchestrator:
             score += self._kl_weight * abs(kl["mean_kl"])
         return score
 
+    @staticmethod
+    def _speed_aware_pick(
+        candidates: List[Dict], quality_best: Dict, epsilon: float
+    ) -> Dict:
+        """Within a tier, re-rank by measured tg throughput among
+        candidates whose measured_loss is within ``epsilon`` relative of the
+        tier's best -- otherwise leave ``quality_best`` (the flat
+        measured_loss/KL-blended winner) untouched.
+
+        Pure function of already-recorded measurements: reads each
+        candidate's "bench" dict (``{"pp_ts", "tg_ts"}``, populated only
+        when ``run_measured_search(enable_speed_bench=True)``). Adds no new
+        GPU calls -- if nothing in the tier carries bench data, this is a
+        no-op and ``quality_best`` is returned unchanged, so
+        ``speed_aware=True`` degrades to today's plain selection whenever
+        speed-bench data isn't available.
+        """
+        best_loss = min(c["measured_loss"] for c in candidates)
+        threshold = best_loss + epsilon * abs(best_loss)
+        contenders = [
+            c for c in candidates
+            if c["measured_loss"] <= threshold
+            and c.get("bench") and c["bench"].get("tg_ts") is not None
+        ]
+        if not contenders:
+            return quality_best
+        return max(contenders, key=lambda c: c["bench"]["tg_ts"])
+
     def _select_final_survivors(self, baseline_gb: float) -> Dict[str, Dict]:
         """From all measured configs, pick the best per tier."""
         by_tier: Dict[str, List[Dict]] = defaultdict(list)
         for info in self._measured.values():
             tier = self._classify_tier(info["size_gb"], baseline_gb)
             by_tier[tier].append(info)
+
+        speed_aware = getattr(self, "_speed_aware", False)
+        speed_epsilon = getattr(self, "_speed_epsilon", 0.005)
 
         result = {}
         for tier in ["Q8", "Q6", "Q5", "Q4", "Q3", "Q2"]:
@@ -997,6 +1065,8 @@ class MagicQuantOrchestrator:
                     return score
 
                 best = min(candidates, key=_score)
+                if speed_aware:
+                    best = self._speed_aware_pick(candidates, best, speed_epsilon)
                 result[tier] = best
         return result
 
@@ -1108,6 +1178,7 @@ class MagicQuantOrchestrator:
         patience: Optional[int] = None,
         enable_rocmfpx: bool = False,
         enable_iq: bool = False,
+        head_aggressive: bool = False,
         seed: Optional[int] = None,
         use_imatrix: bool = False,
         imatrix_corpus: Optional[str] = None,
@@ -1117,6 +1188,10 @@ class MagicQuantOrchestrator:
         """
         Run prediction-only evolutionary search (no real measurements).
         Use run_measured_search() for the full Predict->Measure->Learn loop.
+
+        head_aggressive: same H-only sampling bias as run_measured_search
+        (see its docstring and EvolutionarySurvivor.__init__). Off by
+        default; unchanged sampling for every group when False.
 
         use_imatrix/imatrix_corpus: prediction-only search never builds
         candidate GGUFs, so this has no effect on the search itself -- it
@@ -1229,6 +1304,7 @@ class MagicQuantOrchestrator:
             epsilon=0.2,
             enable_rocmfpx=enable_rocmfpx,
             enable_iq=enable_iq,
+            head_aggressive=head_aggressive,
         )
 
         best_configs = survivor.run_evolution(

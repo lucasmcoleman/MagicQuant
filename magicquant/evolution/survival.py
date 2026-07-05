@@ -118,6 +118,7 @@ class EvolutionarySurvivor:
         epsilon: float = 0.2,
         enable_rocmfpx: bool = False,
         enable_iq: bool = False,
+        head_aggressive: bool = False,
     ):
         self.predictor = predictor
         self.baseline_config = baseline_config
@@ -135,6 +136,18 @@ class EvolutionarySurvivor:
         # unchanged. Schemes with requires_imatrix=True are ALWAYS excluded
         # regardless of this flag (the search threads no imatrix).
         self.enable_iq = enable_iq
+        # When True, random-config sampling for the 'H' (output.weight /
+        # LM head) group ONLY is reweighted toward the smaller K-quants
+        # (Q6_K/Q5_K/Q8_0) and away from BF16 -- output.weight streams in
+        # full every generated token (no vocab shortlist, unlike the
+        # row-gathered token_embd), so a BF16 head is a per-token bandwidth
+        # tax the PPL-only objective never sees. This is a bias (adjusted
+        # category weights, see _HEAD_AGGRESSIVE_CLASS_WEIGHTS), not a hard
+        # exclusion -- BF16 stays reachable, just unlikely. Off by default
+        # so the standard search -- and its seed-pinned regression fixture
+        # -- is unchanged; every other group's sampling is untouched by this
+        # flag regardless of its value.
+        self.head_aggressive = head_aggressive
 
         self.history: List[Dict] = []
         self.tier_winners: Dict[str, Dict] = {}
@@ -389,6 +402,29 @@ class EvolutionarySurvivor:
         "mxfp4":    0.33,
     }
 
+    # Opt-in alternative to _BRAIN_CLASS_WEIGHTS, applied to the 'H' group
+    # ONLY when head_aggressive=True (see __init__). Biases toward the
+    # smaller K-quants and Q8_0 -- output.weight streams in full every tg
+    # token, so its precision is a per-token bandwidth tax the PPL objective
+    # doesn't account for. Float mass is lowered, not zeroed: a bias, not a
+    # hard exclusion (BF16 stays reachable, just unlikely).
+    _HEAD_AGGRESSIVE_CLASS_WEIGHTS = {
+        "float":    0.02,   # BF16 -- biased away, still reachable
+        "legacy_q": 0.28,   # Q8_0
+        "k_quant":  0.60,   # Q6_K, Q5_K, ... -- the dial's target band
+        "iq_quant": 0.05,
+        "mxfp4":    0.05,
+    }
+
+    # The default sensitive-group floor (Q8_0, see _min_scheme_for_class)
+    # would otherwise clamp EVERY sub-Q8_0 pick back up to Q8_0 -- silently
+    # collapsing the k_quant mass above onto Q8_0/BF16 and defeating the
+    # Q6_K/Q5_K bias entirely. head_aggressive relaxes the floor for 'H'
+    # only, down to Q5_K, so Q6_K/Q5_K survive; anything sampled below Q5_K
+    # (IQ4_NL, MXFP4_MOE, Q4_K_M, ...) still gets clamped up -- to Q5_K
+    # instead of Q8_0.
+    _HEAD_AGGRESSIVE_FLOOR = "Q5_K"
+
     # ROCmFPX mass added to each class dict when enable_rocmfpx is set. The
     # AMD-native family is offered as a compression alternative — a little for
     # brain groups (fp8/fp6 as high-quality options), more for FFN (fp4 is the
@@ -398,15 +434,21 @@ class EvolutionarySurvivor:
         "brain":     0.10,
         "attention": 0.25,
         "ffn":       0.40,
+        # Same mass as "brain": head_aggressive only reweights the
+        # non-rocmfpx categories (see _HEAD_AGGRESSIVE_CLASS_WEIGHTS above);
+        # H is still a high-sensitivity group when the AMD family is in play.
+        "head_aggressive": 0.10,
     }
 
     def _class_weights(self, group_key: str) -> Dict[str, float]:
         """Return the category-weight dict for a group class ('brain',
-        'attention', 'ffn'), injecting rocmfpx mass when enabled."""
+        'attention', 'ffn', or 'head_aggressive' for the opt-in H-only
+        dial), injecting rocmfpx mass when enabled."""
         base = {
             "brain": self._BRAIN_CLASS_WEIGHTS,
             "attention": self._ATTENTION_CLASS_WEIGHTS,
             "ffn": self._FFN_CLASS_WEIGHTS,
+            "head_aggressive": self._HEAD_AGGRESSIVE_CLASS_WEIGHTS,
         }[group_key]
         if not self.enable_rocmfpx:
             return base
@@ -443,7 +485,9 @@ class EvolutionarySurvivor:
         all_schemes = [s for s in all_schemes if not s.requires_imatrix]
 
         for g in groups:
-            if g in self._HIGH_SENSITIVITY:
+            if g == 'H' and self.head_aggressive:
+                class_weights = self._class_weights("head_aggressive")
+            elif g in self._HIGH_SENSITIVITY:
                 class_weights = self._class_weights("brain")
             elif g in self._LOW_SENSITIVITY:
                 class_weights = self._class_weights("ffn")
@@ -484,8 +528,17 @@ class EvolutionarySurvivor:
             # floor. The class weights still allow low-bit picks (mxfp4/k_quant
             # in _BRAIN_CLASS_WEIGHTS), so clamp here rather than silently
             # producing a sub-floor sensitive config the Protector can't fix.
+            # head_aggressive relaxes this floor for 'H' only (see
+            # _HEAD_AGGRESSIVE_FLOOR) so the Q6_K/Q5_K bias above isn't
+            # silently collapsed back onto Q8_0/BF16; every other group
+            # (and H itself when head_aggressive is False) keeps the
+            # original Q8_0 floor, unchanged.
             if g in self._HIGH_SENSITIVITY:
-                floor = self._min_scheme_for_class('sensitive')
+                floor = (
+                    self._HEAD_AGGRESSIVE_FLOOR
+                    if (g == 'H' and self.head_aggressive)
+                    else self._min_scheme_for_class('sensitive')
+                )
                 try:
                     picked_bpw = get_scheme_by_name(picked).bits_per_weight
                     floor_bpw = get_scheme_by_name(floor).bits_per_weight
