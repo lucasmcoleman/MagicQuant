@@ -29,7 +29,8 @@ def test_speed_aware_pick_reranks_within_epsilon():
     quality_best = {"measured_loss": 0.10, "bench": {"tg_ts": 20.0}}
     faster = {"measured_loss": 0.1004, "bench": {"tg_ts": 80.0}}  # +0.4% -- within 0.5%
     result = MagicQuantOrchestrator._speed_aware_pick(
-        [quality_best, faster], quality_best, epsilon=0.005
+        [quality_best, faster], quality_best, epsilon=0.005,
+        score_of=lambda c: c['measured_loss']
     )
     assert result is faster
 
@@ -38,7 +39,8 @@ def test_speed_aware_pick_ignores_candidate_outside_epsilon():
     quality_best = {"measured_loss": 0.10, "bench": {"tg_ts": 20.0}}
     outside = {"measured_loss": 0.11, "bench": {"tg_ts": 999.0}}  # +10% -- outside 0.5%
     result = MagicQuantOrchestrator._speed_aware_pick(
-        [quality_best, outside], quality_best, epsilon=0.005
+        [quality_best, outside], quality_best, epsilon=0.005,
+        score_of=lambda c: c['measured_loss']
     )
     assert result is quality_best
 
@@ -47,7 +49,8 @@ def test_speed_aware_pick_falls_back_when_no_candidate_has_bench():
     quality_best = {"measured_loss": 0.10}
     other = {"measured_loss": 0.1001}
     result = MagicQuantOrchestrator._speed_aware_pick(
-        [quality_best, other], quality_best, epsilon=0.005
+        [quality_best, other], quality_best, epsilon=0.005,
+        score_of=lambda c: c['measured_loss']
     )
     assert result is quality_best
 
@@ -56,7 +59,8 @@ def test_speed_aware_pick_only_considers_within_epsilon_bench_having_candidates(
     quality_best = {"measured_loss": 0.10, "bench": {"tg_ts": 20.0}}
     no_bench_but_within_epsilon = {"measured_loss": 0.1001}
     result = MagicQuantOrchestrator._speed_aware_pick(
-        [quality_best, no_bench_but_within_epsilon], quality_best, epsilon=0.005
+        [quality_best, no_bench_but_within_epsilon], quality_best, epsilon=0.005,
+        score_of=lambda c: c['measured_loss']
     )
     assert result is quality_best
 
@@ -64,7 +68,8 @@ def test_speed_aware_pick_only_considers_within_epsilon_bench_having_candidates(
 def test_speed_aware_pick_exact_tie_prefers_higher_tg():
     a = {"measured_loss": 0.10, "bench": {"tg_ts": 20.0}}
     b = {"measured_loss": 0.10, "bench": {"tg_ts": 20.1}}
-    result = MagicQuantOrchestrator._speed_aware_pick([a, b], a, epsilon=0.005)
+    result = MagicQuantOrchestrator._speed_aware_pick([a, b], a, epsilon=0.005,
+        score_of=lambda c: c['measured_loss'])
     assert result is b
 
 
@@ -311,3 +316,26 @@ def test_run_measured_search_speed_aware_false_keeps_plain_tiebreak(tmp_path, mo
     first_measured = next(iter(orch._measured.values()))
     winner = next(iter(tiered.values()))
     assert winner["config"] == first_measured["config"]
+
+
+def test_speed_aware_respects_kl_guard(monkeypatch):
+    """enable_kl + speed_aware together: a candidate whose KL FAILED (no "kl")
+    but whose raw PPL is within epsilon and whose tg is fastest must NOT be
+    picked -- the speed band uses the KL-guarded score, so the failed
+    candidate is pushed out of the band by the worst-KL penalty (adversarial
+    review 2026-07-05)."""
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch._kl_weight = 1.0
+    orch._speed_aware = True
+    orch._speed_epsilon = 0.02  # generous band so raw-loss alone would admit it
+    orch._measured = {
+        # real-KL winner, modest tg
+        "good": {"config": {"E": "GOOD"}, "measured_loss": 0.100, "size_gb": 4.0,
+                 "kl": {"mean_kl": 0.01}, "bench": {"tg_ts": 20.0}},
+        # KL FAILED (no "kl"), raw loss within epsilon, FASTEST tg -- must be rejected
+        "failed": {"config": {"E": "FAILED"}, "measured_loss": 0.101, "size_gb": 4.0,
+                   "bench": {"tg_ts": 999.0}},
+    }
+    result = orch._select_final_survivors(baseline_gb=8.0)
+    tier = orch._classify_tier(4.0, 8.0)
+    assert result[tier]["config"] == {"E": "GOOD"}, "KL-failed fast candidate wrongly won the speed band"

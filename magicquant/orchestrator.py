@@ -1004,12 +1004,19 @@ class MagicQuantOrchestrator:
 
     @staticmethod
     def _speed_aware_pick(
-        candidates: List[Dict], quality_best: Dict, epsilon: float
+        candidates: List[Dict], quality_best: Dict, epsilon: float, score_of
     ) -> Dict:
         """Within a tier, re-rank by measured tg throughput among
-        candidates whose measured_loss is within ``epsilon`` relative of the
-        tier's best -- otherwise leave ``quality_best`` (the flat
-        measured_loss/KL-blended winner) untouched.
+        candidates whose *selection score* is within ``epsilon`` relative of
+        the tier's best -- otherwise leave ``quality_best`` (the flat
+        score winner) untouched.
+
+        ``score_of`` is the same KL-guarded scoring callable
+        ``_select_final_survivors`` ranks by, NOT raw measured_loss: the band
+        must inherit the "a candidate whose KL measurement failed can't beat
+        one that measured real KL" guard, so a KL-failed candidate can't
+        sneak into the speed tiebreak on raw PPL alone (adversarial review,
+        2026-07-05).
 
         Pure function of already-recorded measurements: reads each
         candidate's "bench" dict (``{"pp_ts", "tg_ts"}``, populated only
@@ -1019,12 +1026,23 @@ class MagicQuantOrchestrator:
         ``speed_aware=True`` degrades to today's plain selection whenever
         speed-bench data isn't available.
         """
-        best_loss = min(c["measured_loss"] for c in candidates)
-        threshold = best_loss + epsilon * abs(best_loss)
+        # If the quality winner is KL-confirmed, only KL-confirmed candidates
+        # may win on speed: a candidate whose KL measurement FAILED is
+        # unconfirmed quality (its real KL could be terrible), so letting it
+        # win the tiebreak on tg alone would reward the measurement failure --
+        # the small worst-KL score penalty isn't guaranteed to exclude it from
+        # a generous epsilon band on its own.
+        best_has_kl = bool(
+            quality_best.get("kl") and quality_best["kl"].get("mean_kl") is not None
+        )
+        best_score = min(score_of(c) for c in candidates)
+        threshold = best_score + epsilon * abs(best_score)
         contenders = [
             c for c in candidates
-            if c["measured_loss"] <= threshold
+            if score_of(c) <= threshold
             and c.get("bench") and c["bench"].get("tg_ts") is not None
+            and (not best_has_kl
+                 or (c.get("kl") and c["kl"].get("mean_kl") is not None))
         ]
         if not contenders:
             return quality_best
@@ -1066,7 +1084,9 @@ class MagicQuantOrchestrator:
 
                 best = min(candidates, key=_score)
                 if speed_aware:
-                    best = self._speed_aware_pick(candidates, best, speed_epsilon)
+                    best = self._speed_aware_pick(
+                        candidates, best, speed_epsilon, _score
+                    )
                 result[tier] = best
         return result
 
