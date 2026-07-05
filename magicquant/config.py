@@ -44,6 +44,10 @@ class MagicQuantSettings(BaseSettings):
     enable_speed_bench: bool = False
     enable_rocmfpx: bool = False
     enable_iq: bool = False
+    # Search-bias knobs (EvolutionarySurvivor sampling, not scoring): off by
+    # default so the unbiased sampling behavior is unchanged unless opted in.
+    stream_aware: bool = False
+    head_aggressive: bool = False
     seed: Optional[int] = None
     # Cap on ctx_size-token chunks per perplexity/KL pass during a measured
     # search (forwarded to LlamaCppTools.ppl_chunks, overriding its own

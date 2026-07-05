@@ -160,6 +160,8 @@ def _settings_from_args(args: argparse.Namespace):
     _maybe("enable_speed_bench", "enable_speed_bench")
     _maybe("enable_rocmfpx", "enable_rocmfpx")
     _maybe("enable_iq", "enable_iq")
+    _maybe("stream_aware", "stream_aware")
+    _maybe("head_aggressive", "head_aggressive")
     _maybe("seed", "seed")
     _maybe("measurement_chunks", "measurement_chunks")
 
@@ -199,6 +201,8 @@ def cmd_search(args: argparse.Namespace) -> None:
             enable_speed_bench=settings.enable_speed_bench,
             enable_rocmfpx=settings.enable_rocmfpx,
             enable_iq=settings.enable_iq,
+            stream_aware=settings.stream_aware,
+            head_aggressive=settings.head_aggressive,
             seed=settings.seed,
             measurement_chunks=settings.measurement_chunks,
         )
@@ -214,6 +218,8 @@ def cmd_search(args: argparse.Namespace) -> None:
             imatrix_corpus=settings.imatrix_corpus,
             enable_rocmfpx=settings.enable_rocmfpx,
             enable_iq=settings.enable_iq,
+            stream_aware=settings.stream_aware,
+            head_aggressive=settings.head_aggressive,
             seed=settings.seed,
             measurement_chunks=settings.measurement_chunks,
         )
@@ -685,6 +691,21 @@ def main() -> None:
         default=None,
         help="Let the search also explore IQ-family quant types "
              "(default: MAGICQUANT_ENABLE_IQ or off)",
+    )
+    search_parser.add_argument(
+        "--stream-aware",
+        action="store_true",
+        default=None,
+        help="Bias the evolutionary search's sampling toward BF16->Q8_0 on "
+             "streamed matmul groups (default: MAGICQUANT_STREAM_AWARE or off)",
+    )
+    search_parser.add_argument(
+        "--head-aggressive",
+        action="store_true",
+        default=None,
+        help="Bias the evolutionary search's random-config sampling for the "
+             "'H' (LM head) group toward smaller K-quants "
+             "(default: MAGICQUANT_HEAD_AGGRESSIVE or off)",
     )
     search_parser.add_argument(
         "--seed",

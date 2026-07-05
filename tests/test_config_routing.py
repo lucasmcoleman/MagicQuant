@@ -20,6 +20,7 @@ def _args(**kw):
         candidates=None, patience=None,
         use_imatrix=None, imatrix_corpus=None, enable_kl=None, kl_weight=None,
         enable_speed_bench=None, enable_rocmfpx=None, enable_iq=None,
+        stream_aware=None, head_aggressive=None,
         seed=None, measurement_chunks=None,
     )
     base.update(kw)
@@ -60,7 +61,8 @@ def test_orchestrator_knobs_default_off(monkeypatch):
         "MAGICQUANT_USE_IMATRIX", "MAGICQUANT_IMATRIX_CORPUS",
         "MAGICQUANT_ENABLE_KL", "MAGICQUANT_KL_WEIGHT",
         "MAGICQUANT_ENABLE_SPEED_BENCH", "MAGICQUANT_ENABLE_ROCMFPX",
-        "MAGICQUANT_ENABLE_IQ", "MAGICQUANT_SEED",
+        "MAGICQUANT_ENABLE_IQ", "MAGICQUANT_STREAM_AWARE",
+        "MAGICQUANT_HEAD_AGGRESSIVE", "MAGICQUANT_SEED",
     ):
         monkeypatch.delenv(var, raising=False)
     settings = _settings_from_args(_args())
@@ -71,6 +73,8 @@ def test_orchestrator_knobs_default_off(monkeypatch):
     assert settings.enable_speed_bench is False
     assert settings.enable_rocmfpx is False
     assert settings.enable_iq is False
+    assert settings.stream_aware is False
+    assert settings.head_aggressive is False
     assert settings.seed is None
 
 
@@ -82,6 +86,8 @@ def test_orchestrator_knobs_env_honored(monkeypatch):
     monkeypatch.setenv("MAGICQUANT_ENABLE_SPEED_BENCH", "true")
     monkeypatch.setenv("MAGICQUANT_ENABLE_ROCMFPX", "true")
     monkeypatch.setenv("MAGICQUANT_ENABLE_IQ", "true")
+    monkeypatch.setenv("MAGICQUANT_STREAM_AWARE", "true")
+    monkeypatch.setenv("MAGICQUANT_HEAD_AGGRESSIVE", "true")
     monkeypatch.setenv("MAGICQUANT_SEED", "42")
 
     settings = _settings_from_args(_args())
@@ -93,20 +99,27 @@ def test_orchestrator_knobs_env_honored(monkeypatch):
     assert settings.enable_speed_bench is True
     assert settings.enable_rocmfpx is True
     assert settings.enable_iq is True
+    assert settings.stream_aware is True
+    assert settings.head_aggressive is True
     assert settings.seed == 42
 
 
 def test_orchestrator_knobs_cli_overrides_env(monkeypatch):
     monkeypatch.setenv("MAGICQUANT_USE_IMATRIX", "true")
     monkeypatch.setenv("MAGICQUANT_KL_WEIGHT", "0.5")
+    monkeypatch.setenv("MAGICQUANT_STREAM_AWARE", "true")
+    monkeypatch.setenv("MAGICQUANT_HEAD_AGGRESSIVE", "true")
     monkeypatch.setenv("MAGICQUANT_SEED", "42")
 
     settings = _settings_from_args(
-        _args(use_imatrix=False, kl_weight=0.9, seed=7)
+        _args(use_imatrix=False, kl_weight=0.9,
+              stream_aware=False, head_aggressive=False, seed=7)
     )
 
     assert settings.use_imatrix is False
     assert settings.kl_weight == 0.9
+    assert settings.stream_aware is False
+    assert settings.head_aggressive is False
     assert settings.seed == 7
 
 
@@ -162,7 +175,8 @@ def _search_args(**kw):
         rounds=None, candidates=None, patience=None,
         use_imatrix=None, imatrix_corpus=None, enable_kl=None,
         kl_weight=None, enable_speed_bench=None, enable_rocmfpx=None,
-        enable_iq=None, seed=None, measurement_chunks=None,
+        enable_iq=None, stream_aware=None, head_aggressive=None,
+        seed=None, measurement_chunks=None,
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -177,7 +191,8 @@ def test_cmd_search_forwards_knobs_to_run_measured_search(monkeypatch):
         rounds=1,
         use_imatrix=True, imatrix_corpus="/tmp/corpus.txt",
         enable_kl=True, kl_weight=0.7, enable_speed_bench=True,
-        enable_rocmfpx=True, enable_iq=True, seed=42,
+        enable_rocmfpx=True, enable_iq=True,
+        stream_aware=True, head_aggressive=True, seed=42,
         measurement_chunks=8,
     ))
 
@@ -192,6 +207,8 @@ def test_cmd_search_forwards_knobs_to_run_measured_search(monkeypatch):
     assert call["enable_speed_bench"] is True
     assert call["enable_rocmfpx"] is True
     assert call["enable_iq"] is True
+    assert call["stream_aware"] is True
+    assert call["head_aggressive"] is True
     assert call["seed"] == 42
     assert call["measurement_chunks"] == 8
 
@@ -205,7 +222,8 @@ def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
         rounds=0,
         use_imatrix=True, imatrix_corpus="/tmp/corpus.txt",
         enable_kl=True, kl_weight=0.7, enable_speed_bench=True,
-        enable_rocmfpx=True, enable_iq=True, seed=42,
+        enable_rocmfpx=True, enable_iq=True,
+        stream_aware=True, head_aggressive=True, seed=42,
         measurement_chunks=8,
     ))
 
@@ -217,6 +235,8 @@ def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
     assert call["imatrix_corpus"] == "/tmp/corpus.txt"
     assert call["enable_rocmfpx"] is True
     assert call["enable_iq"] is True
+    assert call["stream_aware"] is True
+    assert call["head_aggressive"] is True
     assert call["seed"] == 42
     assert call["measurement_chunks"] == 8
     # run_full_search has no KL / speed-bench params -- must not be forwarded.
