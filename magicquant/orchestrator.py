@@ -11,6 +11,7 @@ The core loop:
 """
 
 import json
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
@@ -209,6 +210,7 @@ class MagicQuantOrchestrator:
         enable_speed_bench: bool = False,
         measurement_chunks: Optional[int] = None,
         seed_incumbents: bool = True,
+        resume: bool = True,
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run the full Predict -> Measure -> Learn loop.
@@ -254,6 +256,21 @@ class MagicQuantOrchestrator:
                 tier-winner/epsilon picks (deduped against them), so every
                 run records a real measurement for each one -- those entries
                 carry an "incumbent": tier tag in search_results.json.
+            resume: on start, look for ``<output_dir>/_measured_checkpoint
+                .json`` from a prior (possibly killed) run of this exact
+                search -- same seed, same source-model identity (path +
+                size + mtime), same measurement conditions (chunks/ctx_size
+                /corpus). If it matches, restore the baseline PPL,
+                sensitivity weights, and every already-recorded measurement
+                (skipping their rebuild via the existing config_key check)
+                instead of re-running baseline measurement and probing from
+                scratch. A missing/mismatched/corrupt checkpoint is logged
+                and ignored -- the run proceeds fresh and overwrites it. A
+                checkpoint is written after baseline+probing complete and
+                after every successful candidate measurement (atomic
+                tmp-then-``os.replace``, mirroring the GGUF writer's crash
+                safety), and deleted once the run completes successfully.
+                On by default; pass False to always start fresh.
 
         Returns:
             (all_configs, tiered_best) where tiered_best maps tier names
@@ -281,72 +298,106 @@ class MagicQuantOrchestrator:
         if measurement_chunks is not None:
             self.llama_tools.ppl_chunks = measurement_chunks
 
-        # ── Step 1: Baseline perplexity ──
-        if verbose:
-            log.info("Baseline perplexity", stage="baseline")
-
-        self.baseline_ppl = self.llama_tools.calculate_perplexity(
-            self.source_model_path, verbose=verbose
+        # ── Resume: look for a checkpoint from a prior (possibly killed) run
+        # of this exact search before doing any real measurement work ──
+        checkpoint_path = self._measured_checkpoint_path()
+        checkpoint = (
+            self._load_matching_checkpoint(checkpoint_path, verbose) if resume else None
         )
-        if self.baseline_ppl is None:
-            # Measured search is worthless against a fabricated baseline: every
-            # measured_loss=(ppl-baseline)/baseline and every survivor ranking
-            # would be computed against a guess. Fail loudly rather than
-            # silently emit "verified" tiers that were never verified.
-            raise RuntimeError(
-                "Measured search could not measure baseline perplexity "
-                f"(llama-perplexity on {self.source_model_path}). Check the "
-                "llama.cpp build and calibration corpus. Refusing to proceed "
-                "with a fabricated baseline; use prediction-only search "
-                "(run_full_search) if no llama.cpp is available."
+
+        # ── Step 1: Baseline perplexity ──
+        if checkpoint is not None:
+            self.baseline_ppl = checkpoint["baseline_ppl"]
+            self.baseline_provenance = checkpoint["baseline_provenance"]
+            for key, entry in checkpoint.get("measured", {}).items():
+                self._measured[key] = dict(entry)
+            if verbose:
+                log.info(
+                    "Resumed baseline + measurements from checkpoint",
+                    stage="resume", path=str(checkpoint_path),
+                    measured=len(self._measured),
+                )
+        else:
+            if verbose:
+                log.info("Baseline perplexity", stage="baseline")
+
+            self.baseline_ppl = self.llama_tools.calculate_perplexity(
+                self.source_model_path, verbose=verbose
             )
-        self.baseline_provenance = "measured"
+            if self.baseline_ppl is None:
+                # Measured search is worthless against a fabricated baseline: every
+                # measured_loss=(ppl-baseline)/baseline and every survivor ranking
+                # would be computed against a guess. Fail loudly rather than
+                # silently emit "verified" tiers that were never verified.
+                raise RuntimeError(
+                    "Measured search could not measure baseline perplexity "
+                    f"(llama-perplexity on {self.source_model_path}). Check the "
+                    "llama.cpp build and calibration corpus. Refusing to proceed "
+                    "with a fabricated baseline; use prediction-only search "
+                    "(run_full_search) if no llama.cpp is available."
+                )
+            self.baseline_provenance = "measured"
 
         # ── Step 1b: optional imatrix + KL base logits ──
         # Both are best-effort: a failure here degrades to the historical
         # behavior (unweighted quant / no KL score) rather than aborting a
         # real measured search over a secondary quality signal.
         if use_imatrix:
+            # enable_imatrix -> ensure_imatrix already caches capture to disk
+            # and reuses it on a hit, so re-calling this on resume is cheap
+            # when the cache survived and correctly recomputes when it didn't
+            # -- no separate resume bookkeeping needed for imatrix itself.
             self.enable_imatrix(imatrix_corpus)
 
         if enable_kl:
-            # Reuse the SAME corpus already configured for baseline-PPL
-            # measurement (not imatrix_corpus, a separate calibration-corpus
-            # concept) -- KL only means something when base and candidate are
-            # compared over identical text.
-            corpus = self.llama_tools._resolve_data_file(None)
-            if corpus is None:
-                log.warning(
-                    "enable_kl requested but no calibration corpus resolved "
-                    "-- skipping KL-divergence scoring", stage="kl",
-                )
-            else:
-                base_logits_path = str(self.output_dir / "_kl_base_logits.kld")
-                saved = self.llama_tools.save_base_logits(
-                    self.source_model_path, corpus, base_logits_path,
-                    ctx_size=self.llama_tools.ctx_size,
-                )
-                if saved:
-                    self._kl_base_logits_path = base_logits_path
-                    self._kl_corpus_path = corpus
-                    log.info("KL base logits saved", stage="kl", path=base_logits_path)
-                else:
+            # On resume, reuse the checkpoint's KL base-logits file if it's
+            # still on disk -- regenerating it is one llama-perplexity pass
+            # over the whole corpus, exactly the kind of work resume exists
+            # to avoid. Falls through to a fresh capture if the file is gone.
+            reused_kl = False
+            if checkpoint is not None:
+                ck_kl = checkpoint.get("kl") or {}
+                base_path = ck_kl.get("base_logits_path")
+                if ck_kl.get("enabled") and base_path and Path(base_path).is_file():
+                    self._kl_base_logits_path = base_path
+                    self._kl_corpus_path = ck_kl.get("corpus_path")
+                    reused_kl = True
+                    if verbose:
+                        log.info(
+                            "Reusing KL base logits from checkpoint",
+                            stage="kl", path=base_path,
+                        )
+            if not reused_kl:
+                # Reuse the SAME corpus already configured for baseline-PPL
+                # measurement (not imatrix_corpus, a separate calibration-corpus
+                # concept) -- KL only means something when base and candidate are
+                # compared over identical text.
+                corpus = self.llama_tools._resolve_data_file(None)
+                if corpus is None:
                     log.warning(
-                        "Could not save base logits -- disabling KL-divergence "
-                        "scoring for this run", stage="kl",
+                        "enable_kl requested but no calibration corpus resolved "
+                        "-- skipping KL-divergence scoring", stage="kl",
                     )
+                else:
+                    base_logits_path = str(self.output_dir / "_kl_base_logits.kld")
+                    saved = self.llama_tools.save_base_logits(
+                        self.source_model_path, corpus, base_logits_path,
+                        ctx_size=self.llama_tools.ctx_size,
+                    )
+                    if saved:
+                        self._kl_base_logits_path = base_logits_path
+                        self._kl_corpus_path = corpus
+                        log.info("KL base logits saved", stage="kl", path=base_logits_path)
+                    else:
+                        log.warning(
+                            "Could not save base logits -- disabling KL-divergence "
+                            "scoring for this run", stage="kl",
+                        )
 
         # ── Step 2: Sensitivity probing ──
-        if verbose:
-            log.info("Sensitivity probing", stage="probing")
-
-        prober = SensitivityProber(
-            base_model_path=self.source_model_path,
-            baseline_perplexity=self.baseline_ppl,
-            perplexity_calculator=self.llama_tools,
-            output_dir=str(self.output_dir / "_probes"),
-        )
-
+        # Group detection is cheap tensor-name classification (no
+        # measurement calls), so it always runs regardless of resume --
+        # only the expensive probe_all_groups() below is skippable.
         groups = ["E", "H", "Q", "K", "O", "U", "D"]
         # Add MoE/SSM groups if present in the model
         classifier = TensorGroupClassifier()
@@ -364,17 +415,39 @@ class MagicQuantOrchestrator:
         # varies X/R/S (otherwise it falls back to DEFAULT_GROUPS).
         self._search_groups = groups
 
-        prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
-        self.sensitivity_weights = prober.get_normalized_weights()
-        self.probing_provenance = prober.probing_provenance
-        prober.save_results(str(self.output_dir / "sensitivity.json"))
+        if checkpoint is not None:
+            self.sensitivity_weights = checkpoint["sensitivity_weights"]
+            self.probing_provenance = checkpoint["probing_provenance"]
+            if verbose:
+                log.info(
+                    "Resumed sensitivity weights from checkpoint", stage="resume",
+                )
+        else:
+            if verbose:
+                log.info("Sensitivity probing", stage="probing")
 
-        if verbose:
-            log.info(
-                "Sensitivity weights computed",
-                stage="probing",
-                weights={g: round(w, 3) for g, w in self.sensitivity_weights.items()},
+            prober = SensitivityProber(
+                base_model_path=self.source_model_path,
+                baseline_perplexity=self.baseline_ppl,
+                perplexity_calculator=self.llama_tools,
+                output_dir=str(self.output_dir / "_probes"),
             )
+            prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
+            self.sensitivity_weights = prober.get_normalized_weights()
+            self.probing_provenance = prober.probing_provenance
+            prober.save_results(str(self.output_dir / "sensitivity.json"))
+
+            if verbose:
+                log.info(
+                    "Sensitivity weights computed",
+                    stage="probing",
+                    weights={g: round(w, 3) for g, w in self.sensitivity_weights.items()},
+                )
+
+        # Baseline + probing are complete (whether resumed or freshly
+        # measured) -- checkpoint now so a kill during Step 4 can resume
+        # past both without re-running either.
+        self._write_measured_checkpoint(checkpoint_path)
 
         # ── Step 3: Initialize predictor ──
         # (_estimate_model_size also populates self._param_counts per group.)
@@ -550,6 +623,11 @@ class MagicQuantOrchestrator:
                             predicted_loss=round(predicted_loss, 4),
                             residual=round(residual, 4),
                         )
+
+                    # Persist after EVERY successful measurement -- a kill
+                    # right after this point must resume with this candidate
+                    # already recorded, not lost.
+                    self._write_measured_checkpoint(checkpoint_path)
                 else:
                     if verbose:
                         log.warning("Measurement failed", stage="measurement")
@@ -595,6 +673,9 @@ class MagicQuantOrchestrator:
 
         # Save all results
         self._save_results(all_configs, tiered)
+
+        # Run completed successfully -- the checkpoint's job is done.
+        checkpoint_path.unlink(missing_ok=True)
 
         if verbose:
             for tier, info in tiered.items():
@@ -1147,6 +1228,146 @@ class MagicQuantOrchestrator:
             seed_configs.append(restricted)
             incumbent_tier_by_key[self._config_key(restricted)] = tier
         return seed_configs, incumbent_tier_by_key
+
+    # ------------------------------------------------------------------
+    # Measured-search checkpoint / resume
+    # ------------------------------------------------------------------
+
+    def _measured_checkpoint_path(self) -> Path:
+        return self.output_dir / "_measured_checkpoint.json"
+
+    def _source_identity(self) -> Dict[str, Any]:
+        """Identity fingerprint for the source model: path + total size +
+        latest mtime. Comparing only the path would miss an in-place model
+        swap at the same path between a killed run and its resume attempt.
+
+        A directory (safetensors checkpoint) aggregates over its
+        ``*.safetensors`` files, matching ``_estimate_model_size``'s own
+        fallback glob. Any stat failure (missing file/dir) degrades to a
+        ``None``-filled identity rather than raising -- a resume check must
+        never crash the search, it should just conclude "doesn't match".
+        """
+        p = Path(self.source_model_path)
+        try:
+            if p.is_dir():
+                total_size = 0
+                latest_mtime = 0.0
+                for f in sorted(p.glob("*.safetensors")):
+                    st = f.stat()
+                    total_size += st.st_size
+                    latest_mtime = max(latest_mtime, st.st_mtime)
+                return {"path": str(p), "size": total_size, "mtime": latest_mtime}
+            st = p.stat()
+            return {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
+        except OSError:
+            return {"path": str(p), "size": None, "mtime": None}
+
+    def _safe_resolve_corpus(self) -> Optional[str]:
+        try:
+            return self.llama_tools._resolve_data_file(None)
+        except Exception:
+            return None
+
+    def _current_measurement_conditions(self) -> Dict[str, Any]:
+        """The subset of measurement conditions that must match between a
+        checkpoint and the run attempting to resume it: the chunk cap, ctx
+        size, and calibration corpus. (Fuller run metadata -- imatrix/KL
+        state, probing provenance -- is recorded in the checkpoint too, but
+        those are RESULTS of a run, not inputs to compare for eligibility.)
+        """
+        llama = getattr(self, "_llama_tools", None)
+        return {
+            "chunks": getattr(llama, "ppl_chunks", None),
+            "ctx_size": getattr(llama, "ctx_size", None),
+            "corpus": self._safe_resolve_corpus(),
+        }
+
+    def _load_matching_checkpoint(
+        self, path: Path, verbose: bool
+    ) -> Optional[Dict[str, Any]]:
+        """Load ``_measured_checkpoint.json`` and return it only if it's
+        valid JSON AND its seed + source-model identity + measurement
+        conditions match this run. Any mismatch or parse failure logs why
+        and returns None -- the caller then runs fresh (and eventually
+        overwrites the stale/corrupt checkpoint).
+        """
+        if not path.is_file():
+            return None
+        try:
+            checkpoint = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.warning(
+                "Checkpoint unreadable/corrupted -- running fresh",
+                stage="resume", path=str(path), error=str(exc),
+            )
+            return None
+
+        reasons = []
+        if checkpoint.get("seed") != self._search_seed:
+            reasons.append(
+                f"seed {checkpoint.get('seed')!r} != {self._search_seed!r}"
+            )
+        current_source = self._source_identity()
+        if checkpoint.get("source_model") != current_source:
+            reasons.append("source model identity changed")
+        current_conditions = self._current_measurement_conditions()
+        if checkpoint.get("measurement_conditions") != current_conditions:
+            reasons.append("measurement conditions changed")
+
+        if reasons:
+            if verbose:
+                log.info(
+                    "Checkpoint present but not resumable -- running fresh",
+                    stage="resume", path=str(path), reasons=reasons,
+                )
+            return None
+        return checkpoint
+
+    def _write_measured_checkpoint(self, path: Path) -> None:
+        """Atomically persist enough state to resume a killed measured
+        search: baseline, sensitivity weights, every measurement recorded so
+        far, and the identity/condition fields a later resume must match.
+        Mirrors gguf/writer.py's tmp-then-``os.replace`` pattern -- a kill
+        mid-write must never leave a half-written checkpoint a later resume
+        attempts to parse.
+        """
+        checkpoint = {
+            "version": 1,
+            "seed": self._search_seed,
+            "source_model": self._source_identity(),
+            "measurement_conditions": self._current_measurement_conditions(),
+            "baseline_ppl": self.baseline_ppl,
+            "baseline_provenance": self.baseline_provenance,
+            "sensitivity_weights": self.sensitivity_weights,
+            "probing_provenance": self.probing_provenance,
+            "kl": {
+                "enabled": bool(self._kl_base_logits_path),
+                "base_logits_path": self._kl_base_logits_path,
+                "corpus_path": self._kl_corpus_path,
+            },
+            "imatrix": {
+                "active": self._imatrix is not None,
+                "n_tensors": len(self._imatrix) if self._imatrix else None,
+            },
+            "measured": {
+                k: {
+                    "config": v["config"],
+                    "ppl": v.get("ppl"),
+                    "measured_loss": v.get("measured_loss"),
+                    "predicted_loss": v.get("predicted_loss"),
+                    "residual": v.get("residual"),
+                    "path": v.get("path"),
+                    "size_gb": v.get("size_gb"),
+                    "kl": v.get("kl"),
+                    "bench": v.get("bench"),
+                    "incumbent": v.get("incumbent"),
+                }
+                for k, v in self._measured.items()
+            },
+        }
+        tmp_path = str(path) + ".tmp"
+        Path(tmp_path).write_text(json.dumps(checkpoint, indent=2), encoding="utf-8")
+        os.replace(tmp_path, path)
 
     @staticmethod
     def _classify_tier(size_gb: float, baseline_gb: float) -> str:

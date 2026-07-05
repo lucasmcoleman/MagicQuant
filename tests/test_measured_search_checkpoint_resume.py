@@ -1,0 +1,391 @@
+"""Measured-search checkpoint/resume tests (Part F).
+
+Uses the same fake-tools pattern as test_orchestrator_measurement.py: real
+EvolutionarySurvivor/PredictiveScorer/SensitivityProber run unmocked, only
+the I/O boundary (model source, llama.cpp tools, candidate GGUF building) is
+faked.
+"""
+import json
+
+import pytest
+
+import magicquant.gguf.source as source_mod
+from magicquant.orchestrator import MagicQuantOrchestrator
+
+
+_TENSOR_NAMES = [
+    "token_embd.weight",
+    "output.weight",
+    "blk.0.attn_q.weight",
+    "blk.0.attn_k.weight",
+    "blk.0.attn_v.weight",
+    "blk.0.attn_output.weight",
+    "blk.0.ffn_up.weight",
+    "blk.0.ffn_down.weight",
+]
+
+
+class _FakeSource:
+    def get_tensor_names(self):
+        return list(_TENSOR_NAMES)
+
+    def get_all_tensors_info(self):
+        return [{"name": n, "shape": [4, 4]} for n in _TENSOR_NAMES]
+
+    def close(self):
+        pass
+
+
+class _FakeLlamaTools:
+    """Stands in for LlamaCppTools -- no real llama.cpp binary involved.
+
+    Distinguishes a baseline call from a candidate-measurement call by
+    comparing the path against the source model path (not "the first call
+    ever"), since a resumed run may never call calculate_perplexity for the
+    baseline at all -- treating "first call" as baseline would mislabel a
+    resumed run's first (real) candidate measurement.
+    """
+
+    def __init__(self, source_model_path):
+        self.ctx_size = 512
+        self.source_model_path = source_model_path
+        self.ppl_calls = 0
+        self.baseline_calls = 0
+        self.candidate_calls = 0
+        self._kill_after = None  # raise after N successful candidate measurements
+
+    def calculate_perplexity(self, path, verbose=False, **kw):
+        self.ppl_calls += 1
+        if path == self.source_model_path:
+            self.baseline_calls += 1
+            return 5.0
+        if self._kill_after is not None and self.candidate_calls >= self._kill_after:
+            raise RuntimeError("simulated kill mid-measurement")
+        self.candidate_calls += 1
+        return 5.0 + 0.01 * self.candidate_calls  # distinct per-candidate ppl
+
+    def _resolve_data_file(self, data_file=None):
+        return "/fake/corpus.txt"
+
+    def save_base_logits(self, base_model_path, corpus_path, out_logits_path, **kw):
+        from pathlib import Path
+        Path(out_logits_path).write_text("fake logits" * 1000)
+        return True
+
+
+def _make_orchestrator(tmp_path, monkeypatch, source_name="nonexistent.gguf"):
+    monkeypatch.setattr(source_mod, "open_model_source", lambda *a, **k: _FakeSource())
+    orch = MagicQuantOrchestrator(
+        source_model_path=str(tmp_path / source_name),
+        output_dir=str(tmp_path / "out"),
+    )
+    fake_tools = _FakeLlamaTools(orch.source_model_path)
+    orch._llama_tools = fake_tools
+
+    candidates_dir = tmp_path / "candidates"
+    candidates_dir.mkdir(exist_ok=True)
+    counter = {"n": 0}
+
+    def fake_build_candidate(config, name, base_quant):
+        counter["n"] += 1
+        p = candidates_dir / f"{name}_{counter['n']}.gguf"
+        p.write_bytes(b"0" * 1024)
+        return str(p)
+
+    monkeypatch.setattr(orch, "_build_candidate", fake_build_candidate)
+    return orch, fake_tools
+
+
+def _checkpoint_path(orch):
+    return orch.output_dir / "_measured_checkpoint.json"
+
+
+# ── Happy path: checkpoint deleted on successful completion ──────────────
+
+
+def test_checkpoint_deleted_on_successful_completion(tmp_path, monkeypatch):
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+    )
+
+    assert not _checkpoint_path(orch).exists()
+
+
+def test_checkpoint_written_during_a_run(tmp_path, monkeypatch):
+    """Sanity check: the checkpoint file exists WHILE _write_measured_checkpoint
+    has been called at least once, by inspecting its final (pre-delete)
+    content shape via a monkeypatched os.replace that captures the write."""
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    captured = {}
+    import magicquant.orchestrator as orch_mod
+
+    original_replace = orch_mod.os.replace
+
+    def spy_replace(src, dst):
+        from pathlib import Path
+        captured["last"] = json.loads(Path(src).read_text())
+        return original_replace(src, dst)
+
+    monkeypatch.setattr(orch_mod.os, "replace", spy_replace)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+    )
+
+    assert captured, "checkpoint was never written"
+    assert "baseline_ppl" in captured["last"]
+    assert "measured" in captured["last"]
+
+
+# ── Kill-and-resume ───────────────────────────────────────────────────────
+
+
+def test_kill_after_n_measurements_then_resume_skips_baseline_and_measured(
+    tmp_path, monkeypatch
+):
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools._kill_after = 2  # allow baseline + 2 candidate measurements
+
+    with pytest.raises(RuntimeError, match="simulated kill"):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=5, verbose=False,
+            seed_incumbents=False, seed=42,
+        )
+
+    assert _checkpoint_path(orch).exists()
+    checkpoint = json.loads(_checkpoint_path(orch).read_text())
+    n_measured_at_kill = len(checkpoint["measured"])
+    assert n_measured_at_kill == 2
+
+    # Resume: fresh orchestrator, same output_dir/source, no more killing.
+    orch2, fake_tools2 = _make_orchestrator(tmp_path, monkeypatch)
+
+    orch2.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=5, verbose=False,
+        seed_incumbents=False, seed=42,
+    )
+
+    assert not _checkpoint_path(orch2).exists()  # completed successfully
+    # Baseline must NOT have been re-measured on resume.
+    assert fake_tools2.baseline_calls == 0
+    # The 2 checkpointed candidates were restored verbatim, not rebuilt --
+    # a rebuild would re-measure them with fake_tools2's OWN fresh
+    # candidate_calls counter and produce a different "ppl" value.
+    for key, restored_entry in checkpoint["measured"].items():
+        assert key in orch2._measured
+        assert orch2._measured[key]["ppl"] == restored_entry["ppl"]
+    # The search continued past the resume point -- more than just the 2
+    # restored candidates ended up measured by the time this run finished.
+    assert len(orch2._measured) > n_measured_at_kill
+
+
+def test_resumed_run_does_not_recall_perplexity_for_baseline(tmp_path, monkeypatch):
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools._kill_after = 1
+
+    with pytest.raises(RuntimeError):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=5, verbose=False,
+            seed_incumbents=False, seed=42,
+        )
+
+    orch2, fake_tools2 = _make_orchestrator(tmp_path, monkeypatch)
+    orch2.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=5, verbose=False,
+        seed_incumbents=False, seed=42,
+    )
+
+    # On resume the baseline is restored from the checkpoint --
+    # calculate_perplexity must never be called with the source model path.
+    assert fake_tools2.baseline_calls == 0
+
+
+# ── Mismatch forces fresh ─────────────────────────────────────────────────
+
+
+def test_seed_mismatch_forces_fresh_run(tmp_path, monkeypatch):
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False, seed=1,
+    )
+    # Successful run deletes its own checkpoint -- write one back manually to
+    # simulate "a checkpoint exists from a run with a different seed".
+    fake_checkpoint = {
+        "version": 1,
+        "seed": 999,
+        "source_model": orch._source_identity(),
+        "measurement_conditions": orch._current_measurement_conditions(),
+        "baseline_ppl": 1.23,
+        "baseline_provenance": "measured",
+        "sensitivity_weights": {"E": 1.0},
+        "probing_provenance": "measured",
+        "kl": {"enabled": False, "base_logits_path": None, "corpus_path": None},
+        "imatrix": {"active": False, "n_tensors": None},
+        "measured": {"fake:key": {"config": {"E": "BF16"}, "ppl": 1.0}},
+    }
+    _checkpoint_path(orch).write_text(json.dumps(fake_checkpoint))
+
+    orch2, fake_tools2 = _make_orchestrator(tmp_path, monkeypatch)
+    orch2.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False, seed=1,
+    )
+
+    # Fresh baseline was measured for real (not the fabricated 1.23).
+    assert orch2.baseline_ppl == 5.0
+    assert "fake:key" not in orch2._measured
+
+
+def test_source_identity_mismatch_forces_fresh_run(tmp_path, monkeypatch):
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    fake_checkpoint = {
+        "version": 1,
+        "seed": None,
+        "source_model": {"path": "/completely/different/model.gguf", "size": 1, "mtime": 1.0},
+        "measurement_conditions": orch._current_measurement_conditions(),
+        "baseline_ppl": 1.23,
+        "baseline_provenance": "measured",
+        "sensitivity_weights": {"E": 1.0},
+        "probing_provenance": "measured",
+        "kl": {"enabled": False, "base_logits_path": None, "corpus_path": None},
+        "imatrix": {"active": False, "n_tensors": None},
+        "measured": {},
+    }
+    _checkpoint_path(orch).write_text(json.dumps(fake_checkpoint))
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+    )
+
+    assert orch.baseline_ppl == 5.0
+
+
+def test_measurement_conditions_mismatch_forces_fresh_run(tmp_path, monkeypatch):
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    fake_checkpoint = {
+        "version": 1,
+        "seed": None,
+        "source_model": orch._source_identity(),
+        "measurement_conditions": {"chunks": 999, "ctx_size": 512, "corpus": "/fake/corpus.txt"},
+        "baseline_ppl": 1.23,
+        "baseline_provenance": "measured",
+        "sensitivity_weights": {"E": 1.0},
+        "probing_provenance": "measured",
+        "kl": {"enabled": False, "base_logits_path": None, "corpus_path": None},
+        "imatrix": {"active": False, "n_tensors": None},
+        "measured": {},
+    }
+    _checkpoint_path(orch).write_text(json.dumps(fake_checkpoint))
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+    )
+
+    assert orch.baseline_ppl == 5.0
+
+
+def test_resume_false_always_runs_fresh_even_with_matching_checkpoint(tmp_path, monkeypatch):
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+    )
+    # Manually recreate a matching checkpoint (the successful run above
+    # deleted its own).
+    matching = {
+        "version": 1,
+        "seed": None,
+        "source_model": orch._source_identity(),
+        "measurement_conditions": orch._current_measurement_conditions(),
+        "baseline_ppl": 1.23,
+        "baseline_provenance": "measured",
+        "sensitivity_weights": orch.sensitivity_weights,
+        "probing_provenance": orch.probing_provenance,
+        "kl": {"enabled": False, "base_logits_path": None, "corpus_path": None},
+        "imatrix": {"active": False, "n_tensors": None},
+        "measured": {},
+    }
+    _checkpoint_path(orch).write_text(json.dumps(matching))
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False, resume=False,
+    )
+
+    # resume=False must ignore even a matching checkpoint and remeasure.
+    assert orch.baseline_ppl == 5.0
+
+
+# ── Corrupted checkpoint ──────────────────────────────────────────────────
+
+
+def test_corrupted_checkpoint_json_runs_fresh_not_crash(tmp_path, monkeypatch):
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    _checkpoint_path(orch).parent.mkdir(parents=True, exist_ok=True)
+    _checkpoint_path(orch).write_text("{not valid json::::")
+
+    all_configs, tiered = orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+    )
+
+    assert orch.baseline_ppl == 5.0
+    assert orch._measured
+    assert not _checkpoint_path(orch).exists()  # completed + cleaned up
+
+
+# ── KL base-logits reuse on resume ─────────────────────────────────────────
+
+
+def test_kl_base_logits_reused_when_file_still_exists(tmp_path, monkeypatch):
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    save_calls = {"n": 0}
+
+    def fake_save_base_logits(base_model_path, corpus_path, out_logits_path, **kw):
+        save_calls["n"] += 1
+        from pathlib import Path
+        Path(out_logits_path).write_text("logits")
+        return True
+
+    monkeypatch.setattr(fake_tools, "save_base_logits", fake_save_base_logits)
+    fake_tools._kill_after = 1
+
+    with pytest.raises(RuntimeError):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=5, verbose=False,
+            seed_incumbents=False, enable_kl=True,
+        )
+    assert save_calls["n"] == 1
+
+    orch2, fake_tools2 = _make_orchestrator(tmp_path, monkeypatch)
+    monkeypatch.setattr(fake_tools2, "save_base_logits", fake_save_base_logits)
+
+    orch2.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=5, verbose=False,
+        seed_incumbents=False, enable_kl=True,
+    )
+
+    # Base logits were reused from the checkpoint, not regenerated.
+    assert save_calls["n"] == 1
