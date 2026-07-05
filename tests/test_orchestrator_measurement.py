@@ -45,8 +45,13 @@ class _FakeLlamaTools:
         self.ctx_size = 512
         self.kl_calls = []
         self.bench_calls = []
+        self.perplexity_calls = []
+        # calculate_kl_divergence's canned result -- override per-test to
+        # exercise the fused-ppl / missing-ppl / fallback paths.
+        self.kl_result = {"mean_kl": 0.01}
 
     def calculate_perplexity(self, path, verbose=False, **kw):
+        self.perplexity_calls.append(path)
         return 5.0
 
     def _resolve_data_file(self, data_file=None):
@@ -55,11 +60,14 @@ class _FakeLlamaTools:
     def save_base_logits(self, base_model_path, corpus_path, out_logits_path, **kw):
         from pathlib import Path
         Path(out_logits_path).write_text("fake logits" * 1000)
-        return True
+        # This pass's own "Final estimate: PPL" -- distinct from the
+        # standalone calculate_perplexity's 5.0 so fusion-vs-standalone is
+        # unambiguous in assertions.
+        return 5.0
 
     def calculate_kl_divergence(self, quant_model_path, base_logits_path, corpus_path, **kw):
         self.kl_calls.append((quant_model_path, base_logits_path, corpus_path))
-        return {"mean_kl": 0.01}
+        return self.kl_result
 
     def bench(self, model_path, **kw):
         self.bench_calls.append(model_path)
@@ -127,6 +135,108 @@ def test_measured_search_default_has_no_kl_or_bench(tmp_path, monkeypatch):
     for info in orch._measured.values():
         assert "kl" not in info
         assert "bench" not in info
+
+
+# ── Feature 1+2: PPL+KL fusion (candidate) and baseline+logits fusion ──────
+
+
+def test_measured_search_full_fusion_skips_standalone_perplexity_entirely(tmp_path, monkeypatch):
+    """When enable_kl succeeds end-to-end -- save_base_logits returns a ppl,
+    and every candidate's calculate_kl_divergence result carries "ppl" --
+    calculate_perplexity must never be called at all: not for the baseline
+    (fused via save_base_logits) and not per-candidate (fused via
+    calculate_kl_divergence), collapsing 2 llama-perplexity invocations per
+    measurement into 1."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools.kl_result = {"mean_kl": 0.01, "ppl": 6.0, "ppl_err": 0.1}
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        enable_kl=True,
+    )
+
+    assert orch.baseline_ppl == pytest.approx(5.0)  # from save_base_logits, not calculate_perplexity
+    assert orch.baseline_provenance == "measured"
+    assert orch._measured
+    for info in orch._measured.values():
+        assert info["ppl"] == pytest.approx(6.0)  # from the fused KL call
+        assert info["kl"]["ppl"] == pytest.approx(6.0)
+    assert fake_tools.perplexity_calls == [], "calculate_perplexity must never be called when fully fused"
+    assert fake_tools.kl_calls  # the fused call did happen
+
+
+def test_measured_search_kl_missing_ppl_falls_back_to_calculate_perplexity(tmp_path, monkeypatch):
+    """KL succeeds but its result lacks "ppl" (e.g. an older/unexpected
+    output format) -- must fall back to a standalone calculate_perplexity
+    call per candidate, while the baseline (independent of per-candidate KL
+    content) still fuses via save_base_logits."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools.kl_result = {"mean_kl": 0.01}  # no "ppl"
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        enable_kl=True,
+    )
+
+    assert orch.baseline_ppl == pytest.approx(5.0)
+    assert orch._measured
+    assert fake_tools.perplexity_calls, "fallback calculate_perplexity must have run per candidate"
+    for info in orch._measured.values():
+        assert info["ppl"] == pytest.approx(5.0)  # from the calculate_perplexity fallback
+        assert info["kl"] == {"mean_kl": 0.01}
+
+
+def test_measured_search_kl_call_raising_falls_back_and_records_no_kl(tmp_path, monkeypatch):
+    """calculate_kl_divergence raising outright (e.g. OSError from a
+    missing/wrong-arch binary) must fall back to calculate_perplexity for
+    ppl and record no "kl" field -- the existing "KL failure must not
+    abort/win" guarantee, now expressed through the fused code path."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+
+    def raise_oserror(*a, **k):
+        raise FileNotFoundError("llama-perplexity: exec format error")
+
+    monkeypatch.setattr(fake_tools, "calculate_kl_divergence", raise_oserror)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        enable_kl=True,
+    )
+
+    assert orch._measured
+    assert fake_tools.perplexity_calls
+    for info in orch._measured.values():
+        assert info["ppl"] == pytest.approx(5.0)
+        assert "kl" not in info
+
+
+def test_measured_search_save_base_logits_failure_falls_back_to_standalone_baseline(tmp_path, monkeypatch):
+    """If save_base_logits fails (returns None), the fused baseline attempt
+    must fall back to the historical standalone baseline pass, and KL
+    scoring must be disabled entirely for the run (no per-candidate KL
+    calls, matching the pre-fusion "disabling KL-divergence scoring"
+    warning path)."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    monkeypatch.setattr(fake_tools, "save_base_logits", lambda *a, **k: None)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        enable_kl=True,
+    )
+
+    assert orch.baseline_ppl == pytest.approx(5.0)
+    assert orch.baseline_provenance == "measured"
+    assert orch.source_model_path in fake_tools.perplexity_calls, (
+        "standalone baseline fallback must have called calculate_perplexity on the source model"
+    )
+    assert orch._kl_base_logits_path is None
+    assert not fake_tools.kl_calls
+    for info in orch._measured.values():
+        assert "kl" not in info
 
 
 def test_enable_imatrix_reaches_candidate_builds(tmp_path, monkeypatch):

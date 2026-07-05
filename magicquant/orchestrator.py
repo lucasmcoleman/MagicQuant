@@ -306,39 +306,30 @@ class MagicQuantOrchestrator:
         )
 
         # ── Step 1: Baseline perplexity ──
+        # ``baseline_needs_standalone_measurement`` tracks whether we still
+        # owe a real calculate_perplexity(source_model) pass: False when the
+        # checkpoint already restored it, OR when Step 1b below fuses it in
+        # from the KL base-logits save (that pass, even without
+        # --kl-divergence, prints this same model's own "Final estimate:
+        # PPL" -- see LlamaCppTools.save_base_logits). This turns "baseline
+        # pass + KL-base-logits pass" into ONE llama-perplexity invocation
+        # whenever enable_kl succeeds, instead of two.
+        baseline_needs_standalone_measurement = True
         if checkpoint is not None:
             self.baseline_ppl = checkpoint["baseline_ppl"]
             self.baseline_provenance = checkpoint["baseline_provenance"]
             for key, entry in checkpoint.get("measured", {}).items():
                 self._measured[key] = dict(entry)
+            baseline_needs_standalone_measurement = False
             if verbose:
                 log.info(
                     "Resumed baseline + measurements from checkpoint",
                     stage="resume", path=str(checkpoint_path),
                     measured=len(self._measured),
                 )
-        else:
-            if verbose:
-                log.info("Baseline perplexity", stage="baseline")
 
-            self.baseline_ppl = self.llama_tools.calculate_perplexity(
-                self.source_model_path, verbose=verbose
-            )
-            if self.baseline_ppl is None:
-                # Measured search is worthless against a fabricated baseline: every
-                # measured_loss=(ppl-baseline)/baseline and every survivor ranking
-                # would be computed against a guess. Fail loudly rather than
-                # silently emit "verified" tiers that were never verified.
-                raise RuntimeError(
-                    "Measured search could not measure baseline perplexity "
-                    f"(llama-perplexity on {self.source_model_path}). Check the "
-                    "llama.cpp build and calibration corpus. Refusing to proceed "
-                    "with a fabricated baseline; use prediction-only search "
-                    "(run_full_search) if no llama.cpp is available."
-                )
-            self.baseline_provenance = "measured"
-
-        # ── Step 1b: optional imatrix + KL base logits ──
+        # ── Step 1b: optional imatrix + KL base logits (fuses in the ──
+        # ── baseline measurement on a fresh run, see above) ──
         # Both are best-effort: a failure here degrades to the historical
         # behavior (unweighted quant / no KL score) rather than aborting a
         # real measured search over a secondary quality signal.
@@ -380,19 +371,58 @@ class MagicQuantOrchestrator:
                     )
                 else:
                     base_logits_path = str(self.output_dir / "_kl_base_logits.kld")
-                    saved = self.llama_tools.save_base_logits(
+                    saved_ppl = self.llama_tools.save_base_logits(
                         self.source_model_path, corpus, base_logits_path,
                         ctx_size=self.llama_tools.ctx_size,
                     )
-                    if saved:
+                    if saved_ppl is not None:
                         self._kl_base_logits_path = base_logits_path
                         self._kl_corpus_path = corpus
                         log.info("KL base logits saved", stage="kl", path=base_logits_path)
+                        if baseline_needs_standalone_measurement:
+                            # Fuse: this pass's own PPL becomes the baseline,
+                            # so the standalone baseline pass below is
+                            # skipped entirely.
+                            self.baseline_ppl = saved_ppl
+                            self.baseline_provenance = "measured"
+                            baseline_needs_standalone_measurement = False
+                            if verbose:
+                                log.info(
+                                    "Baseline perplexity (fused with KL "
+                                    "base-logits save)",
+                                    stage="baseline", ppl=round(saved_ppl, 4),
+                                )
                     else:
                         log.warning(
                             "Could not save base logits -- disabling KL-divergence "
                             "scoring for this run", stage="kl",
                         )
+
+        # ── Step 1c: standalone baseline measurement ──
+        # Skipped when the checkpoint already restored it, or Step 1b fused
+        # it in above. This is the historical baseline pass, unchanged --
+        # taken whenever enable_kl is off, or its fused attempt didn't pan
+        # out (no corpus / save failure), matching the pre-fusion behavior.
+        if baseline_needs_standalone_measurement:
+            if verbose:
+                log.info("Baseline perplexity", stage="baseline")
+
+            self.baseline_ppl = self.llama_tools.calculate_perplexity(
+                self.source_model_path, verbose=verbose
+            )
+            if self.baseline_ppl is None:
+                # Measured search is worthless against a fabricated baseline: every
+                # measured_loss=(ppl-baseline)/baseline and every survivor ranking
+                # would be computed against a guess. Fail loudly rather than
+                # silently emit "verified" tiers that were never verified.
+                raise RuntimeError(
+                    "Measured search could not measure baseline perplexity "
+                    f"(llama-perplexity on {self.source_model_path}). Check the "
+                    "llama.cpp build and calibration corpus. Refusing to proceed "
+                    "with a fabricated baseline; use prediction-only search "
+                    "(run_full_search) if no llama.cpp is available."
+                )
+            self.baseline_provenance = "measured"
 
         # ── Step 2: Sensitivity probing ──
         # Group detection is cheap tensor-name classification (no
@@ -560,8 +590,35 @@ class MagicQuantOrchestrator:
                 if path is None:
                     continue
 
-                # Measure perplexity
-                ppl = self.llama_tools.calculate_perplexity(path, verbose=verbose)
+                # Measure perplexity, fusing in the KL pass when active: a
+                # --kl-divergence run against saved base logits ALSO prints
+                # this candidate's own perplexity (Mean PPL(Q)), so when KL
+                # scoring is active we get both signals from ONE
+                # llama-perplexity invocation instead of two. Falls back to
+                # the historical standalone calculate_perplexity call when
+                # KL is off, its base logits aren't active, the KL call
+                # raised, or its result doesn't carry "ppl" -- the "KL
+                # failure must not abort/win" guarantee stays intact either
+                # way (measured entry gets ppl either way, "kl" only
+                # recorded when the KL call itself succeeded).
+                kl_result = None
+                if enable_kl and self._kl_base_logits_path:
+                    try:
+                        kl_result = self.llama_tools.calculate_kl_divergence(
+                            path, self._kl_base_logits_path, self._kl_corpus_path,
+                            ctx_size=self.llama_tools.ctx_size,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "KL-divergence measurement failed for candidate; "
+                            "continuing without it", stage="kl", error=str(exc),
+                        )
+                        kl_result = None
+
+                if kl_result is not None and kl_result.get("ppl") is not None:
+                    ppl = kl_result["ppl"]
+                else:
+                    ppl = self.llama_tools.calculate_perplexity(path, verbose=verbose)
 
                 if ppl is not None:
                     measured_loss = (ppl - self.baseline_ppl) / self.baseline_ppl
@@ -584,24 +641,16 @@ class MagicQuantOrchestrator:
                             incumbent_tier_by_key[config_key]
                         )
 
-                    # Optional secondary signals -- both best-effort (None on
+                    if kl_result is not None:
+                        self._measured[config_key]["kl"] = kl_result
+
+                    # Optional secondary signal -- best-effort (None on
                     # failure), scored in _select_final_survivors alongside
                     # measured_loss rather than gating the candidate at all.
-                    # calculate_kl_divergence/bench only catch
-                    # CalledProcessError/TimeoutExpired internally; a missing
-                    # or wrong-arch binary raises OSError/FileNotFoundError,
-                    # which must not abort the rest of the search.
-                    if enable_kl and self._kl_base_logits_path:
-                        try:
-                            self._measured[config_key]["kl"] = self.llama_tools.calculate_kl_divergence(
-                                path, self._kl_base_logits_path, self._kl_corpus_path,
-                                ctx_size=self.llama_tools.ctx_size,
-                            )
-                        except Exception as exc:
-                            log.warning(
-                                "KL-divergence measurement failed for candidate; "
-                                "continuing without it", stage="kl", error=str(exc),
-                            )
+                    # bench() only catches CalledProcessError/TimeoutExpired
+                    # internally; a missing or wrong-arch binary raises
+                    # OSError/FileNotFoundError, which must not abort the
+                    # rest of the search.
                     if enable_speed_bench:
                         try:
                             self._measured[config_key]["bench"] = self.llama_tools.bench(path)

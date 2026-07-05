@@ -70,7 +70,7 @@ class _FakeLlamaTools:
     def save_base_logits(self, base_model_path, corpus_path, out_logits_path, **kw):
         from pathlib import Path
         Path(out_logits_path).write_text("fake logits" * 1000)
-        return True
+        return 5.0  # this pass's own "Final estimate: PPL" (fused baseline)
 
 
 def _make_orchestrator(tmp_path, monkeypatch, source_name="nonexistent.gguf"):
@@ -365,7 +365,7 @@ def test_kl_base_logits_reused_when_file_still_exists(tmp_path, monkeypatch):
         save_calls["n"] += 1
         from pathlib import Path
         Path(out_logits_path).write_text("logits")
-        return True
+        return 5.0  # this pass's own "Final estimate: PPL" (fused baseline)
 
     monkeypatch.setattr(fake_tools, "save_base_logits", fake_save_base_logits)
     fake_tools._kill_after = 1
@@ -377,6 +377,10 @@ def test_kl_base_logits_reused_when_file_still_exists(tmp_path, monkeypatch):
             seed_incumbents=False, enable_kl=True,
         )
     assert save_calls["n"] == 1
+    # The baseline was fused from THIS save_base_logits pass, not a separate
+    # standalone calculate_perplexity call on the source model.
+    assert orch.baseline_ppl == pytest.approx(5.0)
+    assert fake_tools.baseline_calls == 0
 
     orch2, fake_tools2 = _make_orchestrator(tmp_path, monkeypatch)
     monkeypatch.setattr(fake_tools2, "save_base_logits", fake_save_base_logits)
@@ -389,6 +393,10 @@ def test_kl_base_logits_reused_when_file_still_exists(tmp_path, monkeypatch):
 
     # Base logits were reused from the checkpoint, not regenerated.
     assert save_calls["n"] == 1
+    # Baseline was restored from the checkpoint (itself fused on the first
+    # run), not re-measured via calculate_perplexity at all.
+    assert orch2.baseline_ppl == pytest.approx(5.0)
+    assert fake_tools2.baseline_calls == 0
 
 
 def test_checkpoint_tolerates_numpy_typed_measurements(tmp_path):

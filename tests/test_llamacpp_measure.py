@@ -147,8 +147,33 @@ def test_parse_kl_output_extracts_mean_max_p90():
     assert parsed["p90_kl"] == pytest.approx(-0.000005)
 
 
+def test_parse_kl_output_extracts_ppl_from_perplexity_statistics_block():
+    """A --kl-divergence run also prints a 'Perplexity statistics' block with
+    the evaluated model's own 'Mean PPL(Q)' -- extracting it here lets the
+    orchestrator fuse a candidate's PPL + KL measurement into ONE
+    llama-perplexity invocation (see run_measured_search)."""
+    parsed = _parse_kl_output(_KL_STDOUT + _KL_STDERR_NOISE)
+    assert parsed is not None
+    assert parsed["ppl"] == pytest.approx(13.821636)
+    assert parsed["ppl_err"] == pytest.approx(3.046334)
+
+
 def test_parse_kl_output_returns_none_when_absent():
     assert _parse_kl_output("nothing relevant here") is None
+
+
+def test_parse_kl_output_omits_ppl_when_perplexity_block_absent():
+    """A KL block without the preceding Perplexity-statistics block (e.g. an
+    unexpected/older output format) must still parse the KL fields -- just
+    without "ppl"/"ppl_err" -- rather than returning None outright."""
+    kl_only = (
+        "====== KL divergence statistics ======\n"
+        "Mean    KLD:  -0.000019 \xb1   0.000001\n"
+    )
+    parsed = _parse_kl_output(kl_only)
+    assert parsed is not None
+    assert parsed["mean_kl"] == pytest.approx(-0.000019)
+    assert "ppl" not in parsed
 
 
 # --- LlamaCppTools method tests (mocked subprocess) -------------------------
@@ -187,7 +212,11 @@ def test_bench_parses_result_from_mocked_subprocess():
     assert "8" in cmd  # -p 8 / -n 8
 
 
-def test_save_base_logits_true_when_file_written(tmp_path):
+def test_save_base_logits_returns_ppl_when_file_written(tmp_path):
+    """save_base_logits now returns the pass's own parsed PPL (not a bare
+    bool) on success -- this pass, even without --kl-divergence, still
+    prints the normal 'Final estimate: PPL' line for the base model itself,
+    which run_measured_search fuses in as the baseline measurement."""
     import subprocess
 
     corpus = tmp_path / "corpus.txt"
@@ -195,7 +224,9 @@ def test_save_base_logits_true_when_file_written(tmp_path):
     out_logits = tmp_path / "base.kld"
 
     tools = _bare_tools()
-    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="saved", stderr="")
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="", stderr="Final estimate: PPL = 14.9619 +/- 0.85130"
+    )
 
     def _fake_run(cmd, timeout):
         # Simulate llama-perplexity actually writing a real (not stub-sized)
@@ -205,16 +236,17 @@ def test_save_base_logits_true_when_file_written(tmp_path):
         return fake
 
     with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_fake_run):
-        ok = tools.save_base_logits("/base/model.gguf", str(corpus), str(out_logits))
-    assert ok is True
+        ppl = tools.save_base_logits("/base/model.gguf", str(corpus), str(out_logits))
+    assert ppl == pytest.approx(14.9619)
     assert out_logits.is_file()
 
 
-def test_save_base_logits_false_when_file_is_stub_sized(tmp_path):
+def test_save_base_logits_none_when_file_is_stub_sized(tmp_path):
     """A too-short corpus makes llama-perplexity exit 0 but write only a
-    ~12-byte header stub -- save_base_logits must treat that as failure, not
-    just check the file exists (regression: this previously returned True,
-    then calculate_kl_divergence silently failed to find 'Mean KLD')."""
+    ~12-byte header stub -- save_base_logits must treat that as failure
+    (None), not just check the file exists (regression: this previously
+    returned True, then calculate_kl_divergence silently failed to find
+    'Mean KLD'). The stub-file guard wins even if a PPL line parsed."""
     import subprocess
 
     corpus = tmp_path / "corpus.txt"
@@ -222,18 +254,20 @@ def test_save_base_logits_false_when_file_is_stub_sized(tmp_path):
     out_logits = tmp_path / "base.kld"
 
     tools = _bare_tools()
-    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="", stderr="Final estimate: PPL = 14.9619 +/- 0.85130"
+    )
 
     def _fake_run(cmd, timeout):
         out_logits.write_bytes(b"_logits_\x80\x00\x00\x00")  # the real 12-byte stub
         return fake
 
     with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_fake_run):
-        ok = tools.save_base_logits("/base/model.gguf", str(corpus), str(out_logits))
-    assert ok is False
+        ppl = tools.save_base_logits("/base/model.gguf", str(corpus), str(out_logits))
+    assert ppl is None
 
 
-def test_save_base_logits_false_when_file_missing(tmp_path):
+def test_save_base_logits_none_when_file_missing(tmp_path):
     import subprocess
 
     corpus = tmp_path / "corpus.txt"
@@ -243,8 +277,31 @@ def test_save_base_logits_false_when_file_missing(tmp_path):
     tools = _bare_tools()
     fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
     with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake):
-        ok = tools.save_base_logits("/base/model.gguf", str(corpus), str(out_logits))
-    assert ok is False
+        ppl = tools.save_base_logits("/base/model.gguf", str(corpus), str(out_logits))
+    assert ppl is None
+
+
+def test_save_base_logits_none_when_ppl_unparseable(tmp_path):
+    """A valid (non-stub) logits file but no parseable 'Final estimate: PPL'
+    line -- unrealistic for a real llama-perplexity run, but the return
+    contract is a plain Optional[float], so this degrades to None rather
+    than raising."""
+    import subprocess
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("hello world\n")
+    out_logits = tmp_path / "base.kld"
+
+    tools = _bare_tools()
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="no ppl line here", stderr="")
+
+    def _fake_run(cmd, timeout):
+        out_logits.write_bytes(b"fake-logits" * 1000)
+        return fake
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_fake_run):
+        ppl = tools.save_base_logits("/base/model.gguf", str(corpus), str(out_logits))
+    assert ppl is None
 
 
 def test_calculate_kl_divergence_parses_mocked_subprocess(tmp_path):
@@ -560,10 +617,10 @@ def test_bench_and_kl_self_consistency_live(tmp_path):
     corpus.write_text(_TINY_CORPUS)
     base_logits = tmp_path / "base_logits.kld"
 
-    saved_ok = tools.save_base_logits(
+    saved_ppl = tools.save_base_logits(
         _TINY_MODEL, str(corpus), str(base_logits), ctx_size=128, chunks=2, timeout=120,
     )
-    assert saved_ok is True
+    assert saved_ppl is not None and saved_ppl > 0
     assert base_logits.is_file()
 
     kl_result = tools.calculate_kl_divergence(
@@ -574,6 +631,14 @@ def test_bench_and_kl_self_consistency_live(tmp_path):
     # deterministic saved-logits precision artifact -- see module docstring)
     # rather than exactly 0, so assert magnitude rather than sign.
     assert abs(kl_result["mean_kl"]) < 1e-3
+
+    # Fusion parity (Features 1+2, live): the KL pass's own "Mean PPL(Q)"
+    # must match a standalone/save-base-logits perplexity pass over the same
+    # model/corpus/chunks -- the exact invariant run_measured_search's
+    # baseline+candidate fusion relies on to replace two llama-perplexity
+    # invocations with one.
+    assert kl_result.get("ppl") is not None
+    assert kl_result["ppl"] == pytest.approx(saved_ppl, abs=0.01)
 
 
 @pytest.mark.gpu

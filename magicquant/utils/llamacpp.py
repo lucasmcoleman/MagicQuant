@@ -436,13 +436,20 @@ class LlamaCppTools:
         ctx_size: int = 512,
         chunks: int = -1,
         timeout: int = _SUBPROCESS_TIMEOUT,
-    ) -> bool:
+    ) -> Optional[float]:
         """Run the base model once, saving per-token logits to disk.
 
         These saved logits are the reference distribution that later
         ``calculate_kl_divergence`` calls compare quantized models against.
         Wraps ``llama-perplexity -m <base> -f <corpus>
         --kl-divergence-base <out_logits_path>``.
+
+        This pass, even without ``--kl-divergence``, still prints the normal
+        "Final estimate: PPL = ..." line for the base model itself -- so a
+        caller that also needs the base model's own perplexity (e.g. as the
+        measured-search baseline) can get it from THIS single invocation
+        instead of running a separate ``calculate_perplexity`` pass over the
+        same model/corpus (see ``run_measured_search``'s baseline+KL fusion).
 
         Args:
             base_model_path: Path to the (typically un-quantized/BF16 or
@@ -454,7 +461,11 @@ class LlamaCppTools:
             timeout: Subprocess timeout in seconds.
 
         Returns:
-            True if the subprocess succeeded and out_logits_path exists.
+            The parsed "Final estimate: PPL" value from this pass on success,
+            or *None* if the subprocess failed, or the output logits file is
+            missing/stub-sized, or no PPL line could be parsed. The stub-file
+            guard always wins: a stub-sized output file means failure/None
+            even if a PPL line happened to parse from stdout/stderr.
         """
         cmd = [
             self.perplexity_tool,
@@ -466,13 +477,13 @@ class LlamaCppTools:
         ] + self._gpu_flags()
 
         try:
-            self._run_perplexity_subprocess(cmd, timeout=timeout)
+            result = self._run_perplexity_subprocess(cmd, timeout=timeout)
         except subprocess.CalledProcessError as e:
             print(f"Saving base logits failed: {e.stderr}")
-            return False
+            return None
         except subprocess.TimeoutExpired:
             print("Saving base logits timed out")
-            return False
+            return None
 
         # llama-perplexity exits 0 even when it can't actually run (e.g. the
         # corpus tokenizes to fewer tokens than ctx_size*chunks requires) --
@@ -481,7 +492,10 @@ class LlamaCppTools:
         # small model/corpus). is_file() alone can't tell success from a
         # stub, so also require a minimum size.
         out_path = Path(out_logits_path)
-        return out_path.is_file() and out_path.stat().st_size > _MIN_LOGITS_FILE_BYTES
+        if not (out_path.is_file() and out_path.stat().st_size > _MIN_LOGITS_FILE_BYTES):
+            return None
+
+        return _parse_perplexity_output((result.stdout or "") + "\n" + (result.stderr or ""))
 
     def calculate_kl_divergence(
         self,
@@ -517,9 +531,16 @@ class LlamaCppTools:
             timeout: Subprocess timeout in seconds.
 
         Returns:
-            {"mean_kl": float, "max_kl": float, "p90_kl": float} (the
-            latter two omitted if absent from the output), or None if the
-            run failed or the "Mean KLD" line couldn't be found.
+            {"mean_kl": float, "max_kl": float, "p90_kl": float, "ppl": float,
+            "ppl_err": float} (all but "mean_kl" omitted if absent from the
+            output), or None if the run failed or the "Mean KLD" line
+            couldn't be found. "ppl" is this pass's own "Mean PPL(Q)" --
+            the evaluated (quantized) model's perplexity over the same
+            chunks, printed in the "Perplexity statistics" block that always
+            precedes "KL divergence statistics" -- so a caller needing both
+            perplexity and KL divergence for a candidate can get both from
+            this ONE invocation instead of a separate calculate_perplexity
+            call (see run_measured_search's candidate-measurement fusion).
         """
         cmd = [
             self.perplexity_tool,
@@ -629,13 +650,18 @@ def _parse_kl_output(output: str) -> Optional[dict]:
         Maximum KLD:   0.000001
         90.0%   KLD:  -0.000005
 
+    It also prints a "Perplexity statistics" block just above the KL block,
+    including the evaluated model's own perplexity::
+
+        Mean PPL(Q)                   :  13.821636 ±   3.046334
+
     Args:
         output: Combined stdout+stderr from llama-perplexity.
 
     Returns:
-        {"mean_kl": float, "max_kl": float, "p90_kl": float} (max_kl/p90_kl
-        omitted if not present in the output), or None if no "Mean ... KLD:"
-        line is found.
+        {"mean_kl": float, "max_kl": float, "p90_kl": float, "ppl": float,
+        "ppl_err": float} (all but "mean_kl" omitted if not present in the
+        output), or None if no "Mean ... KLD:" line is found.
     """
     result: dict = {}
 
@@ -651,6 +677,18 @@ def _parse_kl_output(output: str) -> Optional[dict]:
     m = re.search(r"90\.0%\s+KLD:\s*(-?\d+\.?\d*)", output)
     if m:
         result["p90_kl"] = float(m.group(1))
+
+    # The evaluated model's own perplexity, from the "Perplexity statistics"
+    # block that precedes "KL divergence statistics" -- lets a caller fuse a
+    # candidate's PPL + KL measurement into this one invocation instead of
+    # two (see llamacpp.py's calculate_kl_divergence docstring / orchestrator
+    # .py's run_measured_search).
+    m = re.search(
+        r"Mean PPL\(Q\)\s*:\s*(\d+\.?\d*)\s*(?:\xb1|\+/-)\s*(\d+\.?\d*)", output
+    )
+    if m:
+        result["ppl"] = float(m.group(1))
+        result["ppl_err"] = float(m.group(2))
 
     return result
 
