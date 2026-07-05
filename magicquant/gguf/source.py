@@ -154,8 +154,24 @@ class GGUFSource(ModelSource):
         # a seek()+read() pair races (the GIL drops between the two calls; a
         # wrong tensor comes back with the RIGHT byte count -- silent output
         # corruption). pread needs no lock and never touches the handle's
-        # own file position.
-        buf = os.pread(self._fh.fileno(), byte_len, self._data_offset + info["offset"])
+        # own file position. A single pread syscall returns at most ~2 GiB on
+        # Linux, so gather in a loop -- a 27B model's token_embd (2.4 GiB
+        # BF16) exceeds the cap and came back short in one call.
+        fd = self._fh.fileno()
+        pos = self._data_offset + info["offset"]
+        remaining = byte_len
+        chunks = []
+        while remaining > 0:
+            chunk = os.pread(fd, remaining, pos)
+            if not chunk:
+                raise IOError(
+                    f"unexpected EOF reading tensor {tensor_name!r}: "
+                    f"{remaining} of {byte_len} bytes missing at offset {pos}"
+                )
+            chunks.append(chunk)
+            pos += len(chunk)
+            remaining -= len(chunk)
+        buf = chunks[0] if len(chunks) == 1 else b"".join(chunks)
         if type_name == "F32":
             return np.frombuffer(buf, dtype=np.float32).copy()
         if type_name == "F16":

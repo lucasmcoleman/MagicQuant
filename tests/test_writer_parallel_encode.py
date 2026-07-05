@@ -319,3 +319,41 @@ def test_resolve_encode_budget_bytes_floor_is_largest_single_tensor(monkeypatch)
     ]
     cap = writer_mod._resolve_encode_budget_bytes(entries, 1)
     assert cap >= 10_000_000 * 4
+
+
+def test_gguf_source_pread_short_reads_are_gathered(tmp_path, monkeypatch):
+    """os.pread returns at most ~2GiB per syscall on Linux; a 27B model's
+    token_embd (2.4GiB BF16) came back short in one call, truncating the
+    tensor and aborting the build (caught live on the real Qwopus 27B,
+    2026-07-05). Simulate the cap with a tiny per-call limit and assert the
+    gather loop reassembles the exact bytes."""
+    import struct
+    import numpy as np
+    import magicquant.gguf.source as source_mod
+
+    # Minimal single-tensor F32 GGUF via the project's own writer round-trip
+    # is heavy; instead monkeypatch a GGUFSource around a raw file.
+    data = np.arange(4096, dtype=np.float32)
+    raw = tmp_path / "raw.bin"
+    raw.write_bytes(data.tobytes())
+
+    src = source_mod.GGUFSource.__new__(source_mod.GGUFSource)
+    src._path = str(raw)
+    src._fh = None
+    src._data_offset = 0
+    src._reader = type("R", (), {"get_tensor_info": staticmethod(
+        lambda name: {"data_type": 0, "shape": [4096], "offset": 0}
+    )})()
+
+    real_pread = __import__("os").pread
+    calls = []
+
+    def capped_pread(fd, n, pos):
+        n = min(n, 1000)  # simulate the syscall cap
+        calls.append(n)
+        return real_pread(fd, n, pos)
+
+    monkeypatch.setattr(source_mod.os, "pread", capped_pread)
+    out = src.read_tensor_f32("token_embd.weight")
+    assert len(calls) > 1, "cap never engaged -- test is vacuous"
+    np.testing.assert_array_equal(out, data)
