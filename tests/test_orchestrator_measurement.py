@@ -402,9 +402,18 @@ def test_measured_search_overlap_cleans_up_prefetched_build_on_exception(tmp_pat
             seed_incumbents=False,
         )
 
-    assert len(built_paths) >= 2, "expected the current candidate's build plus its one-ahead prefetch"
+    # The contract is LEAK-FREE, not "the prefetch physically ran": if the
+    # exception reaches the finally before the single worker dequeues the
+    # prefetch job, cancel() legitimately wins and no second build happens
+    # (Opus review reproduced that ordering ~1 in 8 suite runs). Either way,
+    # no unconsumed candidate GGUF may remain on disk.
     from pathlib import Path as _Path
-    assert not _Path(built_paths[1]).exists(), "the prefetched (never-consumed) build must be cleaned up"
+    assert built_paths, "candidate i itself must have been built"
+    leaked = [
+        f for f in (tmp_path / "candidates").glob("*.gguf")
+        if str(f) != built_paths[0]  # candidate i's own file may remain (pre-existing serial behavior)
+    ]
+    assert not leaked, f"prefetched (never-consumed) build(s) leaked: {leaked}"
 
 
 def test_enable_imatrix_reaches_candidate_builds(tmp_path, monkeypatch):
