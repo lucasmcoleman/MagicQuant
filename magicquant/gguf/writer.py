@@ -10,13 +10,23 @@ abstraction in ``magicquant.gguf.source``.
 Architecture:
   Pass 1 (header): Compute target types, data sizes, and offsets for every
       tensor without touching actual data. Write the complete GGUF header.
-  Pass 2 (data): A background thread reads + encodes tensors while the main
-      thread writes blobs to disk. This overlaps I/O with computation for
-      ~2x throughput on large models.
+  Pass 2 (data): A pool of background threads reads + encodes tensors while
+      the main thread writes blobs to disk in tensor order. This overlaps
+      I/O with computation, and — since ggml_quantize_chunk is a ctypes call
+      that releases the GIL for its duration — lets the encode workers run
+      genuinely in parallel across CPU cores. Encoded blobs are still
+      written out strictly in Pass-1 order regardless of which worker
+      finished them, so output is byte-identical to the single-worker path
+      no matter how many threads are used (see ``_parallel_encode_iter``).
+      Thread count defaults to ``min(8, os.cpu_count() // 2)``; override with
+      ``MAGICQUANT_ENCODE_THREADS`` (``1`` reproduces the exact historical
+      single-worker code path).
 """
 
 from typing import Dict, List, Any, Optional
 from pathlib import Path
+import collections
+import concurrent.futures
 import struct
 import os
 import time
@@ -264,6 +274,69 @@ def _block32_fallback(target_ggml_name: str, row_size: int, group: str) -> str:
     return "MXFP4" if low_bit else "Q8_0"
 
 
+def _encode_entry(source, entry, imatrix=None) -> bytes:
+    """Read one tensor from ``source`` and encode it per its Pass-1 target.
+
+    Pulled out of the historical single-worker loop so both the N=1 (exact
+    historical) and N>1 (pooled) encode paths run the identical logic byte
+    for byte — the only difference between them is how many threads call
+    this function concurrently, never what it computes.
+    """
+    name = entry["name"]
+    can_decode = entry["_can_decode"]
+    target = entry["_target_ggml_name"]
+    expected = entry["_expected_size"]
+
+    f32 = source.read_tensor_f32(name)
+
+    if can_decode and f32 is not None:
+        # Validate dtype before quantization dispatch.
+        # Source should return float32, but guard against bugs
+        # in source implementations that could return integer or
+        # pre-quantized data, which would silently corrupt output.
+        if not np.issubdtype(f32.dtype, np.floating):
+            raise ValueError(
+                f"Tensor {name}: expected floating-point data from "
+                f"source but got dtype={f32.dtype}. Source model may "
+                f"be pre-quantized. Use a BF16/F16/F32 source."
+            )
+        imat_vec = imatrix.get(name) if imatrix else None
+        # Sources return flat buffers; the importance vector is per
+        # input column, so supply the true row width from Pass-1
+        # shape metadata (row-major convention: ne0 = shape[-1]).
+        row_width = entry["shape"][-1] if imat_vec is not None else None
+        blob = encode_to_ggml_bytes(
+            f32, target, imatrix=imat_vec, n_per_row=row_width,
+        )
+    elif f32 is not None:
+        blob = f32.view(np.uint8).tobytes()
+    else:
+        blob = b"\x00" * expected
+
+    # Validate blob size against expected
+    if len(blob) != expected:
+        if target in ("F32", "F16", "BF16"):
+            # Safe to pad/trim uncompressed formats
+            logger.warning(
+                "Tensor %s: encoded blob size %d != expected %d "
+                "(target type %s, %d elements); %s to fit",
+                name, len(blob), expected, target,
+                entry["_n_elems"],
+                "padding" if len(blob) < expected else "trimming",
+            )
+            if len(blob) < expected:
+                blob = blob + b"\x00" * (expected - len(blob))
+            else:
+                blob = blob[:expected]
+        else:
+            raise RuntimeError(
+                f"Tensor {name}: encoder produced {len(blob)} bytes "
+                f"but expected {expected} for type {target}"
+            )
+
+    return blob
+
+
 def _read_encode_worker(source, entries, result_queue, imatrix=None):
     """
     Background thread: reads each tensor from source, encodes to ggml bytes,
@@ -274,66 +347,200 @@ def _read_encode_worker(source, entries, result_queue, imatrix=None):
 
     imatrix: optional {tensor_name: importance_vector}; tensors with an entry
     are encoded imatrix-weighted, the rest unweighted.
+
+    This is the historical single-worker path (MAGICQUANT_ENCODE_THREADS=1),
+    kept byte-for-byte as it always was; see ``_parallel_encode_iter`` for
+    the N>1 pooled path.
     """
     try:
         for entry in entries:
-            name = entry["name"]
-            can_decode = entry["_can_decode"]
-            target = entry["_target_ggml_name"]
-            expected = entry["_expected_size"]
-
-            f32 = source.read_tensor_f32(name)
-
-            if can_decode and f32 is not None:
-                # Validate dtype before quantization dispatch.
-                # Source should return float32, but guard against bugs
-                # in source implementations that could return integer or
-                # pre-quantized data, which would silently corrupt output.
-                if not np.issubdtype(f32.dtype, np.floating):
-                    raise ValueError(
-                        f"Tensor {name}: expected floating-point data from "
-                        f"source but got dtype={f32.dtype}. Source model may "
-                        f"be pre-quantized. Use a BF16/F16/F32 source."
-                    )
-                imat_vec = imatrix.get(name) if imatrix else None
-                # Sources return flat buffers; the importance vector is per
-                # input column, so supply the true row width from Pass-1
-                # shape metadata (row-major convention: ne0 = shape[-1]).
-                row_width = entry["shape"][-1] if imat_vec is not None else None
-                blob = encode_to_ggml_bytes(
-                    f32, target, imatrix=imat_vec, n_per_row=row_width,
-                )
-            elif f32 is not None:
-                blob = f32.view(np.uint8).tobytes()
-            else:
-                blob = b"\x00" * expected
-
-            # Validate blob size against expected
-            if len(blob) != expected:
-                if target in ("F32", "F16", "BF16"):
-                    # Safe to pad/trim uncompressed formats
-                    logger.warning(
-                        "Tensor %s: encoded blob size %d != expected %d "
-                        "(target type %s, %d elements); %s to fit",
-                        name, len(blob), expected, target,
-                        entry["_n_elems"],
-                        "padding" if len(blob) < expected else "trimming",
-                    )
-                    if len(blob) < expected:
-                        blob = blob + b"\x00" * (expected - len(blob))
-                    else:
-                        blob = blob[:expected]
-                else:
-                    raise RuntimeError(
-                        f"Tensor {name}: encoder produced {len(blob)} bytes "
-                        f"but expected {expected} for type {target}"
-                    )
-
+            blob = _encode_entry(source, entry, imatrix)
             result_queue.put((entry, blob))
     except Exception as exc:
         result_queue.put(exc)
     finally:
         result_queue.put(None)  # sentinel
+
+
+# ---------------------------------------------------------------------------
+# Parallel encode pool (N>1 worker threads)
+# ---------------------------------------------------------------------------
+
+# Fallback per-tensor byte estimate when there are no entries to average
+# (degenerate empty-model case); arbitrary but harmless since capacity is
+# re-derived from real entries whenever any exist.
+_DEFAULT_TENSOR_BYTES = 4 * 1024 * 1024
+
+
+def _resolve_encode_threads(env: Optional[Dict[str, str]] = None) -> int:
+    """Number of encode worker threads: MAGICQUANT_ENCODE_THREADS overrides;
+    default is min(8, os.cpu_count() // 2) (at least 1). ``1`` is the exact
+    historical single-worker path, not just "a pool of size 1".
+    """
+    environ = os.environ if env is None else env
+    raw = environ.get("MAGICQUANT_ENCODE_THREADS")
+    if raw is not None:
+        try:
+            n = int(raw)
+        except ValueError:
+            n = 0
+        if n >= 1:
+            return n
+        # Non-positive / unparsable override: fall through to the default
+        # rather than silently spawning zero workers.
+    cpu = os.cpu_count() or 2
+    return max(1, min(8, cpu // 2))
+
+
+def _entry_footprint(entry: Dict[str, Any]) -> int:
+    """Estimate the peak transient memory (bytes) one tensor occupies while
+    in flight: the decoded float32 buffer (source.read_tensor_f32's return,
+    the dominant allocation for anything but F32 passthrough) or the encoded
+    blob, whichever is larger.
+    """
+    decode_bytes = entry["_n_elems"] * 4
+    return max(decode_bytes, entry["_expected_size"])
+
+
+def _resolve_encode_budget_bytes(
+    tensor_entries: List[Dict[str, Any]], n_workers: int,
+    env: Optional[Dict[str, str]] = None,
+) -> int:
+    """Total in-flight byte budget for the N-worker encode pool.
+
+    ``MAGICQUANT_ENCODE_BUDGET_MB`` overrides directly (useful for tuning to
+    the box's RAM headroom, or for deterministic small-budget tests). The
+    default scales with both the model's actual tensor sizes (a model with
+    170 MB dense tensors gets a bigger per-slot budget than one with 2 MB
+    tensors) and the worker count (~2 tensors' worth of headroom per
+    worker), and is never smaller than the single largest tensor's footprint
+    so that tensor is never left unable to acquire its own budget alone.
+    """
+    environ = os.environ if env is None else env
+    raw = environ.get("MAGICQUANT_ENCODE_BUDGET_MB")
+    if raw:
+        try:
+            mb = float(raw)
+            if mb > 0:
+                return int(mb * 1024 * 1024)
+        except ValueError:
+            pass  # fall through to the size-derived default
+
+    footprints = [_entry_footprint(e) for e in tensor_entries]
+    if not footprints:
+        return 2 * n_workers * _DEFAULT_TENSOR_BYTES
+    avg_footprint = sum(footprints) / len(footprints)
+    capacity = int(2 * n_workers * avg_footprint)
+    return max(capacity, max(footprints))
+
+
+class _ByteBudget:
+    """Bounded byte budget gating how many decoded+encoded tensor buffers may
+    be in flight at once.
+
+    A plain bounded queue (the historical maxsize=2) caps tensor COUNT, not
+    size — fine with one worker, but real models mix tiny 1D norms with
+    100s-of-MB packed MoE expert tensors, so an N-worker, count-bounded queue
+    could let N of the big ones decode simultaneously and blow memory on a
+    box that shares RAM with the GPU. This caps total bytes instead.
+
+    A single tensor larger than the whole budget is still admitted alone
+    (acquire() only enforces the cap when something is already in flight) —
+    the same guarantee the old one-tensor-at-a-time path gave for free, so a
+    giant outlier tensor can never deadlock the pipeline.
+    """
+
+    def __init__(self, capacity_bytes: int):
+        self._capacity = max(1, capacity_bytes)
+        self._used = 0
+        self._cv = threading.Condition()
+        self.peak_used = 0  # instrumentation hook for tests
+
+    def acquire(self, nbytes: int) -> None:
+        with self._cv:
+            while self._used > 0 and self._used + nbytes > self._capacity:
+                self._cv.wait()
+            self._used += nbytes
+            self.peak_used = max(self.peak_used, self._used)
+
+    def try_acquire(self, nbytes: int) -> bool:
+        with self._cv:
+            if self._used > 0 and self._used + nbytes > self._capacity:
+                return False
+            self._used += nbytes
+            self.peak_used = max(self.peak_used, self._used)
+            return True
+
+    def release(self, nbytes: int) -> None:
+        with self._cv:
+            self._used -= nbytes
+            self._cv.notify_all()
+
+
+def _parallel_encode_iter(source, entries, imatrix, n_workers, budget):
+    """Yield ``(entry, blob, footprint)`` for every entry in ``entries``, IN
+    ORDER, encoding up to ``n_workers`` tensors concurrently via a thread
+    pool, bounded by ``budget`` (a ``_ByteBudget``).
+
+    Ordering is what makes this byte-identical to the single-worker path:
+    tasks are submitted in ``entries`` order and results are consumed from a
+    FIFO deque in that same order (``future.result()`` blocks on the oldest
+    still-pending task, not on completion order), so the caller sees exactly
+    the sequence it would from ``_read_encode_worker`` — just produced
+    faster. The caller is responsible for calling ``budget.release(footprint)``
+    once it is done with each yielded blob (i.e. after writing it), which is
+    what lets ``_refill`` admit the next tensor.
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=n_workers, thread_name_prefix="mq-encode",
+    )
+    # deque of (entry, footprint, future), oldest-submitted first.
+    pending = collections.deque()
+    n = len(entries)
+    next_idx = 0
+
+    def _submit(idx, blocking):
+        entry = entries[idx]
+        footprint = _entry_footprint(entry)
+        if blocking:
+            budget.acquire(footprint)
+        elif not budget.try_acquire(footprint):
+            return False
+        fut = executor.submit(_encode_entry, source, entry, imatrix)
+        pending.append((entry, footprint, fut))
+        return True
+
+    def _refill():
+        nonlocal next_idx
+        while next_idx < n and _submit(next_idx, blocking=False):
+            next_idx += 1
+        if not pending and next_idx < n:
+            # Nothing in flight yet the next tensor's footprint alone won't
+            # fit under try_acquire — must be a single oversized tensor.
+            # Admit it unconditionally (acquire() never blocks when the
+            # budget is empty) rather than deadlock.
+            _submit(next_idx, blocking=True)
+            next_idx += 1
+
+    try:
+        _refill()
+        while pending:
+            entry, footprint, fut = pending.popleft()
+            blob = fut.result()  # propagates worker exceptions to the caller
+            yield entry, blob, footprint
+            # By now the caller has released this entry's footprint (it
+            # writes the blob and releases immediately after each yield),
+            # so there is room to keep the pipeline topped up.
+            _refill()
+    finally:
+        # wait=True matters on the exception path: if fut.result() above
+        # raised, sibling tasks already submitted (and possibly mid-encode,
+        # reading from `source`) are still running. The caller's crash-
+        # safety contract closes `source` as soon as this propagates, so we
+        # must let every already-running task actually finish first --
+        # otherwise a sibling worker thread could touch `source` after it's
+        # closed. cancel_futures=True only drops tasks that never started.
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
@@ -345,8 +552,9 @@ class GGUFWriter:
     Write GGUF files with custom quantization configurations.
 
     Accepts any ModelSource (GGUF or safetensors) as input.
-    Uses a pipelined architecture: a background thread reads and encodes
-    tensors while the main thread writes to disk.
+    Uses a pipelined architecture: a pool of background threads reads and
+    encodes tensors (see MAGICQUANT_ENCODE_THREADS) while the main thread
+    writes to disk in tensor order.
     """
 
     def __init__(self, output_path: str):
@@ -744,34 +952,8 @@ class GGUFWriter:
             total = len(tensor_entries)
             bytes_written = 0
 
-            # Start background read+encode thread
-            result_q: queue.Queue = queue.Queue(maxsize=2)
-            worker = threading.Thread(
-                target=_read_encode_worker,
-                args=(source, tensor_entries, result_q, imatrix),
-                daemon=True,
-            )
-            worker.start()
-
-            idx = 0
-            while True:
-                item = result_q.get()
-
-                # Check for sentinel (done) or exception
-                if item is None:
-                    break
-                if isinstance(item, Exception):
-                    # Drain queue so worker thread can finish
-                    import queue as _queue_mod
-                    while True:
-                        try:
-                            result_q.get_nowait()
-                        except _queue_mod.Empty:
-                            break
-                    worker.join(timeout=5)
-                    raise item
-
-                entry, blob = item
+            def _write_entry_blob(idx: int, entry: Dict[str, Any], blob: bytes) -> None:
+                nonlocal bytes_written
                 aligned_offset = entry["offset"]
 
                 # Write alignment padding
@@ -788,7 +970,6 @@ class GGUFWriter:
 
                 f.write(blob)
                 bytes_written += len(blob)
-                idx += 1
 
                 if verbose:
                     elapsed = time.monotonic() - t_start
@@ -801,14 +982,70 @@ class GGUFWriter:
                         f"{speed:.0f} MB/s  ETA {eta:.0f}s",
                     )
 
-            # Wait for the worker to finish. If it didn't (hung encode),
-            # raise so a truncated file is never renamed into place.
-            worker.join(timeout=30)
-            if worker.is_alive():
-                raise RuntimeError(
-                    "Encoder worker thread did not finish within 30s; "
-                    "aborting to avoid writing a truncated GGUF."
+            n_workers = _resolve_encode_threads()
+
+            if n_workers <= 1:
+                # ------------------------------------------------------
+                # Exact historical single-worker path (also what
+                # MAGICQUANT_ENCODE_THREADS=1 reproduces).
+                # ------------------------------------------------------
+                result_q: queue.Queue = queue.Queue(maxsize=2)
+                worker = threading.Thread(
+                    target=_read_encode_worker,
+                    args=(source, tensor_entries, result_q, imatrix),
+                    daemon=True,
                 )
+                worker.start()
+
+                idx = 0
+                while True:
+                    item = result_q.get()
+
+                    # Check for sentinel (done) or exception
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        # Drain queue so worker thread can finish
+                        import queue as _queue_mod
+                        while True:
+                            try:
+                                result_q.get_nowait()
+                            except _queue_mod.Empty:
+                                break
+                        worker.join(timeout=5)
+                        raise item
+
+                    entry, blob = item
+                    idx += 1
+                    _write_entry_blob(idx, entry, blob)
+
+                # Wait for the worker to finish. If it didn't (hung encode),
+                # raise so a truncated file is never renamed into place.
+                worker.join(timeout=30)
+                if worker.is_alive():
+                    raise RuntimeError(
+                        "Encoder worker thread did not finish within 30s; "
+                        "aborting to avoid writing a truncated GGUF."
+                    )
+            else:
+                # ------------------------------------------------------
+                # Pooled N-worker path: entries still arrive (and get
+                # written) in Pass-1 order, so output is byte-identical
+                # to the path above -- see _parallel_encode_iter.
+                # ------------------------------------------------------
+                capacity_bytes = _resolve_encode_budget_bytes(tensor_entries, n_workers)
+                budget = _ByteBudget(capacity_bytes)
+
+                idx = 0
+                for entry, blob, footprint in _parallel_encode_iter(
+                    source, tensor_entries, imatrix, n_workers, budget,
+                ):
+                    idx += 1
+                    _write_entry_blob(idx, entry, blob)
+                    # Only now is this tensor's memory truly no longer
+                    # needed -- release lets _parallel_encode_iter admit
+                    # the next one under the byte cap.
+                    budget.release(footprint)
 
     def set_metadata(self, key: str, value: Any):
         self.metadata[key] = value
