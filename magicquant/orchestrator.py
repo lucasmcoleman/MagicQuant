@@ -720,7 +720,7 @@ class MagicQuantOrchestrator:
         results = {
             "baseline_ppl": self.baseline_ppl,
             "baseline_provenance": self.baseline_provenance,
-            "probing_provenance": self.probing_provenance,
+            "probing_provenance": getattr(self, "probing_provenance", "unknown"),
             "seed": self._search_seed,
             "measurement": self._measurement_metadata(),
             "measurements": {
