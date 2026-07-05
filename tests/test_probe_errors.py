@@ -66,6 +66,7 @@ def test_runtime_error_falls_back_to_heuristic(tmp_path, monkeypatch):
         raise RuntimeError("subprocess died")
     monkeypatch.setattr("magicquant.gguf.writer.create_hybrid_gguf", _raise)
 
-    # Should NOT raise — falls back to a heuristic float.
-    result = prober._real_probe("Q", "Q4_K_M", "BF16", verbose=False)
-    assert isinstance(result, float)
+    # Should NOT raise — falls back to a heuristic float, flagged unmeasured.
+    ppl, measured = prober._real_probe("Q", "Q4_K_M", "BF16", verbose=False)
+    assert isinstance(ppl, float)
+    assert measured is False
