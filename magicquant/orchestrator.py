@@ -575,6 +575,22 @@ class MagicQuantOrchestrator:
             # and never mutated afterward -- safe to read concurrently) and
             # writes to an output path unique to its own candidate index. No
             # other shared mutable state is touched by _build_candidate.
+            # Prefetching candidate i+1's build while candidate i is being
+            # MEASURED stacks a concurrent CPU build's working set on top of
+            # the measurement subprocess's full model load. On a big model /
+            # small box that sum OOMs (killed a real 27B run at candidate 6/7
+            # on this 124GB unified-memory box, 2026-07-05). Only overlap when
+            # the source model is small enough that a concurrent build fits
+            # alongside the measurement -- otherwise build serially (peak =
+            # max(build, measure), never their sum).
+            overlap_builds = self._should_overlap_builds()
+            if verbose:
+                log.info(
+                    "Build/measure overlap",
+                    stage="measurement",
+                    enabled=overlap_builds,
+                )
+
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
             def _submit_build(idx: int):
@@ -592,17 +608,24 @@ class MagicQuantOrchestrator:
                 future = executor.submit(self._build_candidate, cfg, name, target_base_quant)
                 return (future, cfg, key)
 
-            pending = _submit_build(0)
+            pending = _submit_build(0) if overlap_builds else None
             try:
                 for i, candidate in enumerate(to_measure):
                     config = candidate["config"]
                     config_key = self._config_key(config)
 
-                    job = pending
-                    # Prefetch the NEXT candidate's build now, so it overlaps
-                    # with this candidate's measurement below -- at most one
-                    # extra candidate GGUF on disk at a time (prefetch depth 1).
-                    pending = _submit_build(i + 1)
+                    if overlap_builds:
+                        job = pending
+                        # Prefetch the NEXT candidate's build now, so it
+                        # overlaps with this candidate's measurement below --
+                        # at most one extra candidate GGUF on disk at a time
+                        # (prefetch depth 1).
+                        pending = _submit_build(i + 1)
+                    else:
+                        # Serial: build THIS candidate now and block on it
+                        # before measuring -- never a build and a measurement
+                        # resident at once.
+                        job = _submit_build(i)
 
                     # Skip if already measured (mirrors the historical guard;
                     # _submit_build applies the identical check before ever
@@ -864,6 +887,46 @@ class MagicQuantOrchestrator:
                     break
 
         return to_build
+
+    @staticmethod
+    def _available_ram_bytes() -> Optional[int]:
+        """Best-effort MemAvailable (Linux); None if unreadable."""
+        try:
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+        return None
+
+    def _should_overlap_builds(self) -> bool:
+        """Whether to prefetch candidate i+1's build during i's measurement.
+
+        The overlap hides CPU build time behind the GPU measurement, but it
+        also holds a build's working set AND the measurement subprocess's full
+        model load in RAM at once -- which OOMs on a large model / small box
+        (a real 27B run died this way, 2026-07-05). ``MAGICQUANT_OVERLAP_BUILDS``
+        forces the choice ("0"/"false"/"no" off, anything else truthy on);
+        unset auto-disables when the source model is large relative to
+        available RAM (a concurrent build then has no headroom), so a tiny
+        model still overlaps and a 27B on a 124GB box does not.
+        """
+        raw = os.environ.get("MAGICQUANT_OVERLAP_BUILDS")
+        if raw is not None:
+            return raw.strip().lower() not in ("0", "false", "no", "")
+
+        try:
+            src = Path(self.source_model_path)
+            src_bytes = src.stat().st_size if src.is_file() else None
+        except OSError:
+            src_bytes = None
+        avail = self._available_ram_bytes()
+        if src_bytes is None or avail is None:
+            return True  # can't reason about it -- keep the historical overlap
+        # A concurrent build needs room beyond the measurement's ~model-sized
+        # load; require the source to fit in ~35% of available RAM to overlap.
+        return src_bytes < avail * 0.35
 
     def _build_candidate(
         self, config: Dict[str, str], name: str, base_quant: str

@@ -757,3 +757,51 @@ def test_enable_imatrix_falls_back_to_path_lookup_without_sibling(tmp_path, monk
     monkeypatch.setattr("magicquant.imatrix.ensure_imatrix", fake_ensure)
     orch.enable_imatrix()
     assert "imatrix_bin" not in captured
+
+
+# ── build/measure overlap memory gate (OOM fix, 2026-07-05) ──────────────────
+
+def _bare_orch_for_overlap(tmp_path, src_size):
+    from magicquant.orchestrator import MagicQuantOrchestrator
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    src = tmp_path / "model-bf16.gguf"
+    src.write_bytes(b"0" * src_size)
+    orch.source_model_path = str(src)
+    return orch
+
+
+def test_overlap_env_force_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("MAGICQUANT_OVERLAP_BUILDS", "0")
+    orch = _bare_orch_for_overlap(tmp_path, 1024)
+    assert orch._should_overlap_builds() is False
+
+
+def test_overlap_env_force_on_beats_memory_heuristic(tmp_path, monkeypatch):
+    monkeypatch.setenv("MAGICQUANT_OVERLAP_BUILDS", "1")
+    orch = _bare_orch_for_overlap(tmp_path, 10_000)
+    monkeypatch.setattr(orch, "_available_ram_bytes", lambda: 1000)  # tiny RAM
+    assert orch._should_overlap_builds() is True
+
+
+def test_overlap_auto_disables_when_source_large(tmp_path, monkeypatch):
+    monkeypatch.delenv("MAGICQUANT_OVERLAP_BUILDS", raising=False)
+    orch = _bare_orch_for_overlap(tmp_path, 51 * 1024)  # ~51 "GB" scaled
+    monkeypatch.setattr(orch.__class__, "_available_ram_bytes",
+                        staticmethod(lambda: 79 * 1024))  # 51 > 79*0.35
+    assert orch._should_overlap_builds() is False
+
+
+def test_overlap_auto_enables_when_source_small(tmp_path, monkeypatch):
+    monkeypatch.delenv("MAGICQUANT_OVERLAP_BUILDS", raising=False)
+    orch = _bare_orch_for_overlap(tmp_path, 1 * 1024)
+    monkeypatch.setattr(orch.__class__, "_available_ram_bytes",
+                        staticmethod(lambda: 79 * 1024))
+    assert orch._should_overlap_builds() is True
+
+
+def test_overlap_auto_keeps_overlap_when_ram_unreadable(tmp_path, monkeypatch):
+    monkeypatch.delenv("MAGICQUANT_OVERLAP_BUILDS", raising=False)
+    orch = _bare_orch_for_overlap(tmp_path, 51 * 1024)
+    monkeypatch.setattr(orch.__class__, "_available_ram_bytes",
+                        staticmethod(lambda: None))
+    assert orch._should_overlap_builds() is True
