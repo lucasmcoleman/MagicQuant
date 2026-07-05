@@ -140,6 +140,18 @@ class MagicQuantOrchestrator:
         """
         from magicquant.imatrix import ensure_imatrix
 
+        # Default llama-imatrix to the sibling of the discovered perplexity
+        # binary: ensure_imatrix's own fallback is a PATH lookup, which can
+        # resolve to a DIFFERENT llama.cpp build than llamacpp_path -- e.g. a
+        # stock brew install that can't load an arch only the configured fork
+        # supports (bit for real on a qwen35 MTP model, 2026-07-04).
+        if "imatrix_bin" not in kwargs:
+            perplexity = getattr(self.llama_tools, "perplexity_tool", None)
+            if perplexity:
+                sibling = Path(perplexity).parent / "llama-imatrix"
+                if sibling.exists():
+                    kwargs["imatrix_bin"] = str(sibling)
+
         self._imatrix = ensure_imatrix(
             self.source_model_path, corpus_path=corpus_path, **kwargs
         )

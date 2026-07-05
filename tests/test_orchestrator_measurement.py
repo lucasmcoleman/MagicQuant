@@ -338,3 +338,41 @@ def test_save_results_defaults_kl_and_bench_to_none_when_absent(tmp_path):
     entry = saved["measurements"]["a"]
     assert entry["kl"] is None
     assert entry["bench"] is None
+
+
+def test_enable_imatrix_uses_sibling_of_perplexity_tool(tmp_path, monkeypatch):
+    """enable_imatrix must aim llama-imatrix at the SAME llama.cpp build as
+    the perplexity tool -- ensure_imatrix's PATH fallback can resolve to a
+    different (e.g. stock brew) build that can't load arches only the
+    configured fork supports."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+
+    bin_dir = tmp_path / "fork" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "llama-imatrix").write_text("")
+    fake_tools.perplexity_tool = str(bin_dir / "llama-perplexity")
+
+    captured = {}
+
+    def fake_ensure(source, corpus_path=None, **kwargs):
+        captured.update(kwargs)
+        return {"t": object()}
+
+    monkeypatch.setattr("magicquant.imatrix.ensure_imatrix", fake_ensure)
+    assert orch.enable_imatrix() is True
+    assert captured["imatrix_bin"] == str(bin_dir / "llama-imatrix")
+
+
+def test_enable_imatrix_falls_back_to_path_lookup_without_sibling(tmp_path, monkeypatch):
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = str(tmp_path / "nowhere" / "llama-perplexity")
+
+    captured = {}
+
+    def fake_ensure(source, corpus_path=None, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr("magicquant.imatrix.ensure_imatrix", fake_ensure)
+    orch.enable_imatrix()
+    assert "imatrix_bin" not in captured
