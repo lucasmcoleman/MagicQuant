@@ -389,3 +389,34 @@ def test_kl_base_logits_reused_when_file_still_exists(tmp_path, monkeypatch):
 
     # Base logits were reused from the checkpoint, not regenerated.
     assert save_calls["n"] == 1
+
+
+def test_checkpoint_tolerates_numpy_typed_measurements(tmp_path):
+    import numpy as np
+    from pathlib import Path as _P
+    from magicquant.orchestrator import MagicQuantOrchestrator
+
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch._search_seed = 42
+    orch.baseline_ppl = 5.0
+    orch.baseline_provenance = "measured"
+    orch.probing_provenance = "measured"
+    orch.sensitivity_weights = {"E": 0.5}
+    orch._kl_base_logits_path = None
+    orch._kl_corpus_path = None
+    orch.source_model_path = str(tmp_path / "m.gguf")
+    _P(orch.source_model_path).write_bytes(b"g")
+    orch._llama_tools = None
+    orch._llamacpp_path = None
+    orch._imatrix = None
+    orch._measured = {
+        "a": {"config": {"E": "BF16"}, "ppl": np.float32(5.5),
+              "measured_loss": np.float64(0.1),
+              "kl": {"mean_kl": np.float32(0.01)},
+              "bench": {"tg": np.int64(9)}},
+    }
+    out = tmp_path / "ckpt.json"
+    orch._write_measured_checkpoint(out)
+    import json as _json
+    data = _json.loads(out.read_text())
+    assert data["measured"]["a"]["kl"]["mean_kl"] == pytest.approx(0.01)

@@ -549,7 +549,16 @@ def _parallel_encode_iter(source, entries, imatrix, n_workers, budget):
         _refill()
         while pending:
             entry, footprint, fut = pending.popleft()
-            blob = fut.result()  # propagates worker exceptions to the caller
+            # 600s per-tensor watchdog: the serial path aborts a hung encoder
+            # rather than blocking forever; the pool must too. Timeout raises,
+            # the finally-block cancels siblings, and the caller unlinks the
+            # .partial -- no truncated file is ever published.
+            try:
+                blob = fut.result(timeout=600)  # propagates worker exceptions
+            except concurrent.futures.TimeoutError:
+                raise RuntimeError(
+                    f"encode worker hung >600s on tensor {entry['name']}"
+                )
             yield entry, blob, footprint
             # By now the caller has released this entry's footprint (it
             # writes the blob and releases immediately after each yield),

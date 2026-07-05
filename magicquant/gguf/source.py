@@ -149,8 +149,13 @@ class GGUFSource(ModelSource):
         byte_len = ggml_tensor_data_size(type_name, n_elems)
         if self._fh is None:
             self._fh = open(self._path, "rb")
-        self._fh.seek(self._data_offset + info["offset"])
-        buf = self._fh.read(byte_len)
+        # os.pread is position-independent: the writer's parallel encode pool
+        # calls read_tensor_f32 from N threads on this ONE shared handle, and
+        # a seek()+read() pair races (the GIL drops between the two calls; a
+        # wrong tensor comes back with the RIGHT byte count -- silent output
+        # corruption). pread needs no lock and never touches the handle's
+        # own file position.
+        buf = os.pread(self._fh.fileno(), byte_len, self._data_offset + info["offset"])
         if type_name == "F32":
             return np.frombuffer(buf, dtype=np.float32).copy()
         if type_name == "F16":

@@ -1323,6 +1323,17 @@ class MagicQuantOrchestrator:
             return None
         return checkpoint
 
+    @staticmethod
+    def _json_safe(obj):
+        """Coerce numpy scalars/arrays a measurement might carry (kl/bench
+        values) so a checkpoint write can never crash the search mid-run."""
+        import numpy as _np
+        if isinstance(obj, _np.generic):
+            return obj.item()
+        if isinstance(obj, _np.ndarray):
+            return obj.tolist()
+        return str(obj)
+
     def _write_measured_checkpoint(self, path: Path) -> None:
         """Atomically persist enough state to resume a killed measured
         search: baseline, sensitivity weights, every measurement recorded so
@@ -1366,7 +1377,9 @@ class MagicQuantOrchestrator:
             },
         }
         tmp_path = str(path) + ".tmp"
-        Path(tmp_path).write_text(json.dumps(checkpoint, indent=2), encoding="utf-8")
+        Path(tmp_path).write_text(
+            json.dumps(checkpoint, indent=2, default=self._json_safe), encoding="utf-8"
+        )
         os.replace(tmp_path, path)
 
     @staticmethod
