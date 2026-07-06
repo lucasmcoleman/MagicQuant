@@ -63,16 +63,46 @@ CONFIGS = [
 
 
 def test_use_bytes_tps_matches_formula_exactly():
-    """tps_score under use_bytes_tps=True must exactly equal
-    min(1, baseline_size_gb / max(predicted_size, eps)), computed
-    independently via predict_size -- not the predict_tps path."""
+    """tps_score under use_bytes_tps=True must equal the non-saturating
+    compression-ratio gradient (baseline/predicted mapped through
+    MAX_SPEEDUP to [0,1]), computed independently via predict_size."""
     scorer = _scorer()
     eps = scorer._BYTES_TPS_EPS
     for cfg in CONFIGS:
         predicted_size = scorer.predict_size(cfg)
-        expected = min(1.0, scorer.baseline_size_gb / max(predicted_size, eps))
+        speedup = scorer.baseline_size_gb / max(predicted_size, eps)
+        expected = min(1.0, max(0.0,
+            (speedup - 1.0) / (scorer._BYTES_TPS_MAX_SPEEDUP - 1.0)))
         result = scorer.score_hybrid(cfg, use_bytes_tps=True)
         assert result["tps_score"] == pytest.approx(expected)
+
+
+def test_use_bytes_tps_discriminates_between_quantized_configs():
+    """Regression for the saturation bug (live A/B 2026-07-05): two DIFFERENT
+    quantized configs (both smaller than the BF16 baseline) must get DIFFERENT
+    tps_scores -- the old min(1, baseline/predicted) gave both exactly 1.0,
+    making speed_weight inert. The smaller config must score strictly higher."""
+    scorer = _scorer()
+    big = {"E": "BF16", "H": "BF16", "Q": "BF16", "K": "BF16", "O": "BF16",
+           "U": "Q6_K", "D": "Q6_K"}
+    small = {"E": "Q8_0", "H": "Q8_0", "Q": "Q8_0", "K": "Q8_0", "O": "Q8_0",
+             "U": "Q4_K_M", "D": "Q4_K_M"}
+    big_s = scorer.score_hybrid(big, use_bytes_tps=True)["tps_score"]
+    small_s = scorer.score_hybrid(small, use_bytes_tps=True)["tps_score"]
+    assert small_s > big_s, f"tps_score did not discriminate: big={big_s} small={small_s}"
+
+
+def test_speed_weight_can_flip_winner_toward_smaller():
+    """The end goal: a high enough speed_weight makes a smaller config
+    out-score a bigger one of equal-ish quality via score_hybrid's composite."""
+    scorer = _scorer()
+    big = {"E": "Q6_K", "H": "Q6_K", "Q": "Q6_K", "K": "Q6_K", "O": "Q6_K",
+           "U": "Q6_K", "D": "Q6_K"}
+    small = {"E": "Q6_K", "H": "Q6_K", "Q": "Q6_K", "K": "Q6_K", "O": "Q6_K",
+             "U": "Q4_K_M", "D": "Q4_K_M"}  # same brain, smaller FFN
+    speed = lambda c: scorer.score_hybrid(c, precision_weight=0.20,
+        size_weight=0.15, speed_weight=0.65, use_bytes_tps=True)["composite_score"]
+    assert speed(small) > speed(big)
 
 
 def test_use_bytes_tps_zero_baseline_gives_zero_tps_score():
@@ -401,3 +431,12 @@ def test_run_full_search_default_forwards_none_and_false(tmp_path, monkeypatch):
     kwargs = _CapturingSurvivor.captured[0]
     assert kwargs["objective_weights"] is None
     assert kwargs["use_bytes_tps"] is False
+
+
+def test_build_objective_weights_clamps_out_of_range_speed_weight():
+    from magicquant.orchestrator import MagicQuantOrchestrator as O
+    # >1 clamps to 1.0 (no negative precision/size); <0 clamps to 0.0
+    hi = O._build_objective_weights(1.5)
+    assert all(w >= 0 for w in hi) and hi[2] == pytest.approx(1.0)
+    lo = O._build_objective_weights(-0.5)
+    assert lo[2] == pytest.approx(0.0) and sum(lo) == pytest.approx(1.0)

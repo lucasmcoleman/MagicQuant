@@ -294,6 +294,14 @@ class PredictiveScorer:
     # Floor used by score_hybrid's use_bytes_tps path to avoid a divide-by-
     # zero when a (degenerate) predicted_size is 0.
     _BYTES_TPS_EPS = 1e-9
+    # Compression ratio (vs the BF16 baseline) that earns a full tps_score of
+    # 1.0. tg is memory-bandwidth-bound, so a model N-times smaller generates
+    # ~N-times faster; 4.0 (~a 4-bit quant of a 16-bit baseline) is the
+    # practical ceiling. This gradient is what makes speed_weight actually
+    # discriminate: EVERY quantized config is smaller than the BF16 baseline,
+    # so the old min(1, baseline/predicted) saturated to 1.0 for all of them
+    # and the speed term was inert (caught by live A/B, 2026-07-05).
+    _BYTES_TPS_MAX_SPEEDUP = 4.0
 
     def score_hybrid(
         self,
@@ -335,9 +343,13 @@ class PredictiveScorer:
             size_score = max(0.0, 1.0 - predicted_size)
 
         if use_bytes_tps:
-            tps_score = min(
-                1.0, self.baseline_size_gb / max(predicted_size, self._BYTES_TPS_EPS)
-            )
+            # Map the compression ratio to [0, 1] so it DISCRIMINATES across
+            # the quantized range: baseline-sized -> 0, >=MAX_SPEEDUP-smaller
+            # -> 1. (A bare min(1, baseline/predicted) saturates at 1.0 for
+            # every quantized config, making the speed term useless.)
+            speedup = self.baseline_size_gb / max(predicted_size, self._BYTES_TPS_EPS)
+            tps_score = (speedup - 1.0) / (self._BYTES_TPS_MAX_SPEEDUP - 1.0)
+            tps_score = min(1.0, max(0.0, tps_score))
         elif self.baseline_tps > 0:
             tps_score = min(1, predicted_tps / self.baseline_tps)
         elif predicted_tps > 0:

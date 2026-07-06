@@ -163,6 +163,10 @@ class MagicQuantOrchestrator:
         """
         if speed_weight is None:
             return None
+        # Clamp to [0, 1]: a speed_weight > 1 would make remainder negative and
+        # yield negative precision/size weights (nonsensical scoring, not a
+        # crash). Guards a typo'd --speed-weight (Opus review, 2026-07-05).
+        speed_weight = min(1.0, max(0.0, speed_weight))
         remainder = 1.0 - speed_weight
         ratio_total = cls._DEFAULT_PRECISION_WEIGHT + cls._DEFAULT_SIZE_WEIGHT
         precision_weight = remainder * (cls._DEFAULT_PRECISION_WEIGHT / ratio_total)
