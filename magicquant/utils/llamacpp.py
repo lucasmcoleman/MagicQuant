@@ -376,9 +376,9 @@ class LlamaCppTools:
         self,
         model_path: str,
         *,
-        n_prompt: int = 32,
-        n_gen: int = 32,
-        reps: int = 2,
+        n_prompt: Optional[int] = None,
+        n_gen: Optional[int] = None,
+        reps: Optional[int] = None,
         timeout: int = _BENCH_TIMEOUT,
     ) -> Optional[dict]:
         """Measure prompt-processing and token-generation throughput.
@@ -389,20 +389,37 @@ class LlamaCppTools:
         whose avg_ts is the tg t/s). Confirmed empirically against the
         ROCmFPX llama-bench build (see tests/test_llamacpp_measure.py).
 
+        Defaults are 3 reps of 128 generated tokens (was 2x32): a short
+        low-rep tg run swings widely -- the same 27B config was measured at
+        4.44 and 8.19 t/s across invocations (2026-07-05), largely from
+        thermal state and a *coexisting* GPU process (e.g. an unrelated
+        llama-server) competing for the same unified memory bandwidth. More
+        reps + a longer generation average the per-invocation noise; a
+        candidate's own reported ``tg_ts_std`` lets callers judge confidence.
+        For a trustworthy A/B, bench candidates back-to-back in one window and
+        quiesce other GPU users. Env overrides: MAGICQUANT_BENCH_REPS /
+        MAGICQUANT_BENCH_NGEN / MAGICQUANT_BENCH_NPROMPT.
+
         Args:
             model_path: Path to GGUF model to benchmark.
-            n_prompt: Prompt length (tokens) for the pp test.
-            n_gen: Generation length (tokens) for the tg test.
-            reps: Repetitions per test (-r).
+            n_prompt: Prompt length (tokens) for the pp test (default 32).
+            n_gen: Generation length (tokens) for the tg test (default 128).
+            reps: Repetitions per test (-r) (default 3).
             timeout: Subprocess timeout in seconds.
 
         Returns:
-            {"pp_ts": float, "tg_ts": float} (tokens/sec), or None if
-            llama-bench is unavailable or the run/parse failed.
+            ``{"pp_ts", "tg_ts", "pp_ts_std", "tg_ts_std"}`` (tokens/sec;
+            the ``*_std`` are the per-row stddev, or None if the build omits
+            it), or None if llama-bench is unavailable or the run/parse
+            failed.
         """
         if not self.bench_tool:
             print("llama-bench not found; skipping speed measurement")
             return None
+
+        n_prompt = n_prompt if n_prompt is not None else (_env_int("MAGICQUANT_BENCH_NPROMPT") or 32)
+        n_gen = n_gen if n_gen is not None else (_env_int("MAGICQUANT_BENCH_NGEN") or 128)
+        reps = reps if reps is not None else (_env_int("MAGICQUANT_BENCH_REPS") or 3)
 
         cmd = [
             self.bench_tool,
@@ -623,18 +640,30 @@ def _parse_bench_json(text: str) -> Optional[dict]:
 
     pp_ts = None
     tg_ts = None
+    pp_std = None
+    tg_std = None
     for row in rows:
         if not isinstance(row, dict):
             continue
+        # llama-bench names the per-row spread "stddev" on some builds and
+        # "stddev_ts" on others; accept either, None if absent.
+        std = row.get("stddev_ts", row.get("stddev"))
         if pp_ts is None and row.get("n_gen") == 0:
             pp_ts = row.get("avg_ts")
+            pp_std = std
         if tg_ts is None and row.get("n_prompt") == 0:
             tg_ts = row.get("avg_ts")
+            tg_std = std
 
     if pp_ts is None or tg_ts is None:
         return None
 
-    return {"pp_ts": float(pp_ts), "tg_ts": float(tg_ts)}
+    return {
+        "pp_ts": float(pp_ts),
+        "tg_ts": float(tg_ts),
+        "pp_ts_std": float(pp_std) if pp_std is not None else None,
+        "tg_ts_std": float(tg_std) if tg_std is not None else None,
+    }
 
 
 def _parse_kl_output(output: str) -> Optional[dict]:

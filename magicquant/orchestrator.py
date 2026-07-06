@@ -251,6 +251,7 @@ class MagicQuantOrchestrator:
         enable_speed_bench: bool = False,
         speed_aware: bool = False,
         speed_epsilon: float = 0.005,
+        speed_metric: str = "bytes",
         measurement_chunks: Optional[int] = None,
         seed_incumbents: bool = True,
         resume: bool = True,
@@ -374,6 +375,7 @@ class MagicQuantOrchestrator:
         self._kl_weight = kl_weight if enable_kl else 0.0
         self._speed_aware = speed_aware
         self._speed_epsilon = speed_epsilon
+        self._speed_metric = speed_metric
         if verbose:
             log.info(
                 "MagicQuant Measured Hybrid Search",
@@ -1076,49 +1078,57 @@ class MagicQuantOrchestrator:
 
     @staticmethod
     def _speed_aware_pick(
-        candidates: List[Dict], quality_best: Dict, epsilon: float, score_of
+        candidates: List[Dict], quality_best: Dict, epsilon: float, score_of,
+        speed_metric: str = "bytes",
     ) -> Dict:
-        """Within a tier, re-rank by measured tg throughput among
-        candidates whose *selection score* is within ``epsilon`` relative of
-        the tier's best -- otherwise leave ``quality_best`` (the flat
-        score winner) untouched.
+        """Within a tier, among candidates whose *selection score* is within
+        ``epsilon`` relative of the tier's best, pick the fastest -- otherwise
+        leave ``quality_best`` (the flat score winner) untouched.
 
-        ``score_of`` is the same KL-guarded scoring callable
+        ``speed_metric`` chooses how "fastest" is measured:
+          - ``"bytes"`` (default): smallest ``size_gb``. tg is memory-
+            bandwidth-bound, so fewer bytes IS faster generation -- and
+            ``size_gb`` is recorded for every candidate, deterministic, and
+            noise-free. A measured llama-bench tg swung ~1.85x for the SAME
+            config across invocations (thermal + coexisting GPU users), so
+            ranking on it can pick a genuinely worse config as "fastest";
+            bytes sidesteps that entirely. This is the safe default.
+          - ``"bench"``: highest measured ``bench["tg_ts"]``. Captures per-byte
+            kernel-efficiency differences (e.g. IQ vs K-quant) that bytes
+            can't see, but only trustworthy with reliable bench data (more
+            reps, quiesced GPU). Requires ``enable_speed_bench=True``; when no
+            candidate carries bench data this is a no-op and ``quality_best``
+            is returned unchanged.
+
+        ``score_of`` is the KL-guarded scoring callable
         ``_select_final_survivors`` ranks by, NOT raw measured_loss: the band
-        must inherit the "a candidate whose KL measurement failed can't beat
-        one that measured real KL" guard, so a KL-failed candidate can't
-        sneak into the speed tiebreak on raw PPL alone (adversarial review,
-        2026-07-05).
-
-        Pure function of already-recorded measurements: reads each
-        candidate's "bench" dict (``{"pp_ts", "tg_ts"}``, populated only
-        when ``run_measured_search(enable_speed_bench=True)``). Adds no new
-        GPU calls -- if nothing in the tier carries bench data, this is a
-        no-op and ``quality_best`` is returned unchanged, so
-        ``speed_aware=True`` degrades to today's plain selection whenever
-        speed-bench data isn't available.
+        inherits the "a KL-failed candidate can't beat one that measured real
+        KL" guard, and additionally, when the quality winner is KL-confirmed,
+        only KL-confirmed candidates may win the speed tiebreak (an
+        unconfirmed candidate's real quality could be terrible).
         """
-        # If the quality winner is KL-confirmed, only KL-confirmed candidates
-        # may win on speed: a candidate whose KL measurement FAILED is
-        # unconfirmed quality (its real KL could be terrible), so letting it
-        # win the tiebreak on tg alone would reward the measurement failure --
-        # the small worst-KL score penalty isn't guaranteed to exclude it from
-        # a generous epsilon band on its own.
         best_has_kl = bool(
             quality_best.get("kl") and quality_best["kl"].get("mean_kl") is not None
         )
         best_score = min(score_of(c) for c in candidates)
         threshold = best_score + epsilon * abs(best_score)
-        contenders = [
+        in_band = [
             c for c in candidates
             if score_of(c) <= threshold
-            and c.get("bench") and c["bench"].get("tg_ts") is not None
             and (not best_has_kl
                  or (c.get("kl") and c["kl"].get("mean_kl") is not None))
         ]
+        if speed_metric == "bench":
+            contenders = [c for c in in_band
+                          if c.get("bench") and c["bench"].get("tg_ts") is not None]
+            if not contenders:
+                return quality_best
+            return max(contenders, key=lambda c: c["bench"]["tg_ts"])
+        # "bytes": smaller = faster tg (bandwidth-bound), size_gb always present
+        contenders = [c for c in in_band if c.get("size_gb") is not None]
         if not contenders:
             return quality_best
-        return max(contenders, key=lambda c: c["bench"]["tg_ts"])
+        return min(contenders, key=lambda c: c["size_gb"])
 
     def _select_final_survivors(self, baseline_gb: float) -> Dict[str, Dict]:
         """From all measured configs, pick the best per tier."""
@@ -1129,6 +1139,7 @@ class MagicQuantOrchestrator:
 
         speed_aware = getattr(self, "_speed_aware", False)
         speed_epsilon = getattr(self, "_speed_epsilon", 0.005)
+        speed_metric = getattr(self, "_speed_metric", "bytes")
 
         result = {}
         for tier in ["Q8", "Q6", "Q5", "Q4", "Q3", "Q2"]:
@@ -1157,7 +1168,7 @@ class MagicQuantOrchestrator:
                 best = min(candidates, key=_score)
                 if speed_aware:
                     best = self._speed_aware_pick(
-                        candidates, best, speed_epsilon, _score
+                        candidates, best, speed_epsilon, _score, speed_metric
                     )
                 result[tier] = best
         return result

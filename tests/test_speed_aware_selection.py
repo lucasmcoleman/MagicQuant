@@ -30,7 +30,7 @@ def test_speed_aware_pick_reranks_within_epsilon():
     faster = {"measured_loss": 0.1004, "bench": {"tg_ts": 80.0}}  # +0.4% -- within 0.5%
     result = MagicQuantOrchestrator._speed_aware_pick(
         [quality_best, faster], quality_best, epsilon=0.005,
-        score_of=lambda c: c['measured_loss']
+        score_of=lambda c: c['measured_loss'], speed_metric="bench"
     )
     assert result is faster
 
@@ -40,7 +40,7 @@ def test_speed_aware_pick_ignores_candidate_outside_epsilon():
     outside = {"measured_loss": 0.11, "bench": {"tg_ts": 999.0}}  # +10% -- outside 0.5%
     result = MagicQuantOrchestrator._speed_aware_pick(
         [quality_best, outside], quality_best, epsilon=0.005,
-        score_of=lambda c: c['measured_loss']
+        score_of=lambda c: c['measured_loss'], speed_metric="bench"
     )
     assert result is quality_best
 
@@ -50,7 +50,7 @@ def test_speed_aware_pick_falls_back_when_no_candidate_has_bench():
     other = {"measured_loss": 0.1001}
     result = MagicQuantOrchestrator._speed_aware_pick(
         [quality_best, other], quality_best, epsilon=0.005,
-        score_of=lambda c: c['measured_loss']
+        score_of=lambda c: c['measured_loss'], speed_metric="bench"
     )
     assert result is quality_best
 
@@ -60,7 +60,7 @@ def test_speed_aware_pick_only_considers_within_epsilon_bench_having_candidates(
     no_bench_but_within_epsilon = {"measured_loss": 0.1001}
     result = MagicQuantOrchestrator._speed_aware_pick(
         [quality_best, no_bench_but_within_epsilon], quality_best, epsilon=0.005,
-        score_of=lambda c: c['measured_loss']
+        score_of=lambda c: c['measured_loss'], speed_metric="bench"
     )
     assert result is quality_best
 
@@ -69,7 +69,7 @@ def test_speed_aware_pick_exact_tie_prefers_higher_tg():
     a = {"measured_loss": 0.10, "bench": {"tg_ts": 20.0}}
     b = {"measured_loss": 0.10, "bench": {"tg_ts": 20.1}}
     result = MagicQuantOrchestrator._speed_aware_pick([a, b], a, epsilon=0.005,
-        score_of=lambda c: c['measured_loss'])
+        score_of=lambda c: c['measured_loss'], speed_metric="bench")
     assert result is b
 
 
@@ -81,6 +81,7 @@ def test_select_final_survivors_speed_aware_reranks_within_epsilon():
     orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
     orch._kl_weight = 0.0
     orch._speed_aware = True
+    orch._speed_metric = "bench"
     orch._speed_epsilon = 0.005
     orch._measured = {
         "a": {
@@ -101,6 +102,7 @@ def test_select_final_survivors_speed_aware_respects_epsilon_boundary():
     orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
     orch._kl_weight = 0.0
     orch._speed_aware = True
+    orch._speed_metric = "bench"
     orch._speed_epsilon = 0.005
     orch._measured = {
         "a": {
@@ -121,6 +123,7 @@ def test_select_final_survivors_speed_aware_no_bench_data_falls_back_to_loss():
     orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
     orch._kl_weight = 0.0
     orch._speed_aware = True
+    orch._speed_metric = "bench"
     orch._speed_epsilon = 0.005
     orch._measured = {
         "a": {"config": {"E": "WORSE"}, "measured_loss": 0.20, "size_gb": 4.0},
@@ -257,7 +260,7 @@ def test_run_measured_search_threads_speed_aware_params(tmp_path, monkeypatch):
     orch.run_measured_search(
         search_generations=1, population_size=4, measurement_rounds=1,
         candidates_per_round=1, verbose=False, seed_incumbents=False,
-        speed_aware=True, speed_epsilon=0.02,
+        speed_aware=True, speed_metric="bench", speed_epsilon=0.02,
     )
     assert orch._speed_aware is True
     assert orch._speed_epsilon == 0.02
@@ -286,7 +289,7 @@ def test_run_measured_search_speed_aware_end_to_end_prefers_faster_tied_candidat
     all_configs, tiered = orch.run_measured_search(
         search_generations=2, population_size=8, measurement_rounds=1,
         candidates_per_round=3, verbose=False, seed=1, seed_incumbents=False,
-        enable_speed_bench=True, speed_aware=True,
+        enable_speed_bench=True, speed_aware=True, speed_metric="bench",
     )
 
     assert orch._measured, "expected at least one measured candidate"
@@ -339,3 +342,70 @@ def test_speed_aware_respects_kl_guard(monkeypatch):
     result = orch._select_final_survivors(baseline_gb=8.0)
     tier = orch._classify_tier(4.0, 8.0)
     assert result[tier]["config"] == {"E": "GOOD"}, "KL-failed fast candidate wrongly won the speed band"
+
+
+# ── deterministic bytes metric (the noise-robust default) ────────────────────
+
+def test_speed_aware_pick_bytes_default_prefers_smaller():
+    # No bench data at all; bytes mode ranks within-epsilon band by size_gb.
+    a = {"measured_loss": 0.10, "size_gb": 5.0}
+    b = {"measured_loss": 0.1004, "size_gb": 4.0}  # within epsilon, smaller
+    result = MagicQuantOrchestrator._speed_aware_pick(
+        [a, b], a, epsilon=0.005, score_of=lambda c: c["measured_loss"]
+    )
+    assert result is b
+
+
+def test_speed_aware_pick_bytes_ignores_outside_epsilon():
+    a = {"measured_loss": 0.10, "size_gb": 5.0}
+    smaller_but_worse = {"measured_loss": 0.11, "size_gb": 1.0}  # outside epsilon
+    result = MagicQuantOrchestrator._speed_aware_pick(
+        [a, smaller_but_worse], a, epsilon=0.005, score_of=lambda c: c["measured_loss"]
+    )
+    assert result is a
+
+
+def test_speed_aware_bytes_needs_no_bench_data_unlike_bench_mode():
+    # bytes mode works with zero bench data; bench mode would no-op here.
+    a = {"measured_loss": 0.10, "size_gb": 5.0}
+    b = {"measured_loss": 0.1002, "size_gb": 3.0}
+    assert MagicQuantOrchestrator._speed_aware_pick(
+        [a, b], a, epsilon=0.005, score_of=lambda c: c["measured_loss"],
+        speed_metric="bytes") is b
+    assert MagicQuantOrchestrator._speed_aware_pick(
+        [a, b], a, epsilon=0.005, score_of=lambda c: c["measured_loss"],
+        speed_metric="bench") is a  # no bench -> quality_best
+
+
+def test_speed_aware_bytes_honors_kl_guard():
+    # KL-failed candidate can't win the bytes tiebreak when winner is KL-confirmed.
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch._kl_weight = 1.0
+    orch._speed_aware = True
+    orch._speed_metric = "bytes"
+    orch._speed_epsilon = 0.02
+    orch._measured = {
+        "good": {"config": {"E": "GOOD"}, "measured_loss": 0.100, "size_gb": 5.0,
+                 "kl": {"mean_kl": 0.01}},
+        "failed_smaller": {"config": {"E": "FAILED"}, "measured_loss": 0.101, "size_gb": 2.0},
+    }
+    result = orch._select_final_survivors(baseline_gb=8.0)
+    tier = orch._classify_tier(5.0, 8.0)
+    assert result[tier]["config"] == {"E": "GOOD"}
+
+
+def test_select_final_survivors_default_speed_metric_is_bytes():
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch._kl_weight = 0.0
+    orch._speed_aware = True
+    orch._speed_epsilon = 0.005  # note: no _speed_metric set -> getattr default "bytes"
+    orch._measured = {
+        "big_fast": {"config": {"E": "BIG"}, "measured_loss": 0.10, "size_gb": 5.0,
+                     "bench": {"tg_ts": 999.0}},
+        "small": {"config": {"E": "SMALL"}, "measured_loss": 0.1004, "size_gb": 4.0,
+                  "bench": {"tg_ts": 1.0}},
+    }
+    # default bytes: picks SMALL (fewer bytes), ignoring the noisy high tg_ts.
+    result = orch._select_final_survivors(baseline_gb=8.0)
+    tier = orch._classify_tier(4.0, 8.0)
+    assert result[tier]["config"] == {"E": "SMALL"}

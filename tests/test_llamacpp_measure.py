@@ -121,12 +121,12 @@ _KL_STDERR_NOISE = (
 
 def test_parse_bench_json_extracts_pp_and_tg_ts():
     parsed = _parse_bench_json(_BENCH_JSON)
-    assert parsed == {"pp_ts": pytest.approx(1113.103876), "tg_ts": pytest.approx(172.806123)}
+    assert parsed["pp_ts"] == pytest.approx(1113.103876) and parsed["tg_ts"] == pytest.approx(172.806123)
 
 
 def test_parse_bench_json_ignores_surrounding_banner_noise():
     parsed = _parse_bench_json(_BENCH_JSON_WITH_BANNER_NOISE)
-    assert parsed == {"pp_ts": pytest.approx(1113.103876), "tg_ts": pytest.approx(172.806123)}
+    assert parsed["pp_ts"] == pytest.approx(1113.103876) and parsed["tg_ts"] == pytest.approx(172.806123)
 
 
 def test_parse_bench_json_returns_none_on_garbage():
@@ -204,7 +204,7 @@ def test_bench_parses_result_from_mocked_subprocess():
     fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=_BENCH_JSON, stderr="")
     with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake) as run:
         result = tools.bench("/some/model.gguf", n_prompt=8, n_gen=8, reps=1)
-    assert result == {"pp_ts": pytest.approx(1113.103876), "tg_ts": pytest.approx(172.806123)}
+    assert result["pp_ts"] == pytest.approx(1113.103876) and result["tg_ts"] == pytest.approx(172.806123)
     # Sanity: bench invoked llama-bench with -o json and the given -p/-n/-r.
     cmd = run.call_args[0][0]
     assert cmd[0] == "/bin/true"
@@ -751,3 +751,38 @@ def test_ppl_chunks_unset_keeps_historical_behavior(tmp_path, monkeypatch):
 
     tools.calculate_kl_divergence(str(tmp_path / "m.gguf"), "b.kld", str(corpus))
     assert captured["cmd"][captured["cmd"].index("--chunks") + 1] == "-1"
+
+
+def test_bench_defaults_are_3reps_128gen():
+    import subprocess
+    tools = _bare_tools()
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=_BENCH_JSON, stderr="")
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake) as run:
+        tools.bench("/m.gguf")  # no explicit reps/n_gen
+    cmd = run.call_args[0][0]
+    assert cmd[cmd.index("-r") + 1] == "3"
+    assert cmd[cmd.index("-n") + 1] == "128"
+
+
+def test_bench_env_overrides_reps_and_ngen(monkeypatch):
+    import subprocess
+    monkeypatch.setenv("MAGICQUANT_BENCH_REPS", "5")
+    monkeypatch.setenv("MAGICQUANT_BENCH_NGEN", "256")
+    tools = _bare_tools()
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=_BENCH_JSON, stderr="")
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake) as run:
+        tools.bench("/m.gguf")
+    cmd = run.call_args[0][0]
+    assert cmd[cmd.index("-r") + 1] == "5"
+    assert cmd[cmd.index("-n") + 1] == "256"
+
+
+def test_bench_explicit_arg_beats_env(monkeypatch):
+    import subprocess
+    monkeypatch.setenv("MAGICQUANT_BENCH_REPS", "5")
+    tools = _bare_tools()
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=_BENCH_JSON, stderr="")
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake) as run:
+        tools.bench("/m.gguf", reps=2)
+    cmd = run.call_args[0][0]
+    assert cmd[cmd.index("-r") + 1] == "2"
