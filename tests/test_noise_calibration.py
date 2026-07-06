@@ -20,6 +20,7 @@ All new knobs are opt-in and default to False/"" -- required for the
 seed-pinned refactor-regression fixture (tests/test_refactor_regression.py),
 which is exercised (twice, as separate processes) alongside this suite.
 """
+from pathlib import Path
 import json
 
 import pytest
@@ -140,6 +141,45 @@ def test_write_noise_calibration_no_measurements_skips_gracefully(tmp_path):
     orch._write_noise_calibration()  # must not raise
 
     assert not (orch.output_dir / "noise_calibration.json").exists()
+
+
+def test_write_noise_calibration_survives_missing_repo_root_on_sys_path(
+    tmp_path, monkeypatch
+):
+    """Regression: the Foundry pipeline stage imports `magicquant` via
+    PYTHONPATH without the repo root on sys.path, so the plain
+    `from tools.fit_noise_factors import ...` raised ModuleNotFoundError and
+    write_calibration silently no-opped (run 3, 2026-07-06). The fallback
+    must locate `tools/` next to the package and still write the file."""
+    import sys
+
+    repo_root = str(Path(orch_mod.__file__).resolve().parents[1])
+    # Simulate the stage context: repo root absent, `tools` not yet imported,
+    # and no PEP 660 editable finder mapping `tools` (Foundry's venv maps only
+    # `magicquant`; this repo's own editable install maps both, which would
+    # mask the bug).
+    monkeypatch.setattr(
+        sys, "path", [p for p in sys.path if str(Path(p or ".").resolve()) != repo_root]
+    )
+    monkeypatch.setattr(
+        sys,
+        "meta_path",
+        [
+            f
+            for f in sys.meta_path
+            # PEP 660 finders may be registered as classes, so check the
+            # object's own __module__/__name__, not type(f).
+            if "editable" not in str(getattr(f, "__module__", "")).lower()
+            and "editable" not in str(getattr(f, "__name__", "")).lower()
+        ],
+    )
+    for mod in [m for m in sys.modules if m == "tools" or m.startswith("tools.")]:
+        monkeypatch.delitem(sys.modules, mod)
+
+    orch = _make_bare_orchestrator(tmp_path)
+    orch._write_noise_calibration()
+
+    assert (orch.output_dir / "noise_calibration.json").exists()
 
 
 def test_write_noise_calibration_ignores_entries_without_measured_loss(tmp_path):

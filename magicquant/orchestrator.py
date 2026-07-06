@@ -1327,9 +1327,23 @@ class MagicQuantOrchestrator:
         otherwise-successful measured search.
         """
         try:
-            from tools.fit_noise_factors import (
-                FitInput, build_calibration_envelope, fit_noise_factors,
-            )
+            try:
+                from tools.fit_noise_factors import (
+                    FitInput, build_calibration_envelope, fit_noise_factors,
+                )
+            except ModuleNotFoundError:
+                # `tools/` lives at the repo root, next to the `magicquant`
+                # package -- importable when running from a checkout, but not
+                # when only the package itself is on sys.path (e.g. a caller
+                # that added `magicquant` via PYTHONPATH or an editable
+                # install). Fall back to the checkout layout explicitly.
+                import sys
+                repo_root = str(Path(__file__).resolve().parents[1])
+                if repo_root not in sys.path:
+                    sys.path.insert(0, repo_root)
+                from tools.fit_noise_factors import (
+                    FitInput, build_calibration_envelope, fit_noise_factors,
+                )
 
             sensitivity_weights = self.sensitivity_weights or {}
             results_path = str(self.output_dir / "search_results.json")
