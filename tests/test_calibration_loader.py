@@ -163,3 +163,105 @@ def test_calibrated_speed_multiplier_independent_of_noise_factor():
     finally:
         calibration._load = orig_load
         calibration._reset_cache()
+
+
+# ── source_path override (calibration_source, LANE B / PART 2) ─────────
+#
+# Every calibrated_* lookup also accepts an optional `source_path`, letting
+# a caller (PredictiveScorer.calibration_source) LOAD a specific file
+# instead of the fixed `_CALIBRATION_PATH`. These are cached separately
+# (`_source_cache`, keyed by path) from the default-path `_cache` above, so
+# an override never interferes with -- or is shadowed by -- the default
+# lookup other callers still use.
+
+
+def test_source_path_overrides_noise_factor(tmp_path, monkeypatch):
+    # Default path deliberately missing, to prove the value came from
+    # source_path and not a coincidental default-path hit.
+    missing = tmp_path / "does_not_exist.json"
+    monkeypatch.setattr(calibration, "_CALIBRATION_PATH", missing)
+    calibration._reset_cache()
+
+    custom_path = tmp_path / "custom_calibration.json"
+    custom_path.write_text(json.dumps({
+        "schemes": {"Q4_K_M": {"noise_factor": 1.23}},
+    }))
+
+    assert calibration.calibrated_noise_factor("Q4_K_M") is None
+    assert calibration.calibrated_noise_factor("Q4_K_M", str(custom_path)) == 1.23
+
+
+def test_source_path_overrides_speed_multiplier(tmp_path, monkeypatch):
+    missing = tmp_path / "does_not_exist.json"
+    monkeypatch.setattr(calibration, "_CALIBRATION_PATH", missing)
+    calibration._reset_cache()
+
+    custom_path = tmp_path / "custom_calibration.json"
+    custom_path.write_text(json.dumps({
+        "schemes": {"IQ4_NL": {"speed_multiplier": 2.5}},
+    }))
+
+    assert calibration.calibrated_speed_multiplier("IQ4_NL") is None
+    assert calibration.calibrated_speed_multiplier("IQ4_NL", str(custom_path)) == 2.5
+
+
+def test_source_path_missing_file_returns_none(tmp_path):
+    missing = tmp_path / "does_not_exist.json"
+    assert calibration.calibrated_noise_factor("Q8_0", str(missing)) is None
+
+
+def test_source_path_malformed_file_returns_none(tmp_path):
+    bad_path = tmp_path / "bad.json"
+    bad_path.write_text("{not valid json,,,")
+    assert calibration.calibrated_noise_factor("Q8_0", str(bad_path)) is None
+
+
+def test_source_path_cache_does_not_clobber_default_cache(tmp_path, monkeypatch):
+    """A source_path override must be cached independently of the
+    default-path cache -- reading one must never poison the other."""
+    default_path = tmp_path / "default_calibration.json"
+    default_path.write_text(json.dumps({
+        "schemes": {"Q8_0": {"noise_factor": 1.0}},
+    }))
+    monkeypatch.setattr(calibration, "_CALIBRATION_PATH", default_path)
+    calibration._reset_cache()
+
+    custom_path = tmp_path / "custom_calibration.json"
+    custom_path.write_text(json.dumps({
+        "schemes": {"Q8_0": {"noise_factor": 9.99}},
+    }))
+
+    assert calibration.calibrated_noise_factor("Q8_0") == 1.0
+    assert calibration.calibrated_noise_factor("Q8_0", str(custom_path)) == 9.99
+    # Reading the override must not have disturbed the default-path cache.
+    assert calibration.calibrated_noise_factor("Q8_0") == 1.0
+
+
+def test_source_path_result_is_cached_per_path(tmp_path):
+    custom_path = tmp_path / "custom_calibration.json"
+    custom_path.write_text(json.dumps({
+        "schemes": {"Q8_0": {"noise_factor": 1.0}},
+    }))
+
+    assert calibration.calibrated_noise_factor("Q8_0", str(custom_path)) == 1.0
+
+    # Delete the file; the cached value should still be served without
+    # re-reading from disk.
+    custom_path.unlink()
+    assert calibration.calibrated_noise_factor("Q8_0", str(custom_path)) == 1.0
+
+    calibration._reset_cache()
+
+
+def test_reset_cache_clears_source_cache_too(tmp_path):
+    custom_path = tmp_path / "custom_calibration.json"
+    custom_path.write_text(json.dumps({
+        "schemes": {"Q8_0": {"noise_factor": 1.0}},
+    }))
+    assert calibration.calibrated_noise_factor("Q8_0", str(custom_path)) == 1.0
+
+    custom_path.unlink()
+    calibration._reset_cache()
+
+    # Cache cleared -- now genuinely re-reads and misses.
+    assert calibration.calibrated_noise_factor("Q8_0", str(custom_path)) is None

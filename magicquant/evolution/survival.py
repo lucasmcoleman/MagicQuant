@@ -13,7 +13,7 @@ with the evolutionary pressure finding which tensor groups can tolerate
 MXFP4 and which need protection at higher precision.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import random
 import copy
 
@@ -126,6 +126,8 @@ class EvolutionarySurvivor:
         enable_iq: bool = False,
         head_aggressive: bool = False,
         stream_aware: bool = False,
+        objective_weights: Optional[Tuple[float, float, float]] = None,
+        use_bytes_tps: bool = False,
     ):
         self.predictor = predictor
         self.baseline_config = baseline_config
@@ -167,6 +169,22 @@ class EvolutionarySurvivor:
         # A bias, not a hard exclusion; off by default so the standard search
         # and its seed-pinned fixture are unchanged.
         self.stream_aware = stream_aware
+        # Opt-in tunable (precision, size, speed) weights passed straight
+        # through to predictor.score_hybrid every generation (see
+        # _predict_population). None (default) leaves score_hybrid's own
+        # fixed 0.50/0.35/0.15 defaults in effect -- byte-identical to the
+        # historical call, required for the seed-pinned regression fixture.
+        # Built by MagicQuantOrchestrator.run_measured_search/run_full_search
+        # from their speed_weight knob (renormalizing precision:size to fill
+        # the remainder at their default ratio); not meant to be hand-tuned
+        # positionally elsewhere.
+        self.objective_weights = objective_weights
+        # When True, score_hybrid scores tps deterministically from
+        # predicted size (memory-bandwidth-bound proxy) instead of the noisy
+        # per-scheme speed_multiplier path -- see
+        # PredictiveScorer.score_hybrid's use_bytes_tps. Off by default:
+        # byte-identical historical scoring.
+        self.use_bytes_tps = use_bytes_tps
 
         self.history: List[Dict] = []
         self.tier_winners: Dict[str, Dict] = {}
@@ -598,8 +616,27 @@ class EvolutionarySurvivor:
     # ------------------------------------------------------------------
 
     def _predict_population(self, population: List[Dict]) -> List[Dict]:
+        # objective_weights/use_bytes_tps are opt-in (see __init__): pass
+        # them through to score_hybrid only when at least one is set, else
+        # call exactly as before (no extra args) -- keeps the default path
+        # byte-identical for the seed-pinned regression fixture.
+        tunable = self.objective_weights is not None or self.use_bytes_tps
         for candidate in population:
-            scores = self.predictor.score_hybrid(candidate['config'])
+            if tunable:
+                precision_weight, size_weight, speed_weight = (
+                    self.objective_weights
+                    if self.objective_weights is not None
+                    else (0.50, 0.35, 0.15)
+                )
+                scores = self.predictor.score_hybrid(
+                    candidate['config'],
+                    precision_weight=precision_weight,
+                    size_weight=size_weight,
+                    speed_weight=speed_weight,
+                    use_bytes_tps=self.use_bytes_tps,
+                )
+            else:
+                scores = self.predictor.score_hybrid(candidate['config'])
             candidate.update(scores)
         return population
 

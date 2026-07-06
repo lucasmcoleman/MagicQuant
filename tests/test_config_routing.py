@@ -22,6 +22,8 @@ def _args(**kw):
         enable_speed_bench=None, enable_rocmfpx=None, enable_iq=None,
         stream_aware=None, head_aggressive=None,
         seed=None, measurement_chunks=None,
+        speed_weight=None, use_bytes_tps=None,
+        write_calibration=None, calibration_source=None,
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -144,6 +146,52 @@ def test_measurement_chunks_cli_overrides_env(monkeypatch):
     assert settings.measurement_chunks == 5
 
 
+# ── speed_weight / use_bytes_tps / write_calibration / calibration_source ───
+# (LANE B: tunable tps-aware objective + cross-run noise calibration)
+
+
+def test_tps_objective_knobs_default_off(monkeypatch):
+    for var in (
+        "MAGICQUANT_SPEED_WEIGHT", "MAGICQUANT_USE_BYTES_TPS",
+        "MAGICQUANT_WRITE_CALIBRATION", "MAGICQUANT_CALIBRATION_SOURCE",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    settings = _settings_from_args(_args())
+    assert settings.speed_weight is None
+    assert settings.use_bytes_tps is False
+    assert settings.write_calibration is False
+    assert settings.calibration_source == ""
+
+
+def test_tps_objective_knobs_env_honored(monkeypatch):
+    monkeypatch.setenv("MAGICQUANT_SPEED_WEIGHT", "0.4")
+    monkeypatch.setenv("MAGICQUANT_USE_BYTES_TPS", "true")
+    monkeypatch.setenv("MAGICQUANT_WRITE_CALIBRATION", "true")
+    monkeypatch.setenv("MAGICQUANT_CALIBRATION_SOURCE", "/tmp/calib.json")
+
+    settings = _settings_from_args(_args())
+
+    assert settings.speed_weight == 0.4
+    assert settings.use_bytes_tps is True
+    assert settings.write_calibration is True
+    assert settings.calibration_source == "/tmp/calib.json"
+
+
+def test_tps_objective_knobs_cli_overrides_env(monkeypatch):
+    monkeypatch.setenv("MAGICQUANT_SPEED_WEIGHT", "0.4")
+    monkeypatch.setenv("MAGICQUANT_USE_BYTES_TPS", "true")
+    monkeypatch.setenv("MAGICQUANT_CALIBRATION_SOURCE", "/tmp/calib.json")
+
+    settings = _settings_from_args(
+        _args(speed_weight=0.7, use_bytes_tps=False,
+              calibration_source="/tmp/other.json")
+    )
+
+    assert settings.speed_weight == 0.7
+    assert settings.use_bytes_tps is False
+    assert settings.calibration_source == "/tmp/other.json"
+
+
 # ── cmd_search forwarding to the orchestrator ───────────────────────────────
 
 
@@ -177,6 +225,8 @@ def _search_args(**kw):
         kl_weight=None, enable_speed_bench=None, enable_rocmfpx=None,
         enable_iq=None, stream_aware=None, head_aggressive=None,
         seed=None, measurement_chunks=None,
+        speed_weight=None, use_bytes_tps=None,
+        write_calibration=None, calibration_source=None,
     )
     base.update(kw)
     return argparse.Namespace(**base)
@@ -194,6 +244,8 @@ def test_cmd_search_forwards_knobs_to_run_measured_search(monkeypatch):
         enable_rocmfpx=True, enable_iq=True,
         stream_aware=True, head_aggressive=True, seed=42,
         measurement_chunks=8,
+        speed_weight=0.4, use_bytes_tps=True,
+        write_calibration=True, calibration_source="/tmp/calib.json",
     ))
 
     orch = _FakeSearchOrchestrator.last
@@ -211,6 +263,10 @@ def test_cmd_search_forwards_knobs_to_run_measured_search(monkeypatch):
     assert call["head_aggressive"] is True
     assert call["seed"] == 42
     assert call["measurement_chunks"] == 8
+    assert call["speed_weight"] == 0.4
+    assert call["use_bytes_tps"] is True
+    assert call["write_calibration"] is True
+    assert call["calibration_source"] == "/tmp/calib.json"
 
 
 def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
@@ -225,6 +281,8 @@ def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
         enable_rocmfpx=True, enable_iq=True,
         stream_aware=True, head_aggressive=True, seed=42,
         measurement_chunks=8,
+        speed_weight=0.4, use_bytes_tps=True,
+        write_calibration=True, calibration_source="/tmp/calib.json",
     ))
 
     orch = _FakeSearchOrchestrator.last
@@ -239,9 +297,14 @@ def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
     assert call["head_aggressive"] is True
     assert call["seed"] == 42
     assert call["measurement_chunks"] == 8
-    # run_full_search has no KL / speed-bench params -- must not be forwarded.
+    assert call["speed_weight"] == 0.4
+    assert call["use_bytes_tps"] is True
+    assert call["calibration_source"] == "/tmp/calib.json"
+    # run_full_search has no KL / speed-bench / write_calibration params --
+    # must not be forwarded.
     assert "enable_kl" not in call
     assert "kl_weight" not in call
+    assert "write_calibration" not in call
     assert "enable_speed_bench" not in call
 
 

@@ -53,6 +53,18 @@ class MagicQuantSettings(BaseSettings):
     # search (forwarded to LlamaCppTools.ppl_chunks, overriding its own
     # MAGICQUANT_PPL_CHUNKS env fallback when set). None = whole corpus.
     measurement_chunks: Optional[int] = None
+    # Tunable search-objective knobs (PredictiveScorer.score_hybrid /
+    # EvolutionarySurvivor): off by default so the fixed 0.50/0.35/0.15
+    # weights and speed_multiplier-based tps scoring are unchanged unless
+    # explicitly opted into.
+    speed_weight: Optional[float] = None
+    use_bytes_tps: bool = False
+    # Cross-run noise calibration (magicquant/quant/calibration.py): off by
+    # default so predictor noise factors/speed multipliers keep reading the
+    # fixed tools/calibration_results.json path (or the static registry)
+    # unless explicitly opted into.
+    write_calibration: bool = False
+    calibration_source: str = ""
 
     model_config = {
         "env_prefix": "MAGICQUANT_",

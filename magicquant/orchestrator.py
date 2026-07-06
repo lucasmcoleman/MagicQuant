@@ -140,6 +140,35 @@ class MagicQuantOrchestrator:
         except Exception:
             pass
 
+    # Default precision:size ratio score_hybrid's own weights carry
+    # (0.50:0.35) -- _build_objective_weights preserves this ratio while
+    # renormalizing the remainder after reserving a caller-chosen speed_weight.
+    _DEFAULT_PRECISION_WEIGHT = 0.50
+    _DEFAULT_SIZE_WEIGHT = 0.35
+
+    @classmethod
+    def _build_objective_weights(
+        cls, speed_weight: Optional[float]
+    ) -> Optional[Tuple[float, float, float]]:
+        """Build a (precision, size, speed) objective_weights tuple for
+        ``EvolutionarySurvivor`` from a single ``speed_weight`` knob.
+
+        Reserves ``speed_weight`` for the speed term and renormalizes
+        precision/size to fill the remainder while preserving their default
+        0.50:0.35 ratio -- e.g. ``speed_weight=0.40`` gives about
+        ``(0.35, 0.25, 0.40)``. Returns ``None`` when ``speed_weight`` is
+        ``None`` (the default), which leaves ``EvolutionarySurvivor``'s own
+        default -- ``score_hybrid``'s fixed 0.50/0.35/0.15 weights -- in
+        effect, unchanged from historical behavior.
+        """
+        if speed_weight is None:
+            return None
+        remainder = 1.0 - speed_weight
+        ratio_total = cls._DEFAULT_PRECISION_WEIGHT + cls._DEFAULT_SIZE_WEIGHT
+        precision_weight = remainder * (cls._DEFAULT_PRECISION_WEIGHT / ratio_total)
+        size_weight = remainder * (cls._DEFAULT_SIZE_WEIGHT / ratio_total)
+        return (precision_weight, size_weight, speed_weight)
+
     def enable_imatrix(self, corpus_path: Optional[str] = None, **kwargs) -> bool:
         """Capture (or load a cached) importance matrix for the source model
         and cache it on ``self._imatrix`` for every subsequent
@@ -225,6 +254,10 @@ class MagicQuantOrchestrator:
         measurement_chunks: Optional[int] = None,
         seed_incumbents: bool = True,
         resume: bool = True,
+        speed_weight: Optional[float] = None,
+        use_bytes_tps: bool = False,
+        write_calibration: bool = False,
+        calibration_source: str = "",
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run the full Predict -> Measure -> Learn loop.
@@ -307,6 +340,31 @@ class MagicQuantOrchestrator:
                 tmp-then-``os.replace``, mirroring the GGUF writer's crash
                 safety), and deleted once the run completes successfully.
                 On by default; pass False to always start fresh.
+            speed_weight: reserve this weight for the search's speed
+                objective, renormalizing precision:size to fill the
+                remainder while keeping their default 0.50:0.35 ratio (e.g.
+                speed_weight=0.40 gives about 0.35/0.25/0.40). Built into an
+                ``objective_weights`` tuple passed to ``EvolutionarySurvivor``
+                (see ``_build_objective_weights``). ``None`` (default) means
+                today's fixed 0.50/0.35/0.15 weights, unchanged -- required
+                for the seed-pinned regression fixture.
+            use_bytes_tps: score the search's speed term deterministically
+                from predicted size (``PredictiveScorer.score_hybrid``'s
+                bandwidth-bound proxy) instead of the noisy per-scheme
+                speed_multiplier path. Off by default (unchanged scoring).
+            write_calibration: after a successful measured search, fit
+                per-scheme noise factors from THIS run's measurements +
+                sensitivity weights (mirrors ``tools/fit_noise_factors.py``)
+                and write ``<output_dir>/noise_calibration.json`` in the
+                nested envelope ``magicquant.quant.calibration`` reads. Off
+                by default; best-effort (a fitting failure is logged and
+                never blocks a successful search from completing).
+            calibration_source: load empirically calibrated noise
+                factors/speed multipliers from this file instead of the
+                fixed ``tools/calibration_results.json`` path (see
+                ``magicquant.quant.calibration``). Passed straight through
+                to the ``PredictiveScorer`` this search constructs. ``""``
+                (default) means today's fixed-path lookup, unchanged.
 
         Returns:
             (all_configs, tiered_best) where tiered_best maps tier names
@@ -527,6 +585,7 @@ class MagicQuantOrchestrator:
             baseline_size_gb=baseline_size_gb,
             baseline_tps=360,
             imatrix_active=self._imatrix is not None,
+            calibration_source=calibration_source,
         )
 
         # ── Step 3b: incumbent seeding ──
@@ -537,6 +596,12 @@ class MagicQuantOrchestrator:
         seed_configs, incumbent_tier_by_key = self._build_incumbent_seeds(
             seed_incumbents
         )
+
+        # Tunable speed objective (opt-in, see speed_weight's docstring):
+        # built once, reused every round below. None when speed_weight is
+        # unset, leaving EvolutionarySurvivor's own default (score_hybrid's
+        # fixed weights) in effect.
+        objective_weights = self._build_objective_weights(speed_weight)
 
         # ── Step 4: Measured search rounds ──
         all_configs = []
@@ -561,6 +626,8 @@ class MagicQuantOrchestrator:
                 enable_iq=enable_iq,
                 head_aggressive=head_aggressive,
                 stream_aware=stream_aware,
+                objective_weights=objective_weights,
+                use_bytes_tps=use_bytes_tps,
             )
 
             round_configs = survivor.run_evolution(
@@ -858,6 +925,8 @@ class MagicQuantOrchestrator:
         # Save all results
         self._save_results(all_configs, tiered)
         self._write_pareto_report()
+        if write_calibration:
+            self._write_noise_calibration()
 
         # Run completed successfully -- the checkpoint's job is done.
         checkpoint_path.unlink(missing_ok=True)
@@ -1224,6 +1293,63 @@ class MagicQuantOrchestrator:
                 stage="pareto", error=str(exc), exc_info=exc,
             )
 
+    def _write_noise_calibration(self) -> None:
+        """Fit per-scheme noise factors from THIS run's measurements +
+        sensitivity weights and write ``<output_dir>/noise_calibration.json``
+        (opt-in, ``run_measured_search(write_calibration=True)``).
+
+        Mirrors ``tools/fit_noise_factors.py``'s least-squares fit (reused
+        directly, not re-implemented) but skips the round-trip through
+        disk: it builds ``FitInput`` rows straight from ``self._measured``
+        and ``self.sensitivity_weights`` instead of re-reading
+        ``search_results.json``/``sensitivity.json`` back off disk. The
+        output envelope matches the nested ``{"schemes": {...}}`` shape
+        ``magicquant.quant.calibration`` reads, so a later run can point
+        ``calibration_source`` at this exact file.
+
+        Best-effort and additive: never raises. A fitting failure (or zero
+        usable measurements) is logged and swallowed rather than failing an
+        otherwise-successful measured search.
+        """
+        try:
+            from tools.fit_noise_factors import (
+                FitInput, build_calibration_envelope, fit_noise_factors,
+            )
+
+            sensitivity_weights = self.sensitivity_weights or {}
+            results_path = str(self.output_dir / "search_results.json")
+            inputs = [
+                FitInput(
+                    config=info["config"],
+                    measured_loss=info["measured_loss"],
+                    sensitivity_weights=sensitivity_weights,
+                    source=results_path,
+                )
+                for info in self._measured.values()
+                if info.get("measured_loss") is not None
+            ]
+            if not inputs:
+                log.warning(
+                    "write_calibration requested but no usable measurements "
+                    "to fit -- skipping noise_calibration.json",
+                    stage="calibration",
+                )
+                return
+
+            fitted = fit_noise_factors(inputs)
+            envelope = build_calibration_envelope(fitted, [results_path])
+            calib_path = self.output_dir / "noise_calibration.json"
+            calib_path.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
+            log.info(
+                "Noise calibration written", stage="calibration",
+                path=str(calib_path), n_schemes=len(fitted),
+            )
+        except Exception as exc:
+            log.warning(
+                "Noise-factor calibration fit failed (non-fatal)",
+                stage="calibration", error=str(exc), exc_info=exc,
+            )
+
     # ------------------------------------------------------------------
     # Prediction-only search (no llama.cpp needed)
     # ------------------------------------------------------------------
@@ -1244,6 +1370,9 @@ class MagicQuantOrchestrator:
         imatrix_corpus: Optional[str] = None,
         measurement_chunks: Optional[int] = None,
         seed_incumbents: bool = True,
+        speed_weight: Optional[float] = None,
+        use_bytes_tps: bool = False,
+        calibration_source: str = "",
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
         Run prediction-only evolutionary search (no real measurements).
@@ -1269,6 +1398,15 @@ class MagicQuantOrchestrator:
         this path never measures anything real, it only seeds the
         evolutionary search's population so the incumbent mixtures are
         always among the discovered/scored configs. On by default.
+
+        speed_weight/use_bytes_tps: same tunable-objective knobs as
+        run_measured_search (see its docstring and
+        ``_build_objective_weights``) -- ``None``/``False`` (default) leaves
+        the search's scoring unchanged.
+
+        calibration_source: same as run_measured_search -- passed straight
+        through to the ``PredictiveScorer`` this search constructs. ``""``
+        (default) means today's fixed-path calibration lookup, unchanged.
         """
         self._apply_seed(seed)
         if use_imatrix:
@@ -1350,6 +1488,7 @@ class MagicQuantOrchestrator:
             baseline_size_gb=baseline_size_gb,
             baseline_tps=360,
             imatrix_active=self._imatrix is not None,
+            calibration_source=calibration_source,
         )
 
         seed_configs, _incumbent_tier_by_key = self._build_incumbent_seeds(
@@ -1366,6 +1505,8 @@ class MagicQuantOrchestrator:
             enable_iq=enable_iq,
             head_aggressive=head_aggressive,
             stream_aware=stream_aware,
+            objective_weights=self._build_objective_weights(speed_weight),
+            use_bytes_tps=use_bytes_tps,
         )
 
         best_configs = survivor.run_evolution(

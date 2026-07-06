@@ -48,6 +48,7 @@ class PredictiveScorer:
         baseline_size_gb: float = 0,
         baseline_tps: float = 0,
         imatrix_active: bool = False,
+        calibration_source: str = "",
     ):
         self.sensitivity_weights = sensitivity_weights
         self.parameter_counts = parameter_counts or {}
@@ -60,6 +61,13 @@ class PredictiveScorer:
         # MXFP4/rocmfpx/float. Off by default: preserves every caller that
         # doesn't pass this (including the seed42 regression fixture).
         self.imatrix_active = imatrix_active
+        # Optional override path for empirically calibrated noise factors /
+        # speed multipliers (see magicquant.quant.calibration), letting one
+        # run LOAD a specific calibration file instead of the fixed
+        # tools/calibration_results.json path. "" (default) preserves that
+        # historical lookup exactly -- required for the seed-pinned
+        # regression fixture, which builds PredictiveScorer directly.
+        self.calibration_source = calibration_source
 
         # Learnable residual cache for active learning
         self.residual_cache: Dict[str, float] = {}
@@ -231,8 +239,9 @@ class PredictiveScorer:
 
     def _noise_factor_for(self, scheme: str) -> float:
         """Prefer an empirically calibrated noise_factor (from
-        tools/calibration_results.json, when present) over the static
-        registry value; fall back to 3.0 if the scheme is unknown to both.
+        `self.calibration_source` when set, else tools/calibration_results
+        .json, when present) over the static registry value; fall back to
+        3.0 if the scheme is unknown to both.
 
         When `self.imatrix_active`, the result is routed through
         `effective_noise_factor` so schemes whose ggml encoder actually
@@ -241,7 +250,9 @@ class PredictiveScorer:
         An unknown scheme (ValueError below) has no registry entry to read
         `uses_imatrix` off, so it falls back unscaled.
         """
-        calibrated = calibration.calibrated_noise_factor(scheme)
+        calibrated = calibration.calibrated_noise_factor(
+            scheme, self.calibration_source or None
+        )
         try:
             scheme_obj = get_scheme_by_name(scheme)
         except ValueError:
@@ -258,11 +269,11 @@ class PredictiveScorer:
         except ValueError:
             return 2.0
 
-    @staticmethod
-    def _speed_for(scheme: str) -> float:
+    def _speed_for(self, scheme: str) -> float:
         """Prefer an empirically calibrated speed_multiplier (from
-        tools/calibration_results.json, when present) over the static
-        registry value; fall back to 1.5 if the scheme is unknown to both.
+        `self.calibration_source` when set, else tools/calibration_results
+        .json, when present) over the static registry value; fall back to
+        1.5 if the scheme is unknown to both.
 
         The registry value is what feeds the seed-pinned evolution fixture
         (predict_tps -> score_hybrid -> survival.py's selection), so real
@@ -270,7 +281,9 @@ class PredictiveScorer:
         Q4_K_M/IQ4_XS/IQ4_NL/MXFP4_MOE in schemes.py) route through this
         opt-in calibration file rather than changing the registry default.
         """
-        calibrated = calibration.calibrated_speed_multiplier(scheme)
+        calibrated = calibration.calibrated_speed_multiplier(
+            scheme, self.calibration_source or None
+        )
         if calibrated is not None:
             return calibrated
         try:
@@ -278,18 +291,33 @@ class PredictiveScorer:
         except ValueError:
             return 1.5
 
+    # Floor used by score_hybrid's use_bytes_tps path to avoid a divide-by-
+    # zero when a (degenerate) predicted_size is 0.
+    _BYTES_TPS_EPS = 1e-9
+
     def score_hybrid(
         self,
         group_schemes: Dict[str, str],
         precision_weight: float = 0.50,
         size_weight: float = 0.35,
-        speed_weight: float = 0.15
+        speed_weight: float = 0.15,
+        use_bytes_tps: bool = False,
     ) -> Dict:
         """
         Score a hybrid configuration using weighted objectives.
 
         Default weights prioritize quality and compression (the tool's
         primary mission) over inference speed.
+
+        use_bytes_tps: when True, replace the tps_score's normally
+        predict_tps-derived value (which rides the noisy per-scheme
+        speed_multiplier) with a deterministic bandwidth-bound proxy --
+        min(1, baseline_size_gb / predicted_size). Generation is memory-
+        bandwidth-bound, so bytes-per-token IS the tg cost (measured, see
+        docs) -- smaller predicted size deterministically means faster tg,
+        unlike speed_multiplier. Off by default: byte-identical to the
+        historical predict_tps-based scoring, required for the seed-pinned
+        refactor-regression fixture.
         """
         predicted_loss = self.predict_loss(group_schemes)
         predicted_size = self.predict_size(group_schemes)
@@ -306,7 +334,11 @@ class PredictiveScorer:
         else:
             size_score = max(0.0, 1.0 - predicted_size)
 
-        if self.baseline_tps > 0:
+        if use_bytes_tps:
+            tps_score = min(
+                1.0, self.baseline_size_gb / max(predicted_size, self._BYTES_TPS_EPS)
+            )
+        elif self.baseline_tps > 0:
             tps_score = min(1, predicted_tps / self.baseline_tps)
         elif predicted_tps > 0:
             tps_score = min(1, predicted_tps / 4.0)

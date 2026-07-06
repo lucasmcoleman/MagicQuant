@@ -164,6 +164,10 @@ def _settings_from_args(args: argparse.Namespace):
     _maybe("head_aggressive", "head_aggressive")
     _maybe("seed", "seed")
     _maybe("measurement_chunks", "measurement_chunks")
+    _maybe("speed_weight", "speed_weight")
+    _maybe("use_bytes_tps", "use_bytes_tps")
+    _maybe("write_calibration", "write_calibration")
+    _maybe("calibration_source", "calibration_source")
 
     # MagicQuantSettings() reads env/.env first; explicit kwargs (CLI) win.
     return MagicQuantSettings(**overrides)
@@ -205,6 +209,10 @@ def cmd_search(args: argparse.Namespace) -> None:
             head_aggressive=settings.head_aggressive,
             seed=settings.seed,
             measurement_chunks=settings.measurement_chunks,
+            speed_weight=settings.speed_weight,
+            use_bytes_tps=settings.use_bytes_tps,
+            write_calibration=settings.write_calibration,
+            calibration_source=settings.calibration_source,
         )
     else:
         # Prediction-only search (fast, no llama.cpp required)
@@ -222,6 +230,9 @@ def cmd_search(args: argparse.Namespace) -> None:
             head_aggressive=settings.head_aggressive,
             seed=settings.seed,
             measurement_chunks=settings.measurement_chunks,
+            speed_weight=settings.speed_weight,
+            use_bytes_tps=settings.use_bytes_tps,
+            calibration_source=settings.calibration_source,
         )
 
     results_path = Path(settings.output_dir) / "search_results.json"
@@ -723,6 +734,40 @@ def main() -> None:
              "of the whole corpus, trading statistical resolution for "
              "wall-clock time (default: MAGICQUANT_MEASUREMENT_CHUNKS or "
              "unset = whole corpus)",
+    )
+    search_parser.add_argument(
+        "--speed-weight",
+        type=float,
+        default=None,
+        help="Reserve this weight for the search's speed objective, "
+             "renormalizing precision:size to fill the remainder at their "
+             "default 0.50:0.35 ratio (default: MAGICQUANT_SPEED_WEIGHT or "
+             "unset = today's fixed 0.50/0.35/0.15 weights)",
+    )
+    search_parser.add_argument(
+        "--bytes-tps",
+        dest="use_bytes_tps",
+        action="store_true",
+        default=None,
+        help="Score speed deterministically from predicted size (a "
+             "memory-bandwidth-bound proxy) instead of the noisy per-scheme "
+             "speed_multiplier (default: MAGICQUANT_USE_BYTES_TPS or off)",
+    )
+    search_parser.add_argument(
+        "--write-calibration",
+        action="store_true",
+        default=None,
+        help="After a measured search, fit per-scheme noise factors from "
+             "this run's measurements and write "
+             "<output-dir>/noise_calibration.json "
+             "(default: MAGICQUANT_WRITE_CALIBRATION or off)",
+    )
+    search_parser.add_argument(
+        "--calibration-source",
+        default=None,
+        help="Load calibrated noise factors / speed multipliers from this "
+             "file instead of tools/calibration_results.json "
+             "(default: MAGICQUANT_CALIBRATION_SOURCE or unset)",
     )
     search_parser.add_argument(
         "--dry-run",
