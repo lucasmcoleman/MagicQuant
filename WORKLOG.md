@@ -109,4 +109,12 @@ Session start: 2026-07-11.
 - Built --floor E=Q6_K config CPU-side from cached table (0.7446 GiB, E back to Q6_K).
 - GPU (flock-gated, contended): measuring floored-E PPL+HellaSwag, and running full cumulative
   v2 run (reuses cached distortion table — mode-independent). Numbers -> docs/validation.md.
+- MEASURED (folded into validation.md): --floor E=Q6_K @ matched 0.7446 GiB budget:
+  wikitext PPL 19.5733 = +6.56% (down from unfloored +9.20%, competitive with v1 +6.02%) —
+  CONFIRMS the embedding-crush diagnosis. HellaSwag@400 58.25% (edges v1's 57.00%, within
+  eval noise; F16 ref 59.25%). So the floored per-tensor allocation is >= v1 on the downstream
+  task despite marginally-worse PPL.
+- PENDING post-cutoff GPU (contended, honestly marked in validation.md, no raw placeholders):
+  cumulative-probe v2 matched-budget run (mechanism CPU-proven + floored-E-validated;
+  measured end-to-end PPL deferred) and unfloored-v2 HellaSwag.
 - NO git commit (coordinator commits after verifying).
