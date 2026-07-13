@@ -65,6 +65,13 @@ class MagicQuantSettings(BaseSettings):
     # unless explicitly opted into.
     write_calibration: bool = False
     calibration_source: str = ""
+    # Search algorithm selector: "v1" (default — the evolutionary
+    # Predict->Measure->Learn path, unchanged) or "v2" (budget-constrained
+    # per-tensor allocation, docs/redesign.md). v2 requires budget_gb.
+    algo: str = "v1"
+    # Target model size in GiB for --algo v2 (weights only; leave headroom
+    # for ctx/KV inside the GTT envelope).
+    budget_gb: Optional[float] = None
 
     model_config = {
         "env_prefix": "MAGICQUANT_",

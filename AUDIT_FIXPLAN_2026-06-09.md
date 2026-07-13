@@ -1,3 +1,13 @@
+> **SUPERSEDED — findings fixed at HEAD (2026-07-11).** H1 (MoE up/gate experts
+> misclassified as dense U instead of X) is fixed: `tensor_groups.py`'s X list
+> now includes `r'ffn_(up|gate|down)_exps'`. H2/M1 (predictor never received
+> per-group `parameter_counts`) is fixed: `orchestrator.py` passes
+> `parameter_counts=self._param_counts` at lines ~590 and ~1516. M3 (worker
+> exception could leave a partial GGUF on disk) is fixed: `writer.py` builds to
+> `output_path + ".partial"` and calls `os.replace()` only after the worker
+> thread joins successfully. See `AUDIT_2026-07-01.md` for the current state.
+> Kept for historical reference only.
+
 # Trusted Fix-Plan — MagicQuant
 
 Verified against current code by an independent pass (every audit finding re-confirmed or refuted with file:line evidence). This is the authoritative implementation plan.

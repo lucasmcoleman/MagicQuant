@@ -8,6 +8,8 @@ Discovery order (first match wins):
 
 Public API:
     ggml_encode(weights, ggml_type, imatrix=None) -> bytes
+    ggml_decode(data, ggml_type, n_elements) -> np.ndarray (float32)
+    supports_decode(ggml_type) -> bool
     GGML_TYPE_IDS  (mapping name -> numeric ggml type enum, synced from ggml.h)
     LibggmlNotFound  (exception)
 """
@@ -222,6 +224,31 @@ def _expected_size(ggml_type: str, n_elements: int) -> int:
     return n_blocks * type_sz
 
 
+# ── Dequantize row symbol table (synced with ggml/src/ggml-quants.h /
+# ggml-cpu, plus the ROCmFPX fork's rocmfp4.h / rocmfpx.h) ─────────────────
+#
+# All symbols share the C signature `void f(const void *x, float *y,
+# int64_t k)`, where k is the ELEMENT count (not block count) — blocks are
+# contiguous so a single call handles a whole block-aligned tensor. Symbol
+# names verified present via `nm -D` on
+# /home/lucas/ROCmFPX/build-strix-rocmfp4/bin/libggml-base.so; stock builds
+# have the non-ROCmFPX entries.
+_DEQUANT_SYMBOLS = {
+    "Q8_0": "dequantize_row_q8_0", "Q6_K": "dequantize_row_q6_K",
+    "Q5_K": "dequantize_row_q5_K", "Q4_K": "dequantize_row_q4_K",
+    "Q3_K": "dequantize_row_q3_K", "Q2_K": "dequantize_row_q2_K",
+    "IQ4_NL": "dequantize_row_iq4_nl", "IQ4_XS": "dequantize_row_iq4_xs",
+    "MXFP4": "dequantize_row_mxfp4",
+    "Q4_0": "dequantize_row_q4_0", "Q4_1": "dequantize_row_q4_1",
+    "Q5_0": "dequantize_row_q5_0", "Q5_1": "dequantize_row_q5_1",
+    "Q4_0_ROCMFP4": "rocmfp4_dequantize_row_q4_0",
+    "Q4_0_ROCMFP4_FAST": "rocmfp4_dequantize_row_q4_0_fast",
+    "Q6_0_ROCMFPX": "rocmfpx_dequantize_row_fp6",
+    "Q8_0_ROCMFPX": "rocmfpx_dequantize_row_fp8",
+    "Q3_0_ROCMFPX": "rocmfpx_dequantize_row_fp3",
+}
+
+
 class _LibggmlHandle:
     """Process-wide ctypes binding to libggml. Created once via get_handle()."""
 
@@ -235,6 +262,7 @@ class _LibggmlHandle:
         self._setup_signatures()
         self.rocmfpx_supported: frozenset = self._probe_rocmfpx()
         self._verify_type_ids()
+        self._dequant_fn_cache: dict = {}
         # Initialize all type tables (-1 = init all). Required for IQ-quants
         # which use precomputed grid tables.
         self._base.ggml_quantize_init(ctypes.c_int(-1))
@@ -503,6 +531,127 @@ class _LibggmlHandle:
             return False
         return self._base.ggml_quantize_requires_imatrix(GGML_TYPE_IDS[ggml_type])
 
+    def _dequant_fn(self, ggml_type: str):
+        """Lazily dlsym and cache the `dequantize_row_*` symbol for a type.
+
+        Tries libggml-base first, then libggml-cpu (dequantize kernels can
+        live in either depending on the build). Returns None if the symbol
+        is absent from both — callers use this as the "can decode" probe.
+        """
+        if ggml_type in self._dequant_fn_cache:
+            return self._dequant_fn_cache[ggml_type]
+
+        fn = None
+        name = _DEQUANT_SYMBOLS.get(ggml_type)
+        if name is not None:
+            for lib in (self._base, self._cpu):
+                try:
+                    fn = getattr(lib, name)
+                    break
+                except AttributeError:
+                    continue
+            if fn is not None:
+                fn.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_float),
+                    ctypes.c_int64,
+                ]
+                fn.restype = None
+
+        self._dequant_fn_cache[ggml_type] = fn
+        return fn
+
+    def supports_decode(self, ggml_type: str) -> bool:
+        """True if the loaded libggml can dequantize this type.
+
+        F32/F16/BF16 are native numpy conversions, so always supported.
+        ROCmFPX fork types additionally require the fork's libggml (probed
+        at load, same gate as ``supports``/``encode``).
+        """
+        if ggml_type in ("F32", "F16", "BF16"):
+            return True
+        if ggml_type in ROCMFPX_TYPE_NAMES:
+            return ggml_type in self.rocmfpx_supported and self._dequant_fn(ggml_type) is not None
+        return self._dequant_fn(ggml_type) is not None
+
+    def decode(self, data: bytes, ggml_type: str, n_elements: int) -> np.ndarray:
+        """Dequantize raw ggml block-format bytes back to a float32 array.
+
+        Args:
+            data: raw bytes in the on-disk ggml block layout (as produced
+                by ``encode``/``ggml_quantize_chunk``).
+            ggml_type: ggml type name (e.g., "Q4_K", "Q2_K", "MXFP4").
+            n_elements: number of scalar elements the tensor holds (NOT
+                block count).
+
+        Returns:
+            float32 numpy array of shape (n_elements,).
+
+        Unlike ``encode``, decoding is stateless per block — there is no
+        imatrix or per-expert slicing to thread through, since dequantizing
+        a block never depends on anything outside that block.
+        """
+        if ggml_type == "F32":
+            expected = 4 * n_elements
+            if len(data) != expected:
+                raise ValueError(
+                    f"F32 decode: buffer is {len(data)} bytes, expected "
+                    f"{expected} (n_elements={n_elements})"
+                )
+            return np.frombuffer(data, dtype=np.float32)
+
+        if ggml_type == "F16":
+            expected = 2 * n_elements
+            if len(data) != expected:
+                raise ValueError(
+                    f"F16 decode: buffer is {len(data)} bytes, expected "
+                    f"{expected} (n_elements={n_elements})"
+                )
+            return np.frombuffer(data, dtype=np.float16).astype(np.float32)
+
+        if ggml_type == "BF16":
+            expected = 2 * n_elements
+            if len(data) != expected:
+                raise ValueError(
+                    f"BF16 decode: buffer is {len(data)} bytes, expected "
+                    f"{expected} (n_elements={n_elements})"
+                )
+            u16 = np.frombuffer(data, dtype=np.uint16)
+            u32 = u16.astype(np.uint32) << 16
+            return u32.view(np.float32)
+
+        if ggml_type not in GGML_TYPE_IDS:
+            raise ValueError(
+                f"Unknown ggml type: {ggml_type}. Available: {sorted(GGML_TYPE_IDS)}"
+            )
+
+        if not self.supports_decode(ggml_type):
+            raise RuntimeError(
+                f"'{ggml_type}' cannot be dequantized by the loaded libggml "
+                f"({self._base_path}): no dequantize_row_* symbol found in "
+                f"libggml-base or libggml-cpu (or, for a ROCmFPX fork type, "
+                f"the loaded lib does not support it). Point "
+                f"MAGICQUANT_LIBGGML_DIR at a build that provides it "
+                f"(e.g. ~/ROCmFPX/build-strix-rocmfp4/bin for fork types)."
+            )
+
+        expected = _expected_size(ggml_type, n_elements)
+        if len(data) != expected:
+            raise ValueError(
+                f"{ggml_type} decode: buffer is {len(data)} bytes, expected "
+                f"{expected} bytes for n_elements={n_elements}"
+            )
+
+        fn = self._dequant_fn(ggml_type)
+        src = np.frombuffer(data, dtype=np.uint8)
+        out = np.empty(n_elements, dtype=np.float32)
+        fn(
+            src.ctypes.data_as(ctypes.c_void_p),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            ctypes.c_int64(n_elements),
+        )
+        return out
+
 
 _HANDLE: Optional[_LibggmlHandle] = None
 
@@ -526,3 +675,17 @@ def ggml_encode(
     Public entry point used by magicquant.quant.converters.
     """
     return get_handle().encode(weights, ggml_type, imatrix, n_per_row=n_per_row)
+
+
+def ggml_decode(data: bytes, ggml_type: str, n_elements: int) -> np.ndarray:
+    """Dequantize via libggml's dequantize_row_* kernels.
+
+    Public entry point mirroring ggml_encode; returns a float32 ndarray of
+    shape (n_elements,).
+    """
+    return get_handle().decode(data, ggml_type, n_elements)
+
+
+def supports_decode(ggml_type: str) -> bool:
+    """True if the loaded libggml can dequantize this type."""
+    return get_handle().supports_decode(ggml_type)

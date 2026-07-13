@@ -519,6 +519,7 @@ class EvolutionarySurvivor:
         """
         from magicquant.quant.schemes import (
             get_all_schemes, ROCMFPX_SCHEME_NAMES, IQ_SCHEME_NAMES,
+            LEGACY_Q4_SCHEME_NAMES,
         )
 
         config: Dict[str, str] = {}
@@ -533,6 +534,9 @@ class EvolutionarySurvivor:
             # entirely when disabled, not just down-weighted, so the default
             # search (and its seed-pinned regression fixture) is unchanged.
             all_schemes = [s for s in all_schemes if s.name not in IQ_SCHEME_NAMES]
+        # Q4_0/Q4_1: v2-only allocation choices; excluded from v1 sampling to
+        # keep the seed-pinned fixture stable.
+        all_schemes = [s for s in all_schemes if s.name not in LEGACY_Q4_SCHEME_NAMES]
         # Schemes that require an importance matrix are ALWAYS excluded: the
         # search threads no imatrix, so encoding one would hard-error the
         # writer. This applies regardless of enable_iq.

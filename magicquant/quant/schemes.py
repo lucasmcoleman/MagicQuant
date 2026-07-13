@@ -221,6 +221,59 @@ Q2_K = QuantizationScheme(
 )
 
 
+# ── Legacy (non-K) Q4 quants ─────────────────────────────────────────
+# Stock-ggml pre-K-quant block=32 legacy types (llama.cpp's original Q4_0/
+# Q4_1, predating the block=256 K-quant family). v2-ONLY: excluded from v1's
+# random-config sampling pool (see LEGACY_Q4_SCHEME_NAMES below and
+# survival.py's _generate_random_config) so the default evolutionary search
+# -- and its seed-pinned regression fixture -- stays byte-identical. These
+# exist in the registry for v2's explicit per-tensor scheme-override
+# allocation (writer.py create_hybrid_gguf's "tensors" override key), not
+# for the evolutionary sampler.
+#
+# bpw from the real ggml block struct (block=32, matches
+# ggml_binding._GGML_BLOCK_SIZE/_GGML_TYPE_SIZE):
+#   Q4_0 = 18B/32 = 4.5 bpw (4-bit codes + 1 f16 scale, no min term)
+#   Q4_1 = 20B/32 = 5.0 bpw (4-bit codes + f16 scale + f16 min term)
+# noise_factor values are HEURISTIC, slotted just below Q4_K_M (4.5) and
+# above Q3_K (8.0) -- legacy Q4 lacks the K-quant super-block min/scale
+# refinement, so it's noisier than Q4_K_M at the same or slightly higher
+# bpw; Q4_1's extra min term makes it slightly cleaner than Q4_0.
+# Calibration pending, like the rest of the registry (see module docstring).
+#
+# upgrade_neighbor=None for both, and no EXISTING scheme's upgrade_neighbor
+# is changed to point at them -- the default mutation (Protector/Crusher)
+# neighbor-walk can never reach these from any v1-reachable scheme.
+
+Q4_0 = QuantizationScheme(
+    name="Q4_0",
+    ggml_type_name="Q4_0",
+    ggml_type_id=2,
+    bits_per_weight=4.5,
+    noise_factor=5.0,
+    speed_multiplier=3.4,   # ~parity with Q4_K_M; both are 4-bit block quants
+    category="legacy_q",
+    uses_imatrix=False,
+    requires_imatrix=False,
+    upgrade_neighbor=None,
+    downgrade_neighbor=None,
+)
+
+Q4_1 = QuantizationScheme(
+    name="Q4_1",
+    ggml_type_name="Q4_1",
+    ggml_type_id=3,
+    bits_per_weight=5.0,
+    noise_factor=4.7,
+    speed_multiplier=3.4,   # ~parity with Q4_K_M; both are 4-bit block quants
+    category="legacy_q",
+    uses_imatrix=False,
+    requires_imatrix=False,
+    upgrade_neighbor=None,
+    downgrade_neighbor=None,
+)
+
+
 # ── ROCmFPX fork schemes ─────────────────────────────────────────────
 # AMD-native (gfx1151-tuned) tensor formats from the ROCmFPX llama.cpp fork
 # (https://github.com/ciru-ai/ROCmFPX). These are OPT-IN: the search only
@@ -456,6 +509,8 @@ _REGISTRY: Dict[str, QuantizationScheme] = {
     "MXFP4_MOE": MXFP4_MOE,
     "Q3_K": Q3_K,
     "Q2_K": Q2_K,
+    "Q4_0": Q4_0,
+    "Q4_1": Q4_1,
     "ROCMFP8": ROCMFP8,
     "ROCMFP6": ROCMFP6,
     "ROCMFP4": ROCMFP4,
@@ -472,6 +527,12 @@ _REGISTRY: Dict[str, QuantizationScheme] = {
 
 # ROCmFPX fork scheme names (opt-in; excluded from the default search pool).
 ROCMFPX_SCHEME_NAMES = frozenset({"ROCMFP8", "ROCMFP6", "ROCMFP4", "ROCMFP3"})
+
+# Legacy Q4_0/Q4_1 scheme names (v2-only; excluded from v1's random-config
+# sampling pool -- see the "Legacy (non-K) Q4 quants" section above and
+# survival.py's _generate_random_config). Reserved for explicit per-tensor
+# scheme overrides (writer.py's "tensors" key), not the evolutionary sampler.
+LEGACY_Q4_SCHEME_NAMES = frozenset({"Q4_0", "Q4_1"})
 
 # Sub-4-bit IQ scheme names (opt-in; excluded from the default search pool).
 # Deliberately does NOT include IQ4_NL, which is an existing default-pool

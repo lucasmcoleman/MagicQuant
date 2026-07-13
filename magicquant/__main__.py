@@ -168,9 +168,58 @@ def _settings_from_args(args: argparse.Namespace):
     _maybe("use_bytes_tps", "use_bytes_tps")
     _maybe("write_calibration", "write_calibration")
     _maybe("calibration_source", "calibration_source")
+    _maybe("algo", "algo")
+    _maybe("budget_gb", "budget_gb")
 
     # MagicQuantSettings() reads env/.env first; explicit kwargs (CLI) win.
     return MagicQuantSettings(**overrides)
+
+
+def _run_v2_search(args: argparse.Namespace, settings) -> None:
+    """--algo v2: budget-constrained per-tensor allocation (docs/redesign.md)."""
+    from magicquant.v2 import V2Config, run_budget_search
+
+    if settings.budget_gb is None:
+        raise SystemExit(
+            "--algo v2 requires --budget-gb <GiB> (or MAGICQUANT_BUDGET_GB): "
+            "the v2 search allocates per-tensor precision to a byte budget."
+        )
+
+    floors = {}
+    for spec in (getattr(args, "floor", None) or []):
+        if "=" not in spec:
+            raise SystemExit(f"--floor expects GROUP=SCHEME, got {spec!r}")
+        g, s = spec.split("=", 1)
+        floors[g.strip()] = s.strip()
+
+    cfg = V2Config(
+        source_model_path=settings.source_model_path,
+        output_dir=settings.output_dir,
+        budget_gb=settings.budget_gb,
+        llamacpp_path=settings.llamacpp_path,
+        enable_rocmfpx=settings.enable_rocmfpx,
+        target_profile=getattr(args, "target_profile", None),
+        use_imatrix=True if getattr(args, "use_imatrix", None) is None
+        else bool(args.use_imatrix),
+        imatrix_corpus=settings.imatrix_corpus,
+        group_probes=not getattr(args, "no_group_probes", False),
+        probe_chunks=getattr(args, "probe_chunks", None) or 24,
+        allow_partial_probes=getattr(args, "allow_partial_probes", False),
+        anchors=getattr(args, "anchors", None) or 2,
+        measurement_chunks=settings.measurement_chunks,
+        sample_rows=getattr(args, "sensitivity_sample_rows", None),
+        floors=floors,
+        keep_anchors=getattr(args, "keep_anchors", False),
+    )
+    results = run_budget_search(cfg)
+    out = Path(settings.output_dir)
+    print(f"\nv2 results: {out / 'v2_results.json'}")
+    print(f"Frontier:   {out / 'frontier.json'}")
+    if results.get("final_model"):
+        print(f"Model:      {results['final_model']}")
+    if results.get("failures"):
+        print(f"WARNING: {len(results['failures'])} recorded failure(s) — "
+              "see v2_results.json 'failures'")
 
 
 def cmd_search(args: argparse.Namespace) -> None:
@@ -178,6 +227,12 @@ def cmd_search(args: argparse.Namespace) -> None:
     from magicquant.orchestrator import MagicQuantOrchestrator
 
     settings = _settings_from_args(args)
+
+    if settings.algo == "v2":
+        _run_v2_search(args, settings)
+        return
+    if settings.algo != "v1":
+        raise SystemExit(f"Unknown --algo {settings.algo!r} (expected v1 or v2)")
 
     orchestrator = MagicQuantOrchestrator(
         source_model_path=settings.source_model_path,
@@ -773,6 +828,77 @@ def main() -> None:
         "--dry-run",
         action="store_true",
         help="Validate config and source model without running the search",
+    )
+    # ── v2 budget search (docs/redesign.md) ──
+    search_parser.add_argument(
+        "--algo",
+        choices=["v1", "v2"],
+        default=None,
+        help="Search algorithm: v1 = evolutionary Predict->Measure->Learn "
+             "(default), v2 = budget-constrained per-tensor allocation "
+             "(default: MAGICQUANT_ALGO or v1)",
+    )
+    search_parser.add_argument(
+        "--budget-gb",
+        type=float,
+        default=None,
+        help="[v2] target model size in GiB — weights only "
+             "(default: MAGICQUANT_BUDGET_GB; required for --algo v2)",
+    )
+    search_parser.add_argument(
+        "--anchors",
+        type=int,
+        default=None,
+        help="[v2] frontier points to build+verify with full-corpus "
+             "perplexity (default: 2)",
+    )
+    search_parser.add_argument(
+        "--probe-chunks",
+        type=int,
+        default=None,
+        help="[v2] chunk cap for group-calibration probe passes (default: 24)",
+    )
+    search_parser.add_argument(
+        "--no-group-probes",
+        action="store_true",
+        help="[v2] skip measured group calibration (kappa=1: pure surrogate "
+             "allocation; zero GPU until anchor verification)",
+    )
+    search_parser.add_argument(
+        "--allow-partial-probes",
+        action="store_true",
+        help="[v2] continue with imputed-median kappa when a group probe "
+             "fails after retry (default: fail loudly)",
+    )
+    search_parser.add_argument(
+        "--target-profile",
+        choices=["q4nx"],
+        default=None,
+        help="[v2] restrict the choice set to a serving container's "
+             "packable types (q4nx: Q4_0/Q4_1/Q8_0/MXFP4 for the FLM NPU "
+             "packer)",
+    )
+    search_parser.add_argument(
+        "--sensitivity-sample-rows",
+        type=int,
+        default=None,
+        help="[v2] row-subsample cap per tensor for the distortion table "
+             "(default: exact, all rows)",
+    )
+    search_parser.add_argument(
+        "--keep-anchors",
+        action="store_true",
+        help="[v2] keep non-budget anchor GGUFs instead of deleting after "
+             "measurement",
+    )
+    search_parser.add_argument(
+        "--floor",
+        action="append",
+        default=None,
+        metavar="GROUP=SCHEME",
+        help="[v2] minimum scheme for a group, repeatable (e.g. --floor "
+             "E=Q6_K --floor H=Q6_K); default: no floors, measured "
+             "sensitivity decides",
     )
     search_parser.set_defaults(func=cmd_search)
 

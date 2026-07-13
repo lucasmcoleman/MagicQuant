@@ -563,6 +563,13 @@ class MagicQuantOrchestrator:
                 baseline_perplexity=self.baseline_ppl,
                 perplexity_calculator=self.llama_tools,
                 output_dir=str(self.output_dir / "_probes"),
+                # A MEASURED search must never silently rank candidates on
+                # fabricated (heuristic) sensitivities: a failed probe now
+                # raises ProbeMeasurementError after a retry instead of
+                # poisoning the whole run. run_full_search (prediction-only)
+                # keeps the heuristic fallback — there it's the documented
+                # design, not a degradation. See probing.ProbeMeasurementError.
+                strict=True,
             )
             prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
             self.sensitivity_weights = prober.get_normalized_weights()

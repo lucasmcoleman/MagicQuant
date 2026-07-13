@@ -615,7 +615,17 @@ class GGUFWriter:
         Args:
             base_model_path: Path to source model — .gguf file, .safetensors
                 file, or directory containing safetensors + config.json
-            quant_config: {"base": "MXFP4_MOE", "groups": {"E": "BF16", ...}}
+            quant_config: {"base": "MXFP4_MOE", "groups": {"E": "BF16", ...},
+                "tensors": {"blk.0.ffn_down.weight": "Q8_0", ...}}. "tensors"
+                is optional: an exact-tensor-name -> scheme-name map that
+                takes precedence over group/base resolution for exactly-
+                matching tensor names. Resolution order is
+                tensors[name] > groups[group] > base. Every scheme name in
+                "tensors" must be known (ValueError otherwise, raised up
+                front before any tensor is classified); a "tensors" entry
+                whose name matches no tensor in the source is not an error
+                (only a logged warning) since it doesn't affect the write,
+                but a typo there would otherwise silently no-op.
             verbose: Print progress
             adapter_path: Optional path to a LoRA adapter directory.
             imatrix: Optional {gguf_tensor_name: importance_vector} from
@@ -638,15 +648,56 @@ class GGUFWriter:
         try:
             base_quant = quant_config.get("base", "Q4_K_M")
             group_schemes = quant_config.get("groups", {})
+            tensor_overrides: Dict[str, str] = quant_config.get("tensors", {})
+
+            # STRICT validation up front: every override scheme name must be
+            # a key of the writer's scheme map. This is always a
+            # configuration bug (unlike an override that names no tensor in
+            # the source, handled below once tensor names are known) --
+            # raise immediately, before any tensor is even classified.
+            if tensor_overrides:
+                unknown_scheme_entries = sorted(
+                    (name, sch) for name, sch in tensor_overrides.items()
+                    if sch not in scheme_map
+                )
+                if unknown_scheme_entries:
+                    listing = ", ".join(f"{n!r}: {s!r}" for n, s in unknown_scheme_entries)
+                    raise ValueError(
+                        f"quant_config['tensors'] references unknown scheme "
+                        f"name(s): {listing}. Available schemes: "
+                        f"{sorted(scheme_map.keys())}"
+                    )
 
             if verbose:
                 print(f"Base quantization: {base_quant}")
                 for grp, sch in group_schemes.items():
                     print(f"  Group {grp} -> {sch}")
+                if tensor_overrides:
+                    print(f"  Tensor overrides: {len(tensor_overrides)} tensor(s) configured")
 
             classifier = TensorGroupClassifier()
             source_metadata = source.get_metadata()
             all_tensors_info = source.get_all_tensors_info()
+
+            # A "tensors" override that matches NO tensor in the source is
+            # never an error (the writer doesn't know the model's tensor
+            # names until now) -- but a typo'd tensor name must not silently
+            # no-op, so it's surfaced as a warning either way.
+            if tensor_overrides:
+                _source_tensor_names = {t["name"] for t in all_tensors_info}
+                unmatched_overrides = [
+                    n for n in tensor_overrides if n not in _source_tensor_names
+                ]
+                if unmatched_overrides:
+                    shown = unmatched_overrides[:5]
+                    more = (f" (+{len(unmatched_overrides) - 5} more)"
+                            if len(unmatched_overrides) > 5 else "")
+                    msg = (f"{len(unmatched_overrides)} tensor override name(s) in "
+                           f"quant_config['tensors'] matched no tensor in the "
+                           f"source (possible typo): {shown}{more}")
+                    logger.warning(msg)
+                    if verbose:
+                        print(f"  WARNING: {msg}")
 
             # Pre-scan for UNKNOWN tensors so the user sees issues upfront
             unknown_tensors = [t["name"] for t in all_tensors_info
@@ -664,6 +715,7 @@ class GGUFWriter:
             # Reset per-call so re-using a writer instance for a second
             # create_hybrid_gguf() call doesn't carry stale entries forward.
             self._fallbacks = []
+            n_tensor_overrides_applied = 0
 
             for tinfo in all_tensors_info:
                 name = tinfo["name"]
@@ -671,7 +723,16 @@ class GGUFWriter:
                 n_dims = tinfo["n_dims"]
 
                 group = classifier.classify_tensor(name)
-                scheme = group_schemes.get(group, base_quant)
+                # Resolution order: tensors[name] > groups[group] > base.
+                # Everything downstream (SSM F32 force, 1D F32, BF16->F16,
+                # block-size fallback) treats this exactly like a
+                # group-resolved scheme -- it only ever sees the resolved
+                # name, never how it was resolved.
+                if name in tensor_overrides:
+                    scheme = tensor_overrides[name]
+                    n_tensor_overrides_applied += 1
+                else:
+                    scheme = group_schemes.get(group, base_quant)
                 target_ggml_name = scheme_map.get(scheme, "Q4_0")
                 target_ggml_id = GGML_TYPE.get(target_ggml_name, GGML_TYPE["Q4_0"])
 
@@ -793,6 +854,10 @@ class GGUFWriter:
 
                 data_offset = aligned_offset + expected_size
 
+            if tensor_overrides and verbose:
+                print(f"  Tensor overrides applied: "
+                      f"{n_tensor_overrides_applied}/{len(tensor_overrides)}")
+
             # ── Validate: detect pre-quantized / undecodable sources ──
             # Two distinct failure modes:
             #   1. UNKNOWN source type — the source could not even identify the
@@ -811,8 +876,16 @@ class GGUFWriter:
                         continue
                     # Recognized but pre-quantized: error only if the user
                     # wanted a different type than the source already is.
+                    # Same resolution order as Pass 1 (tensors[name] >
+                    # groups[group] > base) so an override doesn't get
+                    # silently ignored by this second, independent
+                    # re-derivation of "what scheme did the user actually ask
+                    # for".
                     group = entry["_group"]
-                    scheme = group_schemes.get(group, base_quant)
+                    if entry["name"] in tensor_overrides:
+                        scheme = tensor_overrides[entry["name"]]
+                    else:
+                        scheme = group_schemes.get(group, base_quant)
                     desired_ggml_name = scheme_map.get(scheme, "Q4_0")
                     if desired_ggml_name != source_type:
                         bad_tensors.append((entry["name"], source_type, desired_ggml_name))

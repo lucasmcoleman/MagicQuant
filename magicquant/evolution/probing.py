@@ -24,6 +24,21 @@ from magicquant.quant.schemes import get_scheme_by_name
 _log = logging.getLogger(__name__)
 
 
+class ProbeMeasurementError(RuntimeError):
+    """A sensitivity probe failed to produce a real measurement in a
+    context that requires one (``SensitivityProber(strict=True)``).
+
+    Exists to kill a silent-degradation bug class: historically a probe
+    whose build/measurement failed for ANY reason fell back to
+    ``_heuristic_probe`` — a FABRICATED perplexity from static per-group
+    constants — and the surrounding *measured* search then ranked every
+    candidate, in every round, on made-up sensitivities while still
+    reporting success (provenance said "partial"; nothing failed, nothing
+    was excluded). In strict mode the failure is raised loudly instead.
+    Also re-exported as ``magicquant.v2.outcome.ProbeMeasurementError``.
+    """
+
+
 class SensitivityProber:
     """
     Probe model sensitivity by testing individual groups with aggressive quantization.
@@ -39,6 +54,7 @@ class SensitivityProber:
         baseline_perplexity: float,
         perplexity_calculator=None,
         output_dir: Optional[str] = None,
+        strict: bool = False,
     ):
         """
         Args:
@@ -49,11 +65,21 @@ class SensitivityProber:
                 When *None*, the prober falls back to heuristic estimates.
             output_dir: Directory for temporary probe GGUFs.  A temp dir is
                 used when omitted.
+            strict: when True, a *real* probe whose build or measurement
+                fails raises :class:`ProbeMeasurementError` (after one
+                measurement retry) instead of silently substituting the
+                heuristic estimate. The measured search sets this — a
+                multi-hour run must never silently rank candidates on
+                fabricated sensitivities. Default False preserves the
+                historical fallback for prediction-only use (no
+                perplexity_calculator), where the heuristic is the
+                documented design, not a degradation.
         """
         self.base_model_path = base_model_path
         self.baseline_ppl = baseline_perplexity
         self.perplexity_calculator = perplexity_calculator
         self.output_dir = output_dir
+        self.strict = strict
 
         # Results from probes
         self.sensitivity_results: Dict[str, float] = {}
@@ -274,6 +300,25 @@ class SensitivityProber:
                 probe_path, verbose=verbose
             )
 
+            if ppl is None and self.strict:
+                # One retry: the common cause on a shared box is transient
+                # GPU contention, which a second attempt often clears.
+                _log.warning(
+                    "PPL measurement returned no value for group '%s' — "
+                    "retrying once (strict mode)", group,
+                )
+                ppl = self.perplexity_calculator.calculate_perplexity(
+                    probe_path, verbose=verbose
+                )
+                if ppl is None:
+                    raise ProbeMeasurementError(
+                        f"Sensitivity probe for group '{group}' failed to "
+                        "measure after a retry (llama-perplexity produced no "
+                        "parseable PPL). Refusing to substitute a fabricated "
+                        "heuristic value in a measured search — check the "
+                        "llama.cpp build, corpus, and GPU availability."
+                    )
+
             if ppl is None:
                 if verbose:
                     print(f"    WARNING: PPL measurement failed for group '{group}', "
@@ -294,9 +339,24 @@ class SensitivityProber:
                 group, exc_info=exc,
             )
             raise
+        except ProbeMeasurementError:
+            raise
         except Exception as exc:
-            # Other failures (subprocess / measurement) fall back to heuristic,
-            # but always log the full traceback so the cause is visible.
+            # Other failures (subprocess / measurement). In strict mode these
+            # are raised — a measured search must never continue on fabricated
+            # sensitivities (the silent-degradation bug this class kills).
+            if self.strict:
+                _log.error(
+                    "Probe failed for group '%s' in strict mode — raising",
+                    group, exc_info=exc,
+                )
+                raise ProbeMeasurementError(
+                    f"Sensitivity probe for group '{group}' failed "
+                    f"({type(exc).__name__}: {exc}). Refusing to substitute "
+                    "a fabricated heuristic value in a measured search."
+                ) from exc
+            # Non-strict (prediction-only) keeps the historical fallback,
+            # with the full traceback logged so the cause is visible.
             _log.warning(
                 "Probe failed for group '%s' (%s) — using heuristic estimate",
                 group, exc, exc_info=exc,

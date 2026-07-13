@@ -1,0 +1,25 @@
+name: Docker Build Smoke Test
+
+# Separate from ci.yml on purpose: the llama.cpp compile in docker/Dockerfile
+# is slow, so this only runs on manual dispatch or when docker/** actually
+# changes — not on every push/PR (see AUDIT_2026-07-01.md M14).
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "docker/**"
+  pull_request:
+    paths:
+      - "docker/**"
+
+jobs:
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build docker/Dockerfile image (smoke test)
+        run: docker build -f docker/Dockerfile -t magicquant:ci-smoke .
+
+      - name: Smoke-run the image (--help should exit 0)
+        run: docker run --rm magicquant:ci-smoke --help
