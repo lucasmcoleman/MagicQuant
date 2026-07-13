@@ -55,6 +55,11 @@ class V2Config:
     group_probes: bool = True
     probe_scheme: str = "Q4_K_M"
     probe_chunks: Optional[int] = 24
+    # "single" (default, back-compat) or "cumulative" (leave-one-group-high;
+    # measures marginal importance in a quantized context — docs/redesign.md
+    # §10, the fix for single-group probes underweighting compounding layers
+    # like embeddings).
+    probe_mode: str = "single"
     allow_partial_probes: bool = False
     anchors: int = 2                            # frontier points to verify
     anchor_spread: float = 0.07                 # ±fraction of budget for neighbors
@@ -233,12 +238,13 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
             probe_chunks=cfg.probe_chunks,
             imatrix=imatrix,
             allow_partial=cfg.allow_partial_probes,
+            probe_mode=cfg.probe_mode,
         )
         kappa, kappa_provenance = fit_kappa(
             probe_outcomes, eps_sums, baseline_ppl
         )
         for g, o in probe_outcomes.items():
-            if not o.ok:
+            if not o.ok and g not in ("__slice_baseline__", "__base_aggressive__"):
                 failures.append({"stage": "probe", "group": g, **o.to_json()})
 
     # ── 5. Allocation + frontier ──
@@ -339,16 +345,22 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
         for a in measured_anchors
         if a["measurement"]["status"] == "ok"
     ]
+    # Probe points anchor the low end of the reporting fit. In cumulative
+    # mode κ·ε == recovery by construction (degenerate x==y), so only the
+    # single-mode probe points carry independent signal; skip probes in
+    # cumulative mode and let the anchors define the fit.
     _sb = probe_outcomes.get("__slice_baseline__")
     probe_baseline = _sb.value if (_sb is not None and _sb.ok) else baseline_ppl
-    for g, o in probe_outcomes.items():
-        if g == "__slice_baseline__":
-            continue
-        if o.ok and eps_sums.get(g, 0) > 0:
-            fit_points.append(
-                (kappa[g] * eps_sums[g],
-                 max((o.value - probe_baseline) / probe_baseline, 0.0))
-            )
+    _cumulative = "__base_aggressive__" in probe_outcomes
+    if not _cumulative:
+        for g, o in probe_outcomes.items():
+            if g in ("__slice_baseline__", "__base_aggressive__"):
+                continue
+            if o.ok and eps_sums.get(g, 0) > 0:
+                fit_points.append(
+                    (kappa[g] * eps_sums[g],
+                     max((o.value - probe_baseline) / probe_baseline, 0.0))
+                )
     report_fit = affine_report_fit(fit_points)
 
     frontier_json = [p.to_json() for p in chosen.frontier]

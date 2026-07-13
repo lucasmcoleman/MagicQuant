@@ -92,5 +92,21 @@ Session start: 2026-07-11.
     -> crush — fixed via censoring (fit_kappa measured-censored, tests/test_v2_calibrate.py).
   - Artifacts: docs/validation.md, docs/validation-frontier.png, tools/plot_frontier.py,
     output/validation-v1/, output/validation-v2b/. Tests: 615 passed, 6 skipped.
-- STATUS: COMPLETE. Only open item = measured PPL of the --floor E=Q6_K v2 config (deferred
-  post-cutoff GPU); does not change the reported verdict.
+- STATUS (first pass): COMPLETE. Only open item = measured PPL of the --floor E=Q6_K v2
+  config (deferred post-cutoff GPU); does not change the reported verdict.
+
+## Round 2 (2026-07-12, post-commit at 9f0906f) — cumulative probes + close the floor cell
+- Implemented the diagnosed root-cause fix: CUMULATIVE "leave-one-group-high" kappa probes
+  (--probe-mode cumulative), the old single-group mode kept as default. docs/redesign.md §10
+  appended with the design. Files: magicquant/v2/calibrate.py (run_group_probes gains
+  probe_mode + base-aggressive measurement; fit_kappa auto-detects mode via
+  __base_aggressive__ and computes kappa from RECOVERY = PPL_base_aggressive - PPL_leave_G_high),
+  magicquant/v2/search.py (thread probe_mode, cumulative report-fit handling),
+  config.py + __main__.py (--probe-mode flag / MAGICQUANT_PROBE_MODE).
+- CPU unit tests (no GPU): tests/test_v2_calibrate.py +5 — recovery math, embedding-rescue
+  (single ranks K>>E i.e. the bug; cumulative raises kappa_E 20x+), censoring under cumulative,
+  per-mode probe-config shapes, invalid-mode reject. Full suite: 620 passed, 6 skipped.
+- Built --floor E=Q6_K config CPU-side from cached table (0.7446 GiB, E back to Q6_K).
+- GPU (flock-gated, contended): measuring floored-E PPL+HellaSwag, and running full cumulative
+  v2 run (reuses cached distortion table — mode-independent). Numbers -> docs/validation.md.
+- NO git commit (coordinator commits after verifying).

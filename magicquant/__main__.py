@@ -170,6 +170,7 @@ def _settings_from_args(args: argparse.Namespace):
     _maybe("calibration_source", "calibration_source")
     _maybe("algo", "algo")
     _maybe("budget_gb", "budget_gb")
+    _maybe("probe_mode", "probe_mode")
 
     # MagicQuantSettings() reads env/.env first; explicit kwargs (CLI) win.
     return MagicQuantSettings(**overrides)
@@ -204,6 +205,7 @@ def _run_v2_search(args: argparse.Namespace, settings) -> None:
         imatrix_corpus=settings.imatrix_corpus,
         group_probes=not getattr(args, "no_group_probes", False),
         probe_chunks=getattr(args, "probe_chunks", None) or 24,
+        probe_mode=settings.probe_mode,
         allow_partial_probes=getattr(args, "allow_partial_probes", False),
         anchors=getattr(args, "anchors", None) or 2,
         measurement_chunks=settings.measurement_chunks,
@@ -863,6 +865,15 @@ def main() -> None:
         action="store_true",
         help="[v2] skip measured group calibration (kappa=1: pure surrogate "
              "allocation; zero GPU until anchor verification)",
+    )
+    search_parser.add_argument(
+        "--probe-mode",
+        choices=["single", "cumulative"],
+        default=None,
+        help="[v2] kappa-probe mode: 'single' (default; damage one group vs "
+             "pristine) or 'cumulative' (leave-one-group-high; measures "
+             "marginal importance in a quantized context — recommended for "
+             "models with a large embedding, see docs/redesign.md §10)",
     )
     search_parser.add_argument(
         "--allow-partial-probes",

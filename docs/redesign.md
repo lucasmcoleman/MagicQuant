@@ -406,3 +406,63 @@ about v1 is untouched.
   KV-cache/ctx budgeting (the budget knob is weights-only; document the
   GTT arithmetic in the README instead).
 - Removing v1. It remains the default until v2 has more mileage.
+
+---
+
+## 10. Post-validation addendum: cumulative "leave-one-group-high" κ probes
+
+The first matched-budget validation (docs/validation.md) exposed a real
+flaw in the §3.4 κ calibration: **single-group probes underestimate the
+importance of any layer whose quantization error compounds downstream.**
+
+### The failure
+
+A single-group probe damages group G alone against an otherwise-pristine
+model: `{G: Q4_K_M, rest: BF16}`. For `token_embd.weight` (21% of a 1B
+model's params) this barely moved PPL — κ_E measured 1.4e-5 — because the
+full-precision layers downstream absorbed the embedding error. The
+allocator, told embeddings are nearly free to damage, crushed E to Q4_K_M
+to buy precision elsewhere, and the model measured **+9.2% PPL vs v1's
++6.0%** at matched size. But in the *shipped* allocation nothing downstream
+is full-precision — every layer is quantized — so embedding error is NOT
+absorbed. The probe measured sensitivity in a context that doesn't match
+deployment.
+
+### The fix: marginal importance in a quantized context
+
+Replace the single-group probe with a **cumulative "leave-one-group-high"**
+probe (`--probe-mode cumulative`, the old behavior stays as `single`):
+
+```
+base_aggressive   = every allocatable group at s_probe (Q4_K_M)   → PPL_base
+leave_G_high      = base_aggressive but G at keep_scheme (BF16)    → PPL_leave_G
+recovery_G        = (PPL_base − PPL_leave_G) / slice_baseline_ppl
+κ_G               = max(recovery_G, censor_floor) / Σ_{t∈G} ε(t, s_probe)
+```
+
+`recovery_G` is how much PPL is **recovered by keeping G high while
+everything else stays quantized** — exactly G's marginal value in the
+heavily-quantized regime the allocator actually operates in. It carries the
+same units as the single-group rel-ΔPPL (relative PPL ÷ distortion), so
+`fit_kappa`, the censoring floor, and the allocator are unchanged
+downstream — only the *measurement* differs. An embedding layer that
+compounds error downstream now shows a large `recovery_G` and gets a κ that
+protects it; a genuinely-robust FFN layer recovers little and stays
+crushable.
+
+### Cost
+
+`single` mode: 1 slice-baseline + N group probes = N+1 capped passes.
+`cumulative` mode: 1 slice-baseline + 1 base-aggressive + N leave-one
+probes = N+2 capped passes — one extra measurement, same order, still
+dwarfed by v1's per-candidate full builds. The distortion table (§3) is
+mode-independent and still computed once and cached.
+
+### Why not make it the default immediately
+
+`single` is retained and remains the default so existing v2 results
+(validation-v2b) stay reproducible and the change is opt-in and A/B-able.
+The validation in docs/validation.md reports whether `cumulative` closes
+the v1–v2 gap **without** the manual `--floor E=Q6_K` guardrail — if it
+does, `cumulative` becomes the recommended default in a follow-up once it
+has mileage across more models.

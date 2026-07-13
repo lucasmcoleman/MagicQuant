@@ -48,3 +48,121 @@ def test_no_allocatable_mass_group():
     kappa, prov = fit_kappa(outcomes, {"N": 0.0}, baseline_ppl=10.0)
     assert kappa["N"] == 0.0
     assert prov["N"] == "no-allocatable-mass"
+
+
+# --- cumulative "leave-one-group-high" probe mode (docs/redesign.md §10) ---
+
+def test_cumulative_kappa_uses_recovery_from_base():
+    # base-aggressive PPL 22.0; keeping E high recovers a lot (leave_E=20.0),
+    # keeping D high recovers less but still above the censor floor
+    # (leave_D=21.4). Slice baseline 18.0.
+    outcomes = {
+        "__slice_baseline__": MO.success(18.0),
+        "__base_aggressive__": MO.success(22.0),
+        "E": MO.success(20.0),   # recovery (22-20)/18 = 0.1111
+        "D": MO.success(21.4),   # recovery (22-21.4)/18 = 0.0333 (> floor)
+    }
+    eps = {"E": 600.0, "D": 30.0}
+    kappa, prov = fit_kappa(outcomes, eps, baseline_ppl=999.0)
+    assert "__base_aggressive__" not in kappa and "__slice_baseline__" not in kappa
+    assert prov["E"] == "measured" and prov["D"] == "measured"
+    assert abs(kappa["E"] - (2.0/18.0) / 600.0) < 1e-9
+    assert abs(kappa["D"] - (0.6/18.0) / 30.0) < 1e-9
+
+
+def test_cumulative_rescues_embedding_vs_single():
+    # The exact failure from validation: an embedding whose SINGLE-group probe
+    # barely moves PPL (tiny kappa) but whose CUMULATIVE probe recovers a lot
+    # (large kappa). Same eps in both; only the measurement context differs.
+    eps = {"E": 600.0, "K": 5.0}
+    # single: E quantized alone barely hurts (18.02 vs 18.0 baseline);
+    #         K quantized alone hurts more (18.30).
+    single = {
+        "__slice_baseline__": MO.success(18.0),
+        "E": MO.success(18.02),
+        "K": MO.success(18.30),
+    }
+    ks, _ = fit_kappa(single, eps, baseline_ppl=999.0)
+    # cumulative: from an all-quantized base (22.0), keeping E high recovers
+    #             a lot (20.0), keeping K high recovers little (21.9).
+    cumulative = {
+        "__slice_baseline__": MO.success(18.0),
+        "__base_aggressive__": MO.success(22.0),
+        "E": MO.success(20.0),
+        "K": MO.success(21.9),
+    }
+    kc, _ = fit_kappa(cumulative, eps, baseline_ppl=999.0)
+    # Single mode ranks K >> E (embedding looks cheap to crush — the bug).
+    assert ks["K"] > ks["E"] * 5
+    # Cumulative mode raises E's kappa by orders of magnitude, so E is no
+    # longer the cheapest thing to crush per byte.
+    assert kc["E"] > ks["E"] * 20
+
+
+def test_cumulative_censoring_and_pseudo_key_exclusion():
+    outcomes = {
+        "__slice_baseline__": MO.success(18.0),
+        "__base_aggressive__": MO.success(22.0),
+        "E": MO.success(20.0),    # recovery 0.111 -> measured
+        "Q": MO.success(21.999),  # recovery ~5.5e-5 -> below floor -> censored
+    }
+    eps = {"E": 600.0, "Q": 4.0}
+    kappa, prov = fit_kappa(outcomes, eps, baseline_ppl=999.0)
+    assert set(kappa) == {"E", "Q"}
+    assert prov["E"] == "measured"
+    assert prov["Q"] == "measured-censored"
+
+
+def test_probe_config_shapes_per_mode():
+    # Directly exercise the per-mode probe quant_config builder via a fake
+    # llama_tools that records the configs create_hybrid_gguf is called with,
+    # without touching the GPU or writing real GGUFs.
+    import magicquant.v2.calibrate as cal
+
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+        def calculate_perplexity(self, path, verbose=True, **kw):
+            return 18.0  # constant: baseline == every probe
+
+    captured = []
+    def _fake_create(output_path, base_model_path, quant_config, verbose=False, **kw):
+        captured.append(quant_config)
+        from pathlib import Path as _P
+        _P(output_path).write_bytes(b"x")
+        return output_path
+
+    import magicquant.gguf.writer as wmod
+    orig = wmod.create_hybrid_gguf
+    wmod.create_hybrid_gguf = _fake_create
+    try:
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            # single mode
+            captured.clear()
+            cal.run_group_probes(_Tools(), "m.gguf", d + "/s", ["E", "D"], 18.0,
+                                 probe_mode="single", allow_partial=True)
+            singles = [c for c in captured]
+            assert {"base": "BF16", "groups": {"E": "Q4_K_M"}} in singles
+            assert {"base": "BF16", "groups": {"D": "Q4_K_M"}} in singles
+            # cumulative mode
+            captured.clear()
+            cal.run_group_probes(_Tools(), "m.gguf", d + "/c", ["E", "D"], 18.0,
+                                 probe_mode="cumulative", allow_partial=True)
+            cums = [c for c in captured]
+            assert {"base": "Q4_K_M", "groups": {}} in cums          # base-aggressive
+            assert {"base": "Q4_K_M", "groups": {"E": "BF16"}} in cums  # leave E high
+            assert {"base": "Q4_K_M", "groups": {"D": "BF16"}} in cums
+    finally:
+        wmod.create_hybrid_gguf = orig
+
+
+def test_invalid_probe_mode_rejected():
+    import pytest
+    import magicquant.v2.calibrate as cal
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+    with pytest.raises(ValueError):
+        cal.run_group_probes(_Tools(), "m.gguf", "/tmp/x", ["E"], 18.0,
+                             probe_mode="bogus")

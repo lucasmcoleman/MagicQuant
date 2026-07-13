@@ -61,14 +61,32 @@ def run_group_probes(
     imatrix: Optional[Dict[str, Any]] = None,
     allow_partial: bool = False,
     retries: int = 1,
+    probe_mode: str = "single",
+    keep_scheme: str = "BF16",
 ) -> Dict[str, MeasurementOutcome]:
-    """Measure ΔPPL for each group probe. Strict failure semantics.
+    """Measure per-group probes for κ calibration. Strict failure semantics.
+
+    ``probe_mode``:
+      - ``"single"`` (default): probe G = ``{G: probe_scheme, rest: BF16}``,
+        i.e. damage G alone against an otherwise-pristine model. κ is the
+        PPL damage per unit of G's distortion. Underestimates layers whose
+        error compounds downstream (see docs/redesign.md §10).
+      - ``"cumulative"``: base = every allocatable group at ``probe_scheme``;
+        probe G = base but ``{G: keep_scheme}`` (G held HIGH). κ is the PPL
+        RECOVERED by keeping G high in a heavily-quantized context — G's
+        marginal importance where the allocator actually operates. Adds one
+        base-aggressive measurement (stored as ``__base_aggressive__``).
 
     Results (including failures) are cached to
-    ``<output_dir>/v2_probes.json`` keyed by probe conditions, so a
-    re-run/resume skips already-measured groups.
+    ``<output_dir>/v2_probes.json`` keyed by probe conditions (mode
+    included), so a re-run/resume skips already-measured groups.
     """
     from magicquant.gguf.writer import create_hybrid_gguf
+
+    if probe_mode not in ("single", "cumulative"):
+        raise ValueError(
+            f"probe_mode must be 'single' or 'cumulative', got {probe_mode!r}"
+        )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -81,7 +99,17 @@ def run_group_probes(
         "probe_scheme": probe_scheme,
         "chunks": probe_chunks,
         "ctx_size": getattr(llama_tools, "ctx_size", None),
+        "probe_mode": probe_mode,
+        "keep_scheme": keep_scheme,
     }
+
+    def _probe_config(group: str) -> Dict[str, Any]:
+        """Per-group quant_config for this probe mode."""
+        if probe_mode == "single":
+            # Damage only this group; everything else pristine.
+            return {"base": keep_scheme, "groups": {group: probe_scheme}}
+        # cumulative: everything aggressive, this group held HIGH.
+        return {"base": probe_scheme, "groups": {group: keep_scheme}}
     cached: Dict[str, Any] = {}
     if cache_path.is_file():
         try:
@@ -133,6 +161,74 @@ def run_group_probes(
                 cached=True,
             )
 
+        # Cumulative mode needs the all-aggressive base PPL (the reference
+        # each leave-one-group-high probe is compared against). Measured once,
+        # cached like the other probes.
+        if probe_mode == "cumulative":
+            base_ppl: Optional[float] = None
+            if "__base_aggressive__" in cached and cached[
+                "__base_aggressive__"
+            ].get("status") == "ok":
+                base_ppl = cached["__base_aggressive__"]["value"]
+                outcomes["__base_aggressive__"] = MeasurementOutcome.success(
+                    base_ppl, kind="base-aggressive", cached=True,
+                )
+            else:
+                base_path = probe_dir / "probe__base_aggressive.gguf"
+                b_outcome: Optional[MeasurementOutcome] = None
+                b_attempts = 0
+                b_err = "unknown"
+                while b_attempts <= retries and b_outcome is None:
+                    b_attempts += 1
+                    try:
+                        create_hybrid_gguf(
+                            output_path=str(base_path),
+                            base_model_path=str(source_model_path),
+                            quant_config={"base": probe_scheme, "groups": {}},
+                            verbose=False,
+                            imatrix=imatrix,
+                        )
+                        ppl = llama_tools.calculate_perplexity(
+                            str(base_path), verbose=False
+                        )
+                        if ppl is None:
+                            b_err = "llama-perplexity produced no parseable PPL"
+                            continue
+                        b_outcome = MeasurementOutcome.success(
+                            ppl, attempts=b_attempts, kind="base-aggressive",
+                        )
+                    except Exception as exc:  # noqa: BLE001 — recorded
+                        b_err = f"{type(exc).__name__}: {exc}"
+                        log.warning(
+                            "base-aggressive probe failed (attempt %d/%d): %s",
+                            b_attempts, retries + 1, b_err, stage="calibrate",
+                        )
+                    finally:
+                        if base_path.exists():
+                            try:
+                                base_path.unlink()
+                            except OSError:
+                                pass
+                if b_outcome is None:
+                    # Without the base, no cumulative κ can be computed at
+                    # all — fail loudly (unless partial explicitly allowed,
+                    # in which case fit_kappa falls back to imputed median).
+                    b_outcome = MeasurementOutcome.failure(
+                        b_err, attempts=b_attempts, kind="base-aggressive",
+                    )
+                    if not allow_partial:
+                        outcomes["__base_aggressive__"] = b_outcome
+                        _write_probe_cache(cache_path, conditions, outcomes, cached)
+                        raise ProbeMeasurementError(
+                            "cumulative probe base-aggressive measurement "
+                            f"failed: {b_err}. Every leave-one-group κ is "
+                            "measured against this base; refusing to continue. "
+                            "Fix the measurement and re-run to resume, or pass "
+                            "--allow-partial-probes."
+                        )
+                outcomes["__base_aggressive__"] = b_outcome
+                _write_probe_cache(cache_path, conditions, outcomes, cached)
+
         for group in groups:
             if group in cached and cached[group].get("status") == "ok":
                 c = cached[group]
@@ -149,10 +245,7 @@ def run_group_probes(
             while attempts <= retries and outcome is None:
                 attempts += 1
                 try:
-                    quant_config = {
-                        "base": "BF16",
-                        "groups": {group: probe_scheme},
-                    }
+                    quant_config = _probe_config(group)
                     create_hybrid_gguf(
                         output_path=str(probe_path),
                         base_model_path=str(source_model_path),
@@ -199,7 +292,10 @@ def run_group_probes(
     finally:
         llama_tools.ppl_chunks = saved_chunks
 
-    failed = [g for g, o in outcomes.items() if not o.ok]
+    failed = [
+        g for g, o in outcomes.items()
+        if not o.ok and g not in ("__slice_baseline__", "__base_aggressive__")
+    ]
     if failed and not allow_partial:
         raise ProbeMeasurementError(
             f"Group probe measurement failed for {failed} after "
@@ -235,13 +331,24 @@ def fit_kappa(
 ) -> Tuple[Dict[str, float], Dict[str, str]]:
     """κ_g per group from probe outcomes + distortion sums.
 
-    Returns (kappa, provenance) where provenance[g] is ``"measured"`` or
-    ``"imputed-median"`` (only reachable via allow_partial). Groups with no
-    admissible probe-scheme distortion (e.g. all-fixed) get κ=0 with
-    provenance ``"no-allocatable-mass"``.
+    Auto-detects the probe mode from ``outcomes``:
+      - ``single``: raw rel-dPPL = ``(PPL_G − slice_baseline) / slice_baseline``
+        — the damage of quantizing G alone.
+      - ``cumulative`` (``__base_aggressive__`` present): raw rel-dPPL =
+        ``(PPL_base − PPL_leave_G) / slice_baseline`` — the PPL RECOVERED by
+        keeping G high in a fully-quantized context (its marginal importance).
+    Both are (relative PPL ÷ distortion), so everything downstream
+    (censoring, allocator) is identical.
+
+    Returns (kappa, provenance) where provenance[g] is ``"measured"``,
+    ``"measured-censored"``, ``"imputed-median"`` (only via allow_partial),
+    or ``"no-allocatable-mass"`` (group with no admissible distortion).
+    Pseudo-keys (``__slice_baseline__``, ``__base_aggressive__``) are never
+    emitted as groups.
     """
     kappa: Dict[str, float] = {}
     provenance: Dict[str, str] = {}
+    _pseudo = {"__slice_baseline__", "__base_aggressive__"}
 
     # Compare probes against the slice-matched baseline measured under the
     # probes' own chunk cap (see run_group_probes) — the full-corpus
@@ -249,10 +356,15 @@ def fit_kappa(
     sb = outcomes.get("__slice_baseline__")
     probe_baseline = sb.value if (sb is not None and sb.ok) else baseline_ppl
 
+    # Cumulative mode: rel-dPPL is recovery from the all-aggressive base.
+    ba = outcomes.get("__base_aggressive__")
+    cumulative = ba is not None and ba.ok
+    base_ppl = ba.value if cumulative else None
+
     # Pass 1: raw rel-dPPL per measured group.
     raw_rel: Dict[str, float] = {}
     for g, outcome in outcomes.items():
-        if g == "__slice_baseline__":
+        if g in _pseudo:
             continue
         eps = eps_sums.get(g, 0.0)
         if eps <= 0.0:
@@ -260,7 +372,11 @@ def fit_kappa(
             provenance[g] = "no-allocatable-mass"
             continue
         if outcome.ok:
-            raw_rel[g] = (outcome.value - probe_baseline) / probe_baseline
+            if cumulative:
+                # Recovery from keeping G high in the all-quantized base.
+                raw_rel[g] = (base_ppl - outcome.value) / probe_baseline
+            else:
+                raw_rel[g] = (outcome.value - probe_baseline) / probe_baseline
 
     # Censoring floor: a probe that measures at/below the measurement noise
     # must NOT assert "this group is free to crush" — that's the v1
@@ -292,7 +408,7 @@ def fit_kappa(
         sorted(measured_vals)[len(measured_vals) // 2] if measured_vals else 1.0
     )
     for g, outcome in outcomes.items():
-        if g == "__slice_baseline__" or g in kappa:
+        if g in _pseudo or g in kappa:
             continue
         kappa[g] = median
         provenance[g] = "imputed-median"

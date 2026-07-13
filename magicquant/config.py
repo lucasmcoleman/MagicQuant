@@ -72,6 +72,9 @@ class MagicQuantSettings(BaseSettings):
     # Target model size in GiB for --algo v2 (weights only; leave headroom
     # for ctx/KV inside the GTT envelope).
     budget_gb: Optional[float] = None
+    # v2 κ-probe mode: "single" (default) or "cumulative" (leave-one-group-
+    # high marginal-importance probes; docs/redesign.md §10).
+    probe_mode: str = "single"
 
     model_config = {
         "env_prefix": "MAGICQUANT_",
