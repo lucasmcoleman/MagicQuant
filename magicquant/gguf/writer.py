@@ -1066,6 +1066,14 @@ class GGUFWriter:
             ftype = _ftype_map.get(dominant, _ftype_map.get(base_quant, 1))
             self.metadata["general.file_type"] = ftype
 
+            # llama.cpp/convert_hf_to_gguf always emits this for a quantized
+            # GGUF; the safetensors source path never did (its metadata
+            # comes straight from config.json, which has no such key). Not
+            # load-bearing for inference, but every reference-converted GGUF
+            # carries it -- setdefault so a GGUF-source repack keeps its own
+            # value if it already has one.
+            self.metadata.setdefault("general.quantization_version", 2)
+
             filtered_meta = {k: v for k, v in self.metadata.items() if v is not None}
 
             # ==============================================================

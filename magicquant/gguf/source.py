@@ -856,6 +856,138 @@ def _permute_qk_rows(weights: np.ndarray, n_head: int) -> np.ndarray:
     ).reshape(weights.shape)
 
 
+def _reorder_v_heads(a: np.ndarray, axis: int, num_k_heads: int,
+                      num_v_per_k: int, head_dim: int) -> np.ndarray:
+    """Reorder V heads from HF grouped order [G0_v0..v{r-1}, G1_v0..] to
+    ggml's tiled broadcast order [K0,K1,..,K0,K1,..]. Pure index permutation
+    -- mirrors llama.cpp convert_hf_to_gguf.py's ``_reorder_v_heads``
+    (convert_hf_to_gguf.py:5405-5416), used by qwen3_5's linear-attention
+    layers whenever ``linear_num_value_heads != linear_num_key_heads``.
+    """
+    shape = list(a.shape)
+    if axis < 0:
+        axis += len(shape)
+    new_shape = shape[:axis] + [num_k_heads, num_v_per_k, head_dim] + shape[axis + 1:]
+    t = a.reshape(new_shape).swapaxes(axis, axis + 1)
+    return np.ascontiguousarray(t).reshape(shape)
+
+
+def _qwen35_value_transform(hf_name: str, gguf_name: str, arr: np.ndarray,
+                             shape: List[int], cfg: Dict[str, Optional[int]]
+                             ) -> np.ndarray:
+    """Apply qwen35/qwen35moe's HF->GGUF value transforms.
+
+    Mirrors llama.cpp convert_hf_to_gguf.py's ``Qwen3NextModel.modify_tensors``
+    (RMSNorm +1 for every ``*norm.weight`` EXCEPT ``linear_attn.norm.weight``;
+    ``A_log -> -exp(A_log)``) plus the linear-attention V-head grouped->tiled
+    reorder from ``_LinearAttentionVReorderBase``, which fires whenever
+    ``linear_num_value_heads != linear_num_key_heads``. Without these, the
+    packed GGUF loads and runs but every linear_attention layer's decay gate
+    underflows to zero and the model's logits collapse to uniform -- see the
+    qwen3_5 uniform-logits incident (PPL == vocab size). All three rules were
+    verified byte-exact against a real ``convert_hf_to_gguf`` output during
+    that investigation; see ``tests/test_source_qwen35_transforms.py``.
+
+    Args:
+        hf_name: original HuggingFace tensor name -- drives the RMSNorm/A_log
+            rules, which llama.cpp keys off the HF side.
+        gguf_name: mapped GGUF tensor name -- drives the V-reorder rules.
+        arr: flat float32 array, UNTRANSFORMED (no rope permute either).
+        shape: this tensor's GGUF shape (row-major, already squeezed by
+            ``_flatten_to_max_dims`` -- squeezing size-1 dims never reorders
+            memory, so reshaping the flat buffer into it is safe).
+        cfg: ``{"num_k", "num_v", "head_k_dim", "head_v_dim"}`` resolved by
+            ``SafetensorsSource._ensure_loaded``; any may be ``None`` if the
+            source config didn't have the field (in which case the reorder
+            is skipped but norm/A_log rules still apply -- they don't need
+            head counts).
+    """
+    out = arr.reshape(shape) if shape else arr
+
+    # RMSNorm +1, except linear_attn.norm.weight (ssm_norm) which llama.cpp
+    # deliberately excludes (it's already correctly-scaled upstream).
+    if hf_name.endswith("norm.weight") and not hf_name.endswith("linear_attn.norm.weight"):
+        return (out + 1.0).reshape(-1)
+
+    num_k, num_v = cfg.get("num_k"), cfg.get("num_v")
+    head_k_dim, head_v_dim = cfg.get("head_k_dim"), cfg.get("head_v_dim")
+    need_reorder = bool(num_k and num_v and num_k != num_v)
+    r = (num_v // num_k) if need_reorder else None
+
+    if hf_name.endswith(".A_log"):
+        # Nonlinear -- MUST run before the (linear) reorder.
+        out = -np.exp(out)
+        if need_reorder:
+            out = _reorder_v_heads(out, axis=0, num_k_heads=num_k, num_v_per_k=r, head_dim=1)
+        return out.reshape(-1)
+
+    if not need_reorder:
+        return out.reshape(-1)
+
+    if gguf_name.endswith((".ssm_dt.bias", ".ssm_alpha.weight", ".ssm_beta.weight")):
+        out = _reorder_v_heads(out, axis=0, num_k_heads=num_k, num_v_per_k=r, head_dim=1)
+    elif gguf_name.endswith(".attn_gate.weight"):
+        out = _reorder_v_heads(out, axis=0, num_k_heads=num_k, num_v_per_k=r, head_dim=head_v_dim)
+    elif gguf_name.endswith(".attn_qkv.weight") or gguf_name.endswith(".ssm_conv1d.weight"):
+        # Leading Q/K rows (or conv channels) pass through verbatim; only the
+        # trailing V portion needs reordering.
+        qk_width = 2 * head_k_dim * num_k
+        head_part, v_part = out[:qk_width], out[qk_width:]
+        v_part = _reorder_v_heads(v_part, axis=0, num_k_heads=num_k, num_v_per_k=r, head_dim=head_v_dim)
+        out = np.concatenate([head_part, v_part], axis=0)
+    elif gguf_name.endswith(".ssm_out.weight"):
+        # out_proj: the V axis is COLUMNS (axis=1), not rows.
+        out = _reorder_v_heads(out, axis=1, num_k_heads=num_k, num_v_per_k=r, head_dim=head_v_dim)
+
+    return out.reshape(-1)
+
+
+class UnsupportedSourceArchitecture(RuntimeError):
+    """A safetensors source whose arch needs HF->GGUF value transforms
+    MagicQuant has not implemented (or verified). Packing it anyway
+    produces a GGUF that loads and runs but emits garbage -- see the
+    qwen3_5 uniform-logits incident (PPL == vocab size, every tensor name
+    and shape matched the reference, but 64% of tensor VALUES were wrong).
+    """
+
+
+# Sentinel for arches whose only needed value transform is the existing
+# NORM-rope Q/K permute (_QK_PERMUTED_ARCHS / _permute_qk_rows, applied by
+# apply_arch_value_transform independently of this table). Their presence
+# here is only to satisfy the architecture gate below -- it is never called.
+_QK_PERMUTE_ONLY = object()
+
+# Arches whose HF->GGUF value transforms are implemented AND verified
+# byte-exact against llama.cpp's own convert_hf_to_gguf output.
+_ARCH_VALUE_TRANSFORMS: Dict[str, Any] = {
+    "llama": _QK_PERMUTE_ONLY,
+    "baichuan": _QK_PERMUTE_ONLY,
+    "qwen35": _qwen35_value_transform,
+    "qwen35moe": _qwen35_value_transform,
+}
+
+# Arches verified -- by the test fleet exercising SafetensorsSource end to
+# end against real HF tensor names -- to need NO value transform beyond
+# name mapping + metadata. Deliberately conservative: an arch not proven
+# either way fails loudly (UnsupportedSourceArchitecture) rather than
+# shipping silently-wrong weights. Extend only after adding/verifying
+# coverage, not on a hunch that "it's probably fine".
+_ARCH_NO_TRANSFORM_NEEDED = frozenset({"qwen2", "qwen2moe"})
+
+# Opt-in escape hatch: downgrades UnsupportedSourceArchitecture (both the
+# arch gate and the unmapped-tensor-name gate below) to a single loud
+# _log.error so an experimenter can proceed at their own risk. Default is
+# OFF -- the whole point of the gate is that it can never be silently
+# bypassed by accident.
+_ALLOW_UNVALIDATED_ARCH_ENV = "MAGICQUANT_ALLOW_UNVALIDATED_ARCH"
+
+
+def _allow_unvalidated_arch() -> bool:
+    return os.environ.get(_ALLOW_UNVALIDATED_ARCH_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def _normalize_merges(merges: list) -> list:
     """Normalize BPE merges to llama.cpp's space-joined string form.
 
@@ -913,13 +1045,18 @@ def _detect_tokenizer_pre(tok_json: Dict[str, Any]):
     return None
 
 
-def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
+def _build_tokenizer_metadata(model_dir: str, arch: str = "") -> Dict[str, Any]:
     """
     Read tokenizer data from a HuggingFace model directory and return
     GGUF-compatible tokenizer metadata.
 
     Handles the common case: BPE tokenizer from tokenizer.json
     (covers LLaMA, Qwen, Mistral, GPT-NeoX, Falcon, etc.).
+
+    Args:
+        arch: GGUF architecture string, used only to disambiguate
+            ``tokenizer.ggml.pre`` for qwen35/qwen35moe (see below --
+            regex matching alone can't tell it apart from qwen2).
     """
     meta: Dict[str, Any] = {}
 
@@ -946,6 +1083,14 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
     # tokenizes with the wrong regex (perplexity inflates). Leave the key unset
     # when unrecognized so llama.cpp's own warning still surfaces.
     pre = _detect_tokenizer_pre(tok)
+    if arch in ("qwen35", "qwen35moe"):
+        # qwen3.5's tokenizer.json pre_tokenizer regex is byte-identical to
+        # qwen2's Split regex -- regex matching alone genuinely cannot tell
+        # them apart (llama.cpp's own converter disambiguates via a checksum
+        # of tokenizing a fixed test string, not regex matching, which this
+        # simplified table doesn't replicate). We already know the arch from
+        # config.json, so use it directly instead of the ambiguous table.
+        pre = "qwen35"
     if pre is not None:
         meta["tokenizer.ggml.pre"] = pre
     else:
@@ -999,6 +1144,15 @@ def _build_tokenizer_metadata(model_dir: str) -> Dict[str, Any]:
             cfg_vocab_size = _eff.get("vocab_size", 0)
             if cfg_vocab_size > max_id + 1:
                 max_id = cfg_vocab_size - 1
+
+            # bos_token_id: for qwen3_5, config.json's top-level bos_token_id
+            # is absent (it lives under text_config, already merged into
+            # _eff above) and was previously dropped entirely, leaving
+            # llama.cpp to default BOS to token 0. Emit generically for any
+            # arch that has it.
+            bos_id = _eff.get("bos_token_id")
+            if bos_id is not None:
+                meta["tokenizer.ggml.bos_token_id"] = int(bos_id)
 
         tokens = [""] * (max_id + 1)
         scores = [0.0] * (max_id + 1)
@@ -1185,6 +1339,28 @@ class SafetensorsSource(ModelSource):
 
         arch = self._metadata.get("general.architecture", "llama")
 
+        # Architecture gate: an arch with unimplemented/unverified HF->GGUF
+        # value transforms must never silently ship garbage (see
+        # UnsupportedSourceArchitecture / the qwen3_5 uniform-logits
+        # incident). Checked BEFORE any tensor is read.
+        if arch not in _ARCH_VALUE_TRANSFORMS and arch not in _ARCH_NO_TRANSFORM_NEEDED:
+            msg = (
+                f"Architecture '{arch}' has no verified HF->GGUF value-"
+                f"transform coverage in SafetensorsSource (see "
+                f"_ARCH_VALUE_TRANSFORMS / _ARCH_NO_TRANSFORM_NEEDED in "
+                f"magicquant/gguf/source.py). Packing it anyway can produce "
+                f"a GGUF that LOADS AND RUNS but emits garbage -- every "
+                f"tensor name and shape can match the reference while the "
+                f"VALUES are silently wrong (the qwen3_5 uniform-logits "
+                f"incident). Add and verify a transform for '{arch}', or "
+                f"set {_ALLOW_UNVALIDATED_ARCH_ENV}=1 to proceed anyway at "
+                f"your own risk."
+            )
+            if _allow_unvalidated_arch():
+                _log.error(msg)
+            else:
+                raise UnsupportedSourceArchitecture(msg)
+
         # Rope permutation setup for NORM-rope arches (see _QK_PERMUTED_ARCHS):
         # resolve head counts from the (text_config-aware) effective config.
         self._qk_heads = None
@@ -1205,11 +1381,36 @@ class SafetensorsSource(ModelSource):
                     "broken in llama.cpp).", arch,
                 )
 
+        # qwen3_5 (qwen35/qwen35moe) hybrid-arch value-transform setup:
+        # resolve the linear-attention head counts read_tensor_f32 needs to
+        # apply _qwen35_value_transform's V-head reorder. None of these are
+        # required for the RMSNorm +1 / A_log -> -exp() rules (they don't
+        # need head counts), only for the reorder.
+        self._qwen35_cfg = None
+        if arch in ("qwen35", "qwen35moe"):
+            effective = config
+            for sub_key in ("text_config", "language_config", "llm_config"):
+                if sub_key in config and isinstance(config[sub_key], dict):
+                    effective = {**config, **config[sub_key]}
+                    break
+            self._qwen35_cfg = {
+                "num_k": effective.get("linear_num_key_heads"),
+                "num_v": effective.get("linear_num_value_heads"),
+                "head_k_dim": effective.get("linear_key_head_dim"),
+                "head_v_dim": effective.get("linear_value_head_dim"),
+            }
+
         # Per-expert MoE projection tensors accumulate here instead of going
         # straight into self._tensor_map: gguf_stacked_name -> {expert_idx: raw_info}.
         # Stacked into single virtual 3-D tensors after all files are parsed
         # (see "MoE expert stacking" below _hf_name_to_gguf).
         expert_groups: Dict[str, Dict[int, Dict[str, Any]]] = {}
+
+        # HF tensor names that fell through _hf_name_to_gguf unmapped (kept
+        # under their raw HF name). llama.cpp silently ignores unrecognized
+        # tensor names, so an unmapped tensor is effectively MISSING from the
+        # packed GGUF -- gated below alongside the architecture check.
+        unmapped_names: List[str] = []
 
         # Parse headers from all files
         for filepath in list(self._files.keys()):
@@ -1257,6 +1458,12 @@ class SafetensorsSource(ModelSource):
                     continue
 
                 gguf_name = _hf_name_to_gguf(hf_name, arch=arch)
+                # "output.weight" is excluded: it's the one legitimate case
+                # where hf_name can already equal the GGUF name verbatim
+                # (_hf_name_to_gguf's top-of-function passthrough), not a
+                # fallback miss.
+                if gguf_name == hf_name and hf_name != "output.weight":
+                    unmapped_names.append(hf_name)
 
                 # GGUF supports at most GGML_MAX_DIMS (4) dimensions.
                 # Merge trailing dims for tensors that exceed this (e.g.
@@ -1276,6 +1483,30 @@ class SafetensorsSource(ModelSource):
                     "byte_length": offsets[1] - offsets[0],
                     "data_start": data_start,
                 }
+
+        # Unmapped-name gate: a name _hf_name_to_gguf() couldn't map is
+        # dropped on the floor by llama.cpp (unrecognized names are silently
+        # ignored), the mirror-image failure mode of the qwen3_5 incident
+        # (there every name mapped fine but the VALUES were wrong). Same
+        # gate, same escape hatch.
+        if unmapped_names:
+            shown = unmapped_names[:10]
+            more = (f" (+{len(unmapped_names) - 10} more)"
+                    if len(unmapped_names) > 10 else "")
+            msg = (
+                f"{len(unmapped_names)} tensor name(s) in this safetensors "
+                f"source have no GGUF name mapping for arch '{arch}' and "
+                f"were kept under their raw HF name: {shown}{more}. "
+                f"llama.cpp silently ignores unrecognized tensor names, so "
+                f"these will be MISSING from the packed GGUF. Add a pattern "
+                f"to _HF_TO_GGUF_PATTERNS, or set "
+                f"{_ALLOW_UNVALIDATED_ARCH_ENV}=1 to proceed anyway at your "
+                f"own risk."
+            )
+            if _allow_unvalidated_arch():
+                _log.error(msg)
+            else:
+                raise UnsupportedSourceArchitecture(msg)
 
         # Stack each MoE expert group into one virtual 3-D tensor: shape
         # [n_expert, out_features, in_features], experts in ascending index
@@ -1327,7 +1558,7 @@ class SafetensorsSource(ModelSource):
                 self._tensor_map["output.weight"] = ref
 
         # Load tokenizer data
-        tokenizer_meta = _build_tokenizer_metadata(self._model_dir)
+        tokenizer_meta = _build_tokenizer_metadata(self._model_dir, arch=arch)
         self._metadata.update(tokenizer_meta)
 
     @staticmethod
@@ -1387,7 +1618,18 @@ class SafetensorsSource(ModelSource):
             return heads["k"]
         return None
 
-    def read_tensor_f32(self, tensor_name: str) -> Optional[np.ndarray]:
+    def _read_untransformed(self, tensor_name: str) -> Optional[np.ndarray]:
+        """Decode ``tensor_name`` to a flat float32 array with NO value
+        transforms applied -- no Q/K rope permute, no arch-specific
+        transform (e.g. qwen35's RMSNorm +1 / A_log -> -exp / V-reorder).
+
+        Split out from ``read_tensor_f32`` so ``LoRAMergedSource`` can merge
+        its delta onto the raw (untransformed) base and call
+        ``apply_arch_value_transform`` exactly once, post-merge -- merging
+        onto an ALREADY-transformed base and re-transforming would
+        double-apply an additive rule (norm's ``+1``) and feed a nonlinear
+        rule (``A_log``'s ``-exp()``) a value it never actually produces.
+        """
         self._ensure_loaded()
         info = self._tensor_map.get(tensor_name)
         if info is None:
@@ -1404,16 +1646,45 @@ class SafetensorsSource(ModelSource):
         end = start + info["byte_length"]
         buf = mmap[start:end]
 
-        flat = _decode_st_bytes_to_f32(dtype, buf)
+        return _decode_st_bytes_to_f32(dtype, buf)
+
+    def apply_arch_value_transform(self, tensor_name: str,
+                                    flat: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Apply this source's HF->GGUF value transform(s) to an already-
+        decoded flat float32 array (as returned by ``_read_untransformed``).
+
+        Idempotent-once: call exactly one time per tensor. Currently: the
+        NORM-rope Q/K permute (``_QK_PERMUTED_ARCHS``) and, for
+        qwen35/qwen35moe, ``_qwen35_value_transform``.
+        """
+        self._ensure_loaded()
         if flat is None:
             return None
+        info = self._tensor_map.get(tensor_name)
+        if info is None:
+            return flat
 
         # NORM-rope arches: llama.cpp expects Q/K rows interleaved.
         n_head = self.get_qk_permute_heads(tensor_name)
         if n_head:
             shaped = flat.reshape(info["shape"])
             flat = _permute_qk_rows(shaped, n_head).reshape(-1)
+
+        # qwen35/qwen35moe: RMSNorm +1 / A_log -> -exp / linear-attn V-reorder.
+        # Never applies to expert-stack tensors (hf_name is None for those --
+        # they're synthesized from N per-expert tensors, and none of the
+        # qwen35 rules target expert weights anyway).
+        if self._qwen35_cfg is not None and info.get("hf_name"):
+            flat = _qwen35_value_transform(
+                info["hf_name"], tensor_name, flat, info["shape"], self._qwen35_cfg,
+            )
+
         return flat
+
+    def read_tensor_f32(self, tensor_name: str) -> Optional[np.ndarray]:
+        return self.apply_arch_value_transform(
+            tensor_name, self._read_untransformed(tensor_name)
+        )
 
     def _read_stacked_experts(self, info: Dict[str, Any]) -> Optional[np.ndarray]:
         """Read a virtual stacked-MoE-expert tensor (see ``_detect_moe_expert_tensor``).
@@ -1619,11 +1890,29 @@ class LoRAMergedSource(ModelSource):
         return self._base.read_tensor_raw(tensor_name)
 
     def read_tensor_f32(self, tensor_name: str) -> Optional[np.ndarray]:
-        base_f32 = self._base.read_tensor_f32(tensor_name)
+        # Bases that separate raw decode from arch value-transforms
+        # (currently only SafetensorsSource) get the "merge onto raw,
+        # transform once" path: mandatory for qwen3_5-family bases, where
+        # the transform includes a NONLINEAR step (A_log -> -exp(A_log)) --
+        # merging a LoRA delta onto an ALREADY-transformed base and then
+        # re-transforming the result would double-apply norm's additive
+        # "+1" and feed -exp() a value it never produces. Bases without the
+        # split (e.g. GGUFSource) keep the original behavior: merge onto the
+        # already-transformed base, separately permuting just the delta.
+        read_untransformed = getattr(self._base, "_read_untransformed", None)
+        apply_transform = getattr(self._base, "apply_arch_value_transform", None)
+        use_raw_merge = read_untransformed is not None and apply_transform is not None
+
+        if use_raw_merge:
+            base_f32 = read_untransformed(tensor_name)
+        else:
+            base_f32 = self._base.read_tensor_f32(tensor_name)
         if base_f32 is None:
             return None
 
         if tensor_name not in self._lora_map:
+            if use_raw_merge:
+                return apply_transform(tensor_name, base_f32)
             return base_f32
 
         a_key, b_key = self._lora_map[tensor_name]
@@ -1636,14 +1925,15 @@ class LoRAMergedSource(ModelSource):
         if self._fan_in_fan_out:
             delta = delta.T
 
-        # The adapter delta is in HF layout; if the base source rope-permuted
-        # this tensor (llama-arch Q/K), permute the delta identically or the
-        # merge would mix the two layouts.
-        permute_heads = getattr(self._base, "get_qk_permute_heads", None)
-        if permute_heads is not None:
-            n_head = permute_heads(tensor_name)
-            if n_head:
-                delta = _permute_qk_rows(delta, n_head)
+        if not use_raw_merge:
+            # base_f32 is already transformed (incl. rope permute for
+            # NORM-rope arches); permute the delta identically before adding
+            # so the two layouts match.
+            permute_heads = getattr(self._base, "get_qk_permute_heads", None)
+            if permute_heads is not None:
+                n_head = permute_heads(tensor_name)
+                if n_head:
+                    delta = _permute_qk_rows(delta, n_head)
 
         # Shape guard: a mismatched delta would silently corrupt the merge
         # (reshape could broadcast/raise obscurely). Fail loud, naming the
@@ -1655,9 +1945,15 @@ class LoRAMergedSource(ModelSource):
                 f"{delta.size} (delta shape {delta.shape}). Check the adapter's "
                 f"rank/target_modules or fan_in_fan_out setting."
             )
-        base_f32 = base_f32.reshape(delta.shape) + delta
+        merged = base_f32.reshape(delta.shape) + delta
 
-        return base_f32.flatten()
+        if use_raw_merge:
+            # Raw (untransformed, unpermuted) merge -- apply this source's
+            # value transform (rope permute + qwen35 rules, if any) exactly
+            # once, to the merged result.
+            return apply_transform(tensor_name, merged.flatten())
+
+        return merged.flatten()
 
     def close(self):
         self._base.close()
