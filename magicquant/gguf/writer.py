@@ -288,9 +288,23 @@ def _encode_entry(source, entry, imatrix=None) -> bytes:
     target = entry["_target_ggml_name"]
     expected = entry["_expected_size"]
 
-    f32 = source.read_tensor_f32(name)
-
-    if can_decode and f32 is not None:
+    # f32 is read ONLY on the can_decode branch below. Calling
+    # read_tensor_f32 unconditionally used to be safe because an
+    # undecodable tensor just returned None; now that dequant support lets
+    # GGUFSource.read_tensor_f32 RAISE on a recognized-but-failed decode
+    # (see source.py), calling it here for a passthrough tensor (can_decode
+    # False, source type == target type, no decode ever intended) would
+    # blow up a copy that was never supposed to touch the decoder at all.
+    if can_decode:
+        f32 = source.read_tensor_f32(name)
+        if f32 is None:
+            # Contract violation: can_decode() promised real data for this
+            # tensor. Fail loudly rather than fall through to a zero-filled
+            # blob (the old catch-all this replaces).
+            raise RuntimeError(
+                f"Tensor {name}: source.can_decode() returned True but "
+                f"read_tensor_f32() returned None."
+            )
         # Validate dtype before quantization dispatch.
         # Source should return float32, but guard against bugs
         # in source implementations that could return integer or
@@ -309,10 +323,23 @@ def _encode_entry(source, entry, imatrix=None) -> bytes:
         blob = encode_to_ggml_bytes(
             f32, target, imatrix=imat_vec, n_per_row=row_width,
         )
-    elif f32 is not None:
-        blob = f32.view(np.uint8).tobytes()
     else:
-        blob = b"\x00" * expected
+        # Passthrough: the bad_tensors gate in Pass 1 already confirmed the
+        # desired type equals the source type, so there's nothing to decode
+        # or re-encode -- just copy the tensor's exact on-disk bytes.
+        # getattr-guarded for duck-typed sources in tests that predate the
+        # read_tensor_raw() contract.
+        _read_raw_fn = getattr(source, "read_tensor_raw", None)
+        raw = _read_raw_fn(name) if _read_raw_fn is not None else None
+        if raw is None:
+            raise RuntimeError(
+                f"Tensor {name}: passthrough (source type "
+                f"{entry['_source_type_name']!r}) requires "
+                f"source.read_tensor_raw() to return the tensor's raw "
+                f"bytes, but it returned None. The source cannot produce a "
+                f"verbatim byte copy for this tensor."
+            )
+        blob = raw
 
     # Validate blob size against expected
     if len(blob) != expected:
@@ -818,7 +845,35 @@ class GGUFWriter:
                 n_elems = _tensor_n_elements(shape)
 
                 source_type_name = source.get_source_type_name(name)
-                can_decode = source_type_name in ("F32", "F16", "BF16")
+                # Ask the source rather than testing the type name here: a
+                # GGUFSource opened with dequant enabled can also decode
+                # quantized types via libggml's dequantize_row_* kernels.
+                # getattr-guarded for duck-typed sources in tests that predate
+                # the can_decode() contract.
+                _can_decode_fn = getattr(source, "can_decode", None)
+                if _can_decode_fn is not None:
+                    can_decode = _can_decode_fn(name)
+                else:
+                    can_decode = source_type_name in ("F32", "F16", "BF16")
+                if (
+                    can_decode
+                    and source_type_name not in ("F32", "F16", "BF16")
+                    and scheme_map.get(scheme, "Q4_0") == source_type_name
+                    and target_ggml_name == source_type_name
+                ):
+                    # Dequant-enabled source, but the requested type IS the
+                    # source type: a verbatim byte copy is exact and free,
+                    # while a dequant->re-encode round-trip costs CPU and can
+                    # at best equal it. Route through the passthrough path
+                    # (this also keeps the DOUBLE-QUANTIZATION warning's
+                    # count honest -- such tensors aren't re-quantized).
+                    # Both equality checks matter: the scheme_map one mirrors
+                    # the bad_tensors gate's own derivation (so passthrough
+                    # never trips it), and the target one keeps the compat
+                    # mutations above (SSM/1D F32 forcing, block fallback)
+                    # authoritative -- a compat-mutated tensor still decodes
+                    # and re-encodes to its required type.
+                    can_decode = False
                 if not can_decode:
                     # The source tensor is not decodable to F32 (pre-quantized
                     # or an unrecognized type). We pass it through verbatim, so
@@ -907,7 +962,37 @@ class GGUFWriter:
                 raise ValueError(
                     f"Cannot re-quantize {count} tensors: source is already quantized "
                     f"({source_type}). MagicQuant requires BF16, F16, or F32 source weights. "
-                    f"Use a high-precision source model."
+                    f"Use a high-precision source model. If no high-precision "
+                    f"release exists for this model, you can opt into "
+                    f"dequantize-then-requantize by setting "
+                    f"MAGICQUANT_ALLOW_DEQUANT_SOURCE=1 (or passing "
+                    f"allow_dequant=True to open_model_source) -- the output is "
+                    f"then DOUBLE-quantized and strictly worse than one built "
+                    f"from source weights."
+                )
+
+            # ── Warn: re-quantizing from an already-quantized source ──
+            # Reachable only with dequant explicitly enabled (otherwise the
+            # bad_tensors guard above raised). Loud and unconditional: this
+            # output is double-quantized, and nothing downstream -- model card,
+            # search result, filename -- would otherwise say so.
+            dequant_sources: Dict[str, int] = {}
+            for entry in tensor_entries:
+                st = entry["_source_type_name"]
+                if entry["_can_decode"] and st not in ("F32", "F16", "BF16"):
+                    dequant_sources[st] = dequant_sources.get(st, 0) + 1
+            if dequant_sources:
+                breakdown = ", ".join(
+                    f"{n}x {t}" for t, n in sorted(dequant_sources.items())
+                )
+                logger.warning(
+                    "DOUBLE-QUANTIZATION: %d tensors are being dequantized from "
+                    "an already-quantized source and re-quantized (%s). Quality "
+                    "is bounded by the source quant's error floor -- a tier at or "
+                    "above the source precision cannot improve on it. Only use "
+                    "this when no BF16/F16/F32 release of the model exists, and "
+                    "say so on the model card.",
+                    sum(dequant_sources.values()), breakdown,
                 )
 
             # ── Gate: imatrix-REQUIRING types must have an imatrix entry ──

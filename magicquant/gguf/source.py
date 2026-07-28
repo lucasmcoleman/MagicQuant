@@ -16,6 +16,40 @@ import numpy as np
 
 _log = logging.getLogger(__name__)
 
+# Opt-in: allow an ALREADY-QUANTIZED GGUF to be used as a source by
+# dequantizing its tensors back to F32 via libggml's dequantize_row_* kernels.
+#
+# This is OFF by default and must stay that way. MagicQuant's whole premise is
+# per-group sensitivity search against high-precision weights; a quantized
+# source means every output is DOUBLE-quantized and the search optimizes
+# against weights it cannot reconstruct. The default hard error (writer.py's
+# "source is already quantized" guard) exists to stop that happening by
+# accident.
+#
+# It is enabled deliberately for the one case where there is no alternative:
+# a model published only as GGUF, with no BF16/F16 sibling and no safetensors
+# release. Dequantizing a Q8_0 source (~8.5 bpw, per-32 block scales) and
+# re-quantizing to a Q4 tier lands close to the same tier built from BF16; a
+# Q5/Q6 tier off the same source cannot beat the source's own error floor and
+# is largely pointless.
+#
+# The env var is the propagation mechanism (not a threaded kwarg) so that a
+# single set in the calling stage reaches every internal open_model_source
+# call site -- writer, orchestrator, probing, sensitivity -- and any
+# subprocess they spawn. The explicit ``allow_dequant`` kwarg overrides it for
+# direct API use and tests.
+_ALLOW_DEQUANT_ENV = "MAGICQUANT_ALLOW_DEQUANT_SOURCE"
+
+# Types read straight to float32 with no ggml kernel involved.
+_NATIVE_FLOAT_TYPES = ("F32", "F16", "BF16")
+
+
+def _allow_dequant_default() -> bool:
+    """Resolve the default dequant-source policy from the environment."""
+    return os.environ.get(_ALLOW_DEQUANT_ENV, "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
 
 def _flatten_to_max_dims(shape: List[int], max_dims: int = 4) -> List[int]:
     """Normalize tensor shape for GGUF compatibility.
@@ -79,6 +113,32 @@ class ModelSource(ABC):
         """Return the ggml type name string for a tensor's source format."""
         ...
 
+    def can_decode(self, tensor_name: str) -> bool:
+        """True if ``read_tensor_f32`` will return real data for this tensor.
+
+        The writer uses this to decide between re-quantizing a tensor and
+        passing its bytes through verbatim, so it must agree with
+        ``read_tensor_f32`` exactly -- a False positive here writes a
+        zero-filled blob. The default is the conservative answer (native
+        float types only); ``GGUFSource`` widens it when dequantization of a
+        quantized source is explicitly enabled.
+        """
+        return self.get_source_type_name(tensor_name) in _NATIVE_FLOAT_TYPES
+
+    def read_tensor_raw(self, tensor_name: str) -> Optional[bytes]:
+        """Return this tensor's exact on-disk bytes, undecoded.
+
+        Used by the writer's passthrough path (source type == desired
+        type), which needs a verbatim byte copy and must never go through
+        ``read_tensor_f32`` -- with dequant enabled that can now RAISE for
+        a recognized-but-undecodable type, which is the wrong failure mode
+        for a straight copy. The default is None (most sources -- e.g.
+        safetensors -- only ever expose decoded float data, so a copy path
+        never applies to them); ``GGUFSource`` overrides this to return the
+        tensor's raw block bytes.
+        """
+        return None
+
     def close(self):
         pass
 
@@ -100,7 +160,7 @@ class GGUFSource(ModelSource):
         28: "F64", 29: "IQ1_M", 30: "BF16", 39: "MXFP4",
     }
 
-    def __init__(self, filepath: str):
+    def __init__(self, filepath: str, allow_dequant: Optional[bool] = None):
         from magicquant.gguf.reader import GGUFReader
         self._path = filepath
         self._reader = GGUFReader(filepath)
@@ -110,6 +170,17 @@ class GGUFSource(ModelSource):
         # so a per-tensor open/seek/close (thousands of syscalls on a big MoE)
         # is wasteful. Opened lazily, closed in close().
         self._fh = None
+        # None -> take the environment default. See _ALLOW_DEQUANT_ENV.
+        self._allow_dequant = (
+            _allow_dequant_default() if allow_dequant is None else bool(allow_dequant)
+        )
+        # Types this source actually dequantized, for the writer's warning.
+        self._dequantized_types: set = set()
+        # Types whose dequant probe already failed+warned: the writer calls
+        # can_decode() once per tensor in Pass 1, so without memoization a
+        # broken libggml would emit thousands of identical warnings on a
+        # big model. One warning per type per source is enough.
+        self._probe_warned: set = set()
 
     def get_metadata(self):
         return self._reader.get_metadata()
@@ -134,6 +205,92 @@ class GGUFSource(ModelSource):
             return f"UNKNOWN({info['data_type']})"
         return type_name
 
+    def can_decode(self, tensor_name: str) -> bool:
+        """True for native float types, plus quantized types when dequant is on.
+
+        For a quantized type the answer additionally depends on the loaded
+        libggml actually exporting that ``dequantize_row_*`` symbol -- an
+        IQ3_S/IQ2_XXS tensor has no such kernel in a stock build, so those
+        still fall through to the writer's pre-quantized hard error rather
+        than being silently zero-filled.
+        """
+        type_name = self.get_source_type_name(tensor_name)
+        if type_name in _NATIVE_FLOAT_TYPES:
+            return True
+        if not self._allow_dequant or type_name.startswith("UNKNOWN"):
+            return False
+        if type_name in self._probe_warned:
+            return False
+        from magicquant.quant.ggml_binding import supports_decode
+        try:
+            return supports_decode(type_name)
+        except Exception as exc:  # libggml missing/unloadable -> not decodable
+            self._probe_warned.add(type_name)
+            _log.warning(
+                "Dequant probe for type '%s' failed (%s); treating as "
+                "undecodable", type_name, exc,
+            )
+            return False
+
+    @property
+    def dequantized_types(self) -> set:
+        """ggml types this source dequantized on read (empty in the normal case)."""
+        return set(self._dequantized_types)
+
+    def _read_raw_bytes(self, tensor_name: str, byte_len: int, pos: int) -> bytes:
+        """Gather exactly ``byte_len`` bytes for a tensor at file offset ``pos``.
+
+        Shared by ``read_tensor_f32`` (which decodes the result) and
+        ``read_tensor_raw`` (which returns it verbatim) -- both need the
+        identical pread loop, so it's factored here rather than duplicated.
+
+        os.pread is position-independent: the writer's parallel encode pool
+        calls into this from N threads on this ONE shared handle, and a
+        seek()+read() pair races (the GIL drops between the two calls; a
+        wrong tensor comes back with the RIGHT byte count -- silent output
+        corruption). pread needs no lock and never touches the handle's own
+        file position. A single pread syscall returns at most ~2 GiB on
+        Linux, so gather in a loop -- a 27B model's token_embd (2.4 GiB
+        BF16) exceeds the cap and came back short in one call.
+        """
+        if self._fh is None:
+            self._fh = open(self._path, "rb")
+        fd = self._fh.fileno()
+        remaining = byte_len
+        chunks = []
+        while remaining > 0:
+            chunk = os.pread(fd, remaining, pos)
+            if not chunk:
+                raise IOError(
+                    f"unexpected EOF reading tensor {tensor_name!r}: "
+                    f"{remaining} of {byte_len} bytes missing at offset {pos}"
+                )
+            chunks.append(chunk)
+            pos += len(chunk)
+            remaining -= len(chunk)
+        return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+    def read_tensor_raw(self, tensor_name: str) -> Optional[bytes]:
+        """Return this tensor's exact on-disk bytes, undecoded.
+
+        See ``ModelSource.read_tensor_raw`` for why the writer needs this
+        instead of routing passthrough tensors through ``read_tensor_f32``.
+        """
+        from magicquant.quant.converters import ggml_tensor_data_size
+        info = self._reader.get_tensor_info(tensor_name)
+        if info is None:
+            return None
+        type_name = self._TYPE_NAME.get(info["data_type"])
+        if type_name is None:
+            return None
+        n_elems = 1
+        for d in info["shape"]:
+            n_elems *= d
+        byte_len = ggml_tensor_data_size(type_name, n_elems)
+        return self._read_raw_bytes(
+            tensor_name, byte_len, self._data_offset + info["offset"],
+        )
+
     def read_tensor_f32(self, tensor_name: str) -> Optional[np.ndarray]:
         from magicquant.quant.converters import ggml_tensor_data_size
         info = self._reader.get_tensor_info(tensor_name)
@@ -147,31 +304,9 @@ class GGUFSource(ModelSource):
         for d in info["shape"]:
             n_elems *= d
         byte_len = ggml_tensor_data_size(type_name, n_elems)
-        if self._fh is None:
-            self._fh = open(self._path, "rb")
-        # os.pread is position-independent: the writer's parallel encode pool
-        # calls read_tensor_f32 from N threads on this ONE shared handle, and
-        # a seek()+read() pair races (the GIL drops between the two calls; a
-        # wrong tensor comes back with the RIGHT byte count -- silent output
-        # corruption). pread needs no lock and never touches the handle's
-        # own file position. A single pread syscall returns at most ~2 GiB on
-        # Linux, so gather in a loop -- a 27B model's token_embd (2.4 GiB
-        # BF16) exceeds the cap and came back short in one call.
-        fd = self._fh.fileno()
-        pos = self._data_offset + info["offset"]
-        remaining = byte_len
-        chunks = []
-        while remaining > 0:
-            chunk = os.pread(fd, remaining, pos)
-            if not chunk:
-                raise IOError(
-                    f"unexpected EOF reading tensor {tensor_name!r}: "
-                    f"{remaining} of {byte_len} bytes missing at offset {pos}"
-                )
-            chunks.append(chunk)
-            pos += len(chunk)
-            remaining -= len(chunk)
-        buf = chunks[0] if len(chunks) == 1 else b"".join(chunks)
+        buf = self._read_raw_bytes(
+            tensor_name, byte_len, self._data_offset + info["offset"],
+        )
         if type_name == "F32":
             return np.frombuffer(buf, dtype=np.float32).copy()
         if type_name == "F16":
@@ -179,7 +314,24 @@ class GGUFSource(ModelSource):
         if type_name == "BF16":
             raw = np.frombuffer(buf, dtype=np.uint16)
             return (raw.astype(np.uint32) << 16).view(np.float32)
-        return None  # quantised — can't decode
+        # Quantized source tensor. Undecodable unless dequant was explicitly
+        # enabled; the writer's pre-quantized guard reports the error, so just
+        # signal "no data" here rather than raising.
+        if not self._allow_dequant:
+            return None
+        from magicquant.quant.ggml_binding import ggml_decode
+        try:
+            out = ggml_decode(buf, type_name, n_elems)
+        except Exception as exc:
+            # can_decode() probes the same symbol, so reaching here means the
+            # libggml handle changed under us or the block layout disagreed.
+            # Returning None would zero-fill the tensor; fail loudly instead.
+            raise RuntimeError(
+                f"Dequantizing tensor {tensor_name!r} from {type_name} failed: "
+                f"{exc}"
+            ) from exc
+        self._dequantized_types.add(type_name)
+        return out
 
     def close(self):
         if self._fh is not None:
@@ -1324,16 +1476,18 @@ class LoRAMergedSource(ModelSource):
     the writer reads each one.
     """
 
-    def __init__(self, base_path: str, adapter_path: str):
+    def __init__(self, base_path: str, adapter_path: str,
+                 allow_dequant: Optional[bool] = None):
         """
         Args:
             base_path: Path to the base model (directory or .safetensors/.gguf)
             adapter_path: Path to the LoRA adapter directory (contains
                 adapter_config.json + adapter_model.safetensors)
+            allow_dequant: Forwarded to the base source; see open_model_source.
         """
         from magicquant.gguf.source import open_model_source
 
-        self._base = open_model_source(base_path)
+        self._base = open_model_source(base_path, allow_dequant=allow_dequant)
 
         # Capture the base model's architecture so LoRA tensor-name mapping
         # picks up arch-specific adjustments (e.g. Qwen3.5 ffn_norm renaming).
@@ -1447,6 +1601,23 @@ class LoRAMergedSource(ModelSource):
     def get_source_type_name(self, tensor_name: str) -> str:
         return self._base.get_source_type_name(tensor_name)
 
+    def can_decode(self, tensor_name: str) -> bool:
+        # Merging happens in float on top of whatever the base yields, so
+        # decodability is exactly the base's answer (including its dequant
+        # policy) -- not the conservative float-types-only default.
+        return self._base.can_decode(tensor_name)
+
+    def read_tensor_raw(self, tensor_name: str) -> Optional[bytes]:
+        # A raw byte passthrough only makes sense when there's nothing to
+        # merge: a tensor with a LoRA delta MUST go through read_tensor_f32
+        # (decode -> merge -> re-encode), so returning raw bytes for it
+        # here would silently ship the unmerged (and possibly quantized)
+        # base tensor. Tensors with no adapter entry just forward to the
+        # base source, including its own passthrough/undecodable policy.
+        if tensor_name in self._lora_map:
+            return None
+        return self._base.read_tensor_raw(tensor_name)
+
     def read_tensor_f32(self, tensor_name: str) -> Optional[np.ndarray]:
         base_f32 = self._base.read_tensor_f32(tensor_name)
         if base_f32 is None:
@@ -1499,6 +1670,7 @@ class LoRAMergedSource(ModelSource):
 def open_model_source(
     path: str,
     adapter_path: Optional[str] = None,
+    allow_dequant: Optional[bool] = None,
 ) -> ModelSource:
     """
     Open a model source, auto-detecting the format.
@@ -1512,6 +1684,13 @@ def open_model_source(
 
     If *adapter_path* is given, the result wraps the base model with
     LoRA merge-on-read.
+
+    *allow_dequant* opts a GGUF source into dequantizing already-quantized
+    tensors back to F32 so they can be re-quantized (see _ALLOW_DEQUANT_ENV
+    for why this is off by default and what it costs). ``None`` -- the
+    default -- takes the policy from the environment, which is how the
+    setting reaches nested open_model_source calls and subprocesses. It has
+    no effect on safetensors sources, which are already high-precision.
     """
     # If the path itself is a LoRA adapter directory, resolve the base
     if os.path.isdir(path):
@@ -1524,13 +1703,15 @@ def open_model_source(
             # HF repo id / URL — those would require an explicit override).
             base_model = cfg.get("base_model_name_or_path", "")
             if base_model and os.path.isabs(base_model) and os.path.isdir(base_model):
-                return LoRAMergedSource(base_path=base_model, adapter_path=path)
+                return LoRAMergedSource(base_path=base_model, adapter_path=path,
+                                        allow_dequant=allow_dequant)
             # Relative paths are resolved against the adapter directory, not the
             # CWD, to avoid surprising lookups.
             if base_model and not os.path.isabs(base_model):
                 candidate = os.path.normpath(os.path.join(path, base_model))
                 if os.path.isdir(candidate):
-                    return LoRAMergedSource(base_path=candidate, adapter_path=path)
+                    return LoRAMergedSource(base_path=candidate, adapter_path=path,
+                                            allow_dequant=allow_dequant)
             raise ValueError(
                 f"LoRA adapter detected at {path} but base model "
                 f"'{base_model}' could not be resolved to a local directory. "
@@ -1539,18 +1720,19 @@ def open_model_source(
 
     # Explicit adapter
     if adapter_path is not None:
-        return LoRAMergedSource(base_path=path, adapter_path=adapter_path)
+        return LoRAMergedSource(base_path=path, adapter_path=adapter_path,
+                                allow_dequant=allow_dequant)
 
     # Standard format detection
     if os.path.isfile(path):
         if path.endswith(".gguf"):
-            return GGUFSource(path)
+            return GGUFSource(path, allow_dequant=allow_dequant)
         if path.endswith(".safetensors"):
             return SafetensorsSource(path)
         with open(path, "rb") as f:
             magic = f.read(4)
         if magic == b"GGUF":
-            return GGUFSource(path)
+            return GGUFSource(path, allow_dequant=allow_dequant)
         return SafetensorsSource(path)
 
     if os.path.isdir(path):
@@ -1559,6 +1741,7 @@ def open_model_source(
             return SafetensorsSource(path)
         gguf_files = [f for f in os.listdir(path) if f.endswith(".gguf")]
         if gguf_files:
-            return GGUFSource(os.path.join(path, gguf_files[0]))
+            return GGUFSource(os.path.join(path, gguf_files[0]),
+                              allow_dequant=allow_dequant)
 
     raise ValueError(f"Cannot detect model format for: {path}")
