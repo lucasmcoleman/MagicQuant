@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 import struct
 import json
 import logging
+import math
 import os
 import re
 import numpy as np
@@ -1761,7 +1762,12 @@ class LoRAMergedSource(ModelSource):
 
     For each tensor that has a LoRA delta (lora_A + lora_B matrices), the
     merge formula is:
-        W_merged = W_base + (lora_B @ lora_A) * (alpha / rank)
+        W_merged = W_base + (lora_B @ lora_A) * scale
+
+    scale is (alpha / rank) for plain LoRA, but PEFT computes
+    alpha / sqrt(rank) instead when the adapter was trained with rsLoRA
+    (rank-stabilized LoRA, adapter_config.json's "use_rslora": true) --
+    see PEFT's LoraLayer.scaling.
 
     Tensors without LoRA adapters pass through from the base model unchanged.
     No full merged copy is written to disk — merging happens per-tensor as
@@ -1805,7 +1811,20 @@ class LoRAMergedSource(ModelSource):
 
         self._rank = adapter_cfg.get("r", 8)
         self._alpha = adapter_cfg.get("lora_alpha", self._rank)
-        self._scale = self._alpha / self._rank
+        # INCIDENT (rsLoRA audit, 2026-07-28): this used to compute
+        # alpha / rank unconditionally, ignoring adapter_config.json's
+        # "use_rslora" flag. PEFT uses alpha / sqrt(rank) instead for
+        # rsLoRA adapters (see PEFT's LoraLayer.scaling) -- the same bug
+        # already found and fixed in Foundry's fast_export.build_lora_map
+        # (core/fast_export.py, commit d25f8bc), which trains with
+        # use_rslora=True by default. An unfixed LoRAMergedSource merges
+        # deltas sqrt(rank)x weaker than PEFT's own merge_and_unload() for
+        # any rsLoRA adapter. See test_lora_merged_source_peft_differential.py.
+        self._use_rslora = bool(adapter_cfg.get("use_rslora", False))
+        self._scale = (
+            self._alpha / math.sqrt(self._rank) if self._use_rslora
+            else self._alpha / self._rank
+        )
         self._fan_in_fan_out = adapter_cfg.get("fan_in_fan_out", False)
         self._target_modules = set(adapter_cfg.get("target_modules", []))
 
