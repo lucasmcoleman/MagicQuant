@@ -13,35 +13,25 @@ Public API:
 from typing import Dict, Optional
 import numpy as np
 
-from magicquant.quant.ggml_binding import (
-    ggml_encode,
-    GGML_TYPE_IDS,
-    _GGML_BLOCK_SIZE,
-    _GGML_TYPE_SIZE,
-)
+from magicquant.quant.ggml_binding import ggml_encode, GGML_TYPE_IDS
+from magicquant.quant import ggml_facts
 
 
 # ---------------------------------------------------------------------------
 # ggml block format constants (used by callers for offset/size math).
 #
-# Single source of truth: magicquant.quant.ggml_binding._GGML_BLOCK_SIZE /
-# _GGML_TYPE_SIZE. We derive these tables from the binding so the two can
-# never drift (the previous duplicate hand-maintained tables had IQ4_XS wrong:
-# block=32/size=18 — those are IQ4_NL's values — while the binding correctly
-# had block=256/size=136, causing corrupt Pass-1 offsets the moment PR3
-# registers IQ4_XS). Extra integer/float passthrough types not in the binding
-# are added below for backward-compatible imports.
+# Single source of truth: magicquant.quant.ggml_facts, which derives stock
+# entries from the installed `gguf` package rather than a hand-copied table
+# (the previous duplicate hand-maintained tables had IQ4_XS wrong: block=32/
+# size=18 — those are IQ4_NL's values — while the binding correctly had
+# block=256/size=136, causing corrupt Pass-1 offsets the moment PR3
+# registered IQ4_XS). The integer/float passthrough types (F64/I8/I16/I32/
+# I64) that used to need a manual overlay here are now part of ggml_facts'
+# stock table too, since the `gguf` package publishes them directly.
 # ---------------------------------------------------------------------------
 
-GGML_BLOCK_SIZE = dict(_GGML_BLOCK_SIZE)
-GGML_BLOCK_SIZE.update({
-    "F64": 1, "I8": 1, "I16": 1, "I32": 1, "I64": 1,
-})
-
-GGML_TYPE_SIZE = dict(_GGML_TYPE_SIZE)
-GGML_TYPE_SIZE.update({
-    "F64": 8, "I8": 1, "I16": 2, "I32": 4, "I64": 8,
-})
+GGML_BLOCK_SIZE = dict(ggml_facts.BLOCK_SIZE)
+GGML_TYPE_SIZE = dict(ggml_facts.TYPE_SIZE)
 
 
 def ggml_tensor_data_size(ggml_type_name: str, n_elements: int) -> int:

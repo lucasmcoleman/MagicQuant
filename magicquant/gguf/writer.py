@@ -44,6 +44,7 @@ from magicquant.quant.converters import (
     GGML_BLOCK_SIZE,
 )
 from magicquant.quant.schemes import get_all_schemes
+from magicquant.quant import ggml_facts
 
 # ggml_type_name -> bits_per_weight, derived from the scheme registry so the
 # block-32 fallback's low/high-bit split (see _block32_fallback) can never
@@ -53,47 +54,14 @@ _GGML_NAME_TO_BPW: Dict[str, float] = {
 }
 
 
-# ggml_type enum values used in GGUF tensor info
-GGML_TYPE = {
-    "F32":      0,
-    "F16":      1,
-    "Q4_0":     2,
-    "Q4_1":     3,
-    "Q5_0":     6,
-    "Q5_1":     7,
-    "Q8_0":     8,
-    "Q8_1":     9,
-    "Q2_K":    10,
-    "Q3_K":    11,
-    "Q4_K":    12,
-    "Q5_K":    13,
-    "Q6_K":    14,
-    "Q8_K":    15,
-    "IQ2_XXS": 16,
-    "IQ2_XS":  17,
-    "IQ3_XXS": 18,
-    "IQ1_S":   19,
-    "IQ4_NL":  20,
-    "IQ3_S":   21,
-    "IQ2_S":   22,
-    "IQ4_XS":  23,
-    "I8":      24,
-    "I16":     25,
-    "I32":     26,
-    "I64":     27,
-    "F64":     28,
-    "IQ1_M":   29,
-    "BF16":    30,
-    "MXFP4":   39,  # GGML_TYPE_MXFP4 (native llama.cpp support)
-    # ROCmFPX fork types — only loadable by the ROCmFPX llama.cpp fork.
-    "Q4_0_ROCMFP4":      100,
-    "Q4_0_ROCMFP4_FAST": 101,
-    "Q6_0_ROCMFPX":      102,
-    "Q8_0_ROCMFPX":      103,
-    "Q3_0_ROCMFPX":      104,
-}
+# ggml_type enum values used in GGUF tensor info. Derived from
+# magicquant.quant.ggml_facts (stock names/ids from the installed `gguf`
+# package, ROCmFPX fork types 100-104 overlaid from ggml_facts.FORK_TYPES —
+# see that module's docstring). GGML_TYPE name kept for backward
+# compatibility (external references, e.g. tests/test_writer_tensor_overrides.py).
+GGML_TYPE = dict(ggml_facts.NAME_TO_ID)
 
-_GGML_TYPE_NAME = {v: k for k, v in GGML_TYPE.items()}
+_GGML_TYPE_NAME = dict(ggml_facts.ID_TO_NAME)
 
 # GGUF metadata value-type tags
 _GGUF_TYPE_UINT8   = 0
@@ -908,6 +876,13 @@ class GGUFWriter:
                 })
 
                 data_offset = aligned_offset + expected_size
+
+            # Pass-1's tensor loop drives classify_tensor() name-by-name
+            # (not classify_tensors(), which would fire this automatically)
+            # -- so this instance's unclassified-tensor summary warning must
+            # be triggered explicitly once the pass completes. See
+            # TensorGroupClassifier.warn_unclassified_once()'s docstring.
+            classifier.warn_unclassified_once()
 
             if tensor_overrides and verbose:
                 print(f"  Tensor overrides applied: "

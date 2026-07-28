@@ -41,40 +41,6 @@ class GGUFReader:
         12: "FLOAT64"
     }
     
-    # ggml_type enum — must match the canonical ggml enum exactly
-    QUANT_TYPES = {
-        0: "F32",
-        1: "F16",
-        2: "Q4_0",
-        3: "Q4_1",
-        6: "Q5_0",
-        7: "Q5_1",
-        8: "Q8_0",
-        9: "Q8_1",
-        10: "Q2_K",
-        11: "Q3_K",
-        12: "Q4_K",
-        13: "Q5_K",
-        14: "Q6_K",
-        15: "Q8_K",
-        16: "IQ2_XXS",
-        17: "IQ2_XS",
-        18: "IQ3_XXS",
-        19: "IQ1_S",
-        20: "IQ4_NL",
-        21: "IQ3_S",
-        22: "IQ2_S",
-        23: "IQ4_XS",
-        24: "I8",
-        25: "I16",
-        26: "I32",
-        27: "I64",
-        28: "F64",
-        29: "IQ1_M",
-        30: "BF16",
-        39: "MXFP4",  # GGML_TYPE_MXFP4 (native llama.cpp)
-    }
-    
     def __init__(self, filepath: str):
         """
         Initialize the GGUF reader.

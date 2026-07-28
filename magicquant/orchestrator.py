@@ -543,6 +543,12 @@ class MagicQuantOrchestrator:
             groups.extend(["X", "R"])
         if any(classifier.classify_tensor(t) == "S" for t in tensor_names):
             groups.append("S")
+        # This loop drove classify_tensor() one name at a time (not
+        # classify_tensors(), which fires the summary automatically) across
+        # the full model's tensor_names -- surface the unclassified-tensor
+        # summary now that the pass is complete. See
+        # TensorGroupClassifier.warn_unclassified_once()'s docstring.
+        classifier.warn_unclassified_once()
         # Remember the full detected group set so run_evolution actually
         # varies X/R/S (otherwise it falls back to DEFAULT_GROUPS).
         self._search_groups = groups
@@ -1506,6 +1512,12 @@ class MagicQuantOrchestrator:
             groups.extend(["X", "R"])
         if any(classifier.classify_tensor(t) == "S" for t in tensor_names):
             groups.append("S")
+        # This loop drove classify_tensor() one name at a time (not
+        # classify_tensors(), which fires the summary automatically) across
+        # the full model's tensor_names -- surface the unclassified-tensor
+        # summary now that the pass is complete. See
+        # TensorGroupClassifier.warn_unclassified_once()'s docstring.
+        classifier.warn_unclassified_once()
         # Remember the full detected group set so run_evolution actually
         # varies X/R/S (otherwise it falls back to DEFAULT_GROUPS).
         self._search_groups = groups

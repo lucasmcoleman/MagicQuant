@@ -14,6 +14,8 @@ import os
 import re
 import numpy as np
 
+from magicquant.quant import ggml_facts
+
 _log = logging.getLogger(__name__)
 
 # Opt-in: allow an ALREADY-QUANTIZED GGUF to be used as a source by
@@ -150,14 +152,17 @@ class ModelSource(ABC):
 class GGUFSource(ModelSource):
     """Read tensors from a GGUF file."""
 
-    # ggml_type id -> name
+    # ggml_type id -> name. Derived from magicquant.quant.ggml_facts (stock
+    # ids/names come from the installed `gguf` package — see that module's
+    # docstring). Deliberately excludes the ROCmFPX fork ids (100-104):
+    # a GGUF read as a *source* here needs decoding to F32 for re-encoding,
+    # and MagicQuant has no fork-type dequant path (ggml_binding's fork
+    # dequant symbols exist, but wiring a fork-quantized source through this
+    # reader hasn't been validated) -- recognizing but mishandling those ids
+    # would be worse than the existing "UNKNOWN(id)" fallback.
     _TYPE_NAME = {
-        0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",
-        8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K",
-        13: "Q5_K", 14: "Q6_K", 15: "Q8_K", 16: "IQ2_XXS", 17: "IQ2_XS",
-        18: "IQ3_XXS", 19: "IQ1_S", 20: "IQ4_NL", 21: "IQ3_S", 22: "IQ2_S",
-        23: "IQ4_XS", 24: "I8", 25: "I16", 26: "I32", 27: "I64",
-        28: "F64", 29: "IQ1_M", 30: "BF16", 39: "MXFP4",
+        k: v for k, v in ggml_facts.ID_TO_NAME.items()
+        if k not in {info["id"] for info in ggml_facts.FORK_TYPES.values()}
     }
 
     def __init__(self, filepath: str, allow_dequant: Optional[bool] = None):
