@@ -27,6 +27,7 @@ from magicquant.gguf.source import (
     SafetensorsSource,
     UnsupportedSourceArchitecture,
     _ALLOW_UNVALIDATED_ARCH_ENV,
+    _build_gguf_metadata_from_config,
 )
 
 
@@ -173,3 +174,35 @@ def test_mapped_names_do_not_trip_the_gate(tmp_path, monkeypatch):
     names = set(src.get_tensor_names())  # must not raise
     assert "blk.0.attn_q.weight" in names
     assert "blk.0.ffn_down.weight" in names
+
+
+# ---------------------------------------------------------------------------
+# arch_map / model_type gate (_build_gguf_metadata_from_config)
+# ---------------------------------------------------------------------------
+# One level up from the architecture-transform gate above: this one fires
+# when the HF model_type has no entry in arch_map at all. Ground truth is
+# the same qwen3_5 incident replayed one step earlier -- silently defaulting
+# an unrecognized model_type to 'llama' builds every GGUF metadata key
+# (context_length, attention.head_count, rope.freq_base, ...) under the
+# WRONG architecture namespace, and the pack loads and often runs anyway.
+
+def test_known_model_type_passes(monkeypatch):
+    monkeypatch.delenv(_ALLOW_UNVALIDATED_ARCH_ENV, raising=False)
+    meta = _build_gguf_metadata_from_config(_base_config("qwen2"))  # must not raise
+    assert meta["general.architecture"] == "qwen2"
+
+
+def test_unknown_model_type_raises(monkeypatch):
+    monkeypatch.delenv(_ALLOW_UNVALIDATED_ARCH_ENV, raising=False)
+    with pytest.raises(UnsupportedSourceArchitecture, match="totally_bogus_model_type"):
+        _build_gguf_metadata_from_config(_base_config("totally_bogus_model_type"))
+
+
+def test_unknown_model_type_env_var_downgrades_to_warning(monkeypatch, caplog):
+    monkeypatch.setenv(_ALLOW_UNVALIDATED_ARCH_ENV, "1")
+    with caplog.at_level(logging.ERROR):
+        meta = _build_gguf_metadata_from_config(
+            _base_config("totally_bogus_model_type")
+        )  # must NOT raise
+    assert meta["general.architecture"] == "llama"  # documented fallback
+    assert any("totally_bogus_model_type" in rec.message for rec in caplog.records)

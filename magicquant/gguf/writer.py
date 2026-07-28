@@ -38,6 +38,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+import gguf.constants as _gguf_constants
+
 from magicquant.quant.converters import (
     encode_to_ggml_bytes,
     ggml_tensor_data_size,
@@ -63,22 +65,33 @@ GGML_TYPE = dict(ggml_facts.NAME_TO_ID)
 
 _GGML_TYPE_NAME = dict(ggml_facts.ID_TO_NAME)
 
-# GGUF metadata value-type tags
-_GGUF_TYPE_UINT8   = 0
-_GGUF_TYPE_INT8    = 1
-_GGUF_TYPE_UINT16  = 2
-_GGUF_TYPE_INT16   = 3
-_GGUF_TYPE_UINT32  = 4
-_GGUF_TYPE_INT32   = 5
-_GGUF_TYPE_FLOAT32 = 6
-_GGUF_TYPE_BOOL    = 7
-_GGUF_TYPE_STRING  = 8
-_GGUF_TYPE_ARRAY   = 9
-_GGUF_TYPE_UINT64  = 10
-_GGUF_TYPE_INT64   = 11
-_GGUF_TYPE_FLOAT64 = 12
+# GGUF metadata value-type tags. Derived from the installed `gguf` package's
+# own GGUFValueType enum (gguf.constants) rather than hand-typed ints — same
+# "facts come from upstream, never drift" policy as ggml_facts.py's
+# NAME_TO_ID (see that module's docstring for the incident this class of bug
+# caused: a hand-copied table silently going stale). Local `_GGUF_TYPE_*`
+# names are kept as aliases (many call sites below reference them, plus
+# external references e.g. tests) — only the right-hand side now comes from
+# upstream. Values are asserted identical to the historical literals in
+# tests/test_writer_gguf_constants.py.
+_GGUFValueType     = _gguf_constants.GGUFValueType
+_GGUF_TYPE_UINT8   = int(_GGUFValueType.UINT8)
+_GGUF_TYPE_INT8    = int(_GGUFValueType.INT8)
+_GGUF_TYPE_UINT16  = int(_GGUFValueType.UINT16)
+_GGUF_TYPE_INT16   = int(_GGUFValueType.INT16)
+_GGUF_TYPE_UINT32  = int(_GGUFValueType.UINT32)
+_GGUF_TYPE_INT32   = int(_GGUFValueType.INT32)
+_GGUF_TYPE_FLOAT32 = int(_GGUFValueType.FLOAT32)
+_GGUF_TYPE_BOOL    = int(_GGUFValueType.BOOL)
+_GGUF_TYPE_STRING  = int(_GGUFValueType.STRING)
+_GGUF_TYPE_ARRAY   = int(_GGUFValueType.ARRAY)
+_GGUF_TYPE_UINT64  = int(_GGUFValueType.UINT64)
+_GGUF_TYPE_INT64   = int(_GGUFValueType.INT64)
+_GGUF_TYPE_FLOAT64 = int(_GGUFValueType.FLOAT64)
 
-ALIGNMENT = 32
+# Default tensor-data alignment (bytes), from the same package
+# (gguf.constants.GGUF_DEFAULT_ALIGNMENT) rather than a hand-typed literal.
+ALIGNMENT = _gguf_constants.GGUF_DEFAULT_ALIGNMENT
 
 # Map MagicQuant scheme names to the ggml_type name we write into the file.
 # Built from the canonical scheme registry; F16/F32 added as passthrough

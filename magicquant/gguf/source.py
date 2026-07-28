@@ -703,13 +703,29 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
     }
     arch = arch_map.get(model_type)
     if arch is None:
-        _log.warning(
-            "Unknown model_type '%s' not in arch_map — defaulting to 'llama'. "
-            "GGUF metadata keys may be wrong; consider adding a mapping or "
-            "using a pre-converted GGUF source.",
-            model_type,
+        # Same disease as the qwen3_5 uniform-logits incident: silently
+        # defaulting an unrecognized model_type to 'llama' produces a GGUF
+        # whose metadata keys (context_length, block_count, attention.*,
+        # rope.freq_base, ...) are built under the WRONG architecture
+        # namespace. It loads and often even runs, with hparams silently
+        # wrong. Fail loudly instead -- extend arch_map (cross-check against
+        # llama.cpp's convert_hf_to_gguf.py MODEL_ARCH/architecture registry)
+        # rather than guessing.
+        msg = (
+            f"Unknown HF model_type '{model_type}' has no entry in "
+            f"arch_map (_build_gguf_metadata_from_config, magicquant/gguf/"
+            f"source.py) -- refusing to guess a GGUF architecture. Add a "
+            f"verified '{model_type}' -> GGUF-arch mapping (cross-check "
+            f"llama.cpp's convert_hf_to_gguf.py architecture registry), or "
+            f"set {_ALLOW_UNVALIDATED_ARCH_ENV}=1 to proceed anyway at your "
+            f"own risk (falls back to 'llama'; GGUF metadata keys may be "
+            f"wrong)."
         )
-        arch = "llama"
+        if _allow_unvalidated_arch():
+            _log.error(msg)
+            arch = "llama"
+        else:
+            raise UnsupportedSourceArchitecture(msg)
 
     meta: Dict[str, Any] = {}
     meta["general.architecture"] = arch
