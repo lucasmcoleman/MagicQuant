@@ -50,7 +50,14 @@ class TensorGroupClassifier:
         # fell through to dense group U. ffn_gate_up_exps (fused) needs its own pattern.
         'X': [r'ffn_(up|gate|down)_exps', r'ffn_gate_up_exps', r'ffn.*expert',
               r'block_sparse_moe\.(input|output)_linear'],
-        'R': [r'ffn_gate_inp', r'router', r'block_sparse_moe\.router'],
+        # exp_probs_b: the router's per-expert probability-correction bias as
+        # llama.cpp names it for laguna/deepseek-style MoE (HF
+        # e_score_correction_bias). It is router state, so group R -- without
+        # this, 47 of them on a Laguna-S went unclassified (harmless there,
+        # since the writer forces every 1-D tensor to F32 regardless, but it
+        # makes the unclassified-tensor warning cry wolf on a healthy model).
+        'R': [r'ffn_gate_inp', r'router', r'block_sparse_moe\.router',
+              r'exp_probs_b', r'e_score_correction_bias'],
         'Q': [r'attn_q\.weight', r'attn_qkv\.weight'],
         'K': [r'attn_k\.weight', r'attn_v\.weight'],
         # attn_gate: Qwen3.5 gated attention -- a per-head gate multiplied into
@@ -107,7 +114,7 @@ class TensorGroupClassifier:
         'N': ['norm', 'layernorm', 'rmsnorm'],
         'E': ['embed', 'embd', 'wte'],
         'H': ['lm_head', 'nextn', 'mtp'],
-        'R': ['router', 'gate_inp', 'gating'],
+        'R': ['router', 'gate_inp', 'gating', 'exp_probs_b', 'e_score_correction'],
         'X': ['expert', 'moe'],
         'S': ['ssm', 'mamba', 'conv1d', 'dt_bias', 'a_log', 'recurrence'],
         'Q': ['q_proj', 'query'],
