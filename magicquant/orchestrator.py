@@ -553,7 +553,15 @@ class MagicQuantOrchestrator:
         # varies X/R/S (otherwise it falls back to DEFAULT_GROUPS).
         self._search_groups = groups
 
-        if checkpoint is not None:
+        # A checkpoint can legitimately carry a baseline but NO sensitivities:
+        # a run killed between the baseline measurement and probing, or a
+        # deliberately injected baseline (measuring an oversized source once,
+        # out-of-band, so the search itself never has to load it). Restoring a
+        # null unconditionally used to skip probing and then crash in the
+        # predictor with `'NoneType' object has no attribute 'get'`, which
+        # reads as a corrupt checkpoint rather than a missing-probe state.
+        # Treat absent/empty weights as "not restored" and probe normally.
+        if checkpoint is not None and checkpoint.get("sensitivity_weights"):
             self.sensitivity_weights = checkpoint["sensitivity_weights"]
             self.probing_provenance = checkpoint["probing_provenance"]
             if verbose:
