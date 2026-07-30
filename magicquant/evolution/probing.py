@@ -20,6 +20,7 @@ import numpy as np
 
 from magicquant.quant import calibration
 from magicquant.quant.schemes import get_scheme_by_name
+from magicquant.utils.measurement import measurement_eps
 
 _log = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class SensitivityProber:
         perplexity_calculator=None,
         output_dir: Optional[str] = None,
         strict: bool = False,
+        baseline_ppl_err: Optional[float] = None,
     ):
         """
         Args:
@@ -74,9 +76,18 @@ class SensitivityProber:
                 historical fallback for prediction-only use (no
                 perplexity_calculator), where the heuristic is the
                 documented design, not a degradation.
+            baseline_ppl_err: this run's own reported error for
+                ``baseline_perplexity`` (e.g. llama-perplexity's "+/- <err>"
+                term), when the caller has it. Sizes the "physically
+                impossible probe" clamp tolerance in ``probe_all_groups`` off
+                real measurement noise instead of a flat guess. *None* (the
+                common case -- ``calculate_perplexity`` only returns a bare
+                float) falls back to a default in utils/measurement.py; see
+                ``magicquant.utils.measurement.measurement_eps``.
         """
         self.base_model_path = base_model_path
         self.baseline_ppl = baseline_perplexity
+        self.baseline_ppl_err = baseline_ppl_err
         self.perplexity_calculator = perplexity_calculator
         self.output_dir = output_dir
         self.strict = strict
@@ -87,11 +98,21 @@ class SensitivityProber:
 
         # How the sensitivity weights above were obtained: "measured" (every
         # probe got a real llama-perplexity reading), "partial" (some probes
-        # fell back to the heuristic estimate), or "heuristic" (ALL of them
-        # did -- the search then ran entirely on static empirical guesses,
-        # not this model's actual behavior). Set by probe_all_groups; "unknown"
-        # until then. Threaded into search_results.json by the orchestrator.
+        # fell back to the heuristic estimate), "heuristic" (ALL of them did
+        # -- the search then ran entirely on static empirical guesses, not
+        # this model's actual behavior), or "suspect" (more than half of the
+        # real measurements were physically impossible -- below baseline --
+        # and got clamped to 0.0 sensitivity; see probe_all_groups). Set by
+        # probe_all_groups; "unknown" until then. Threaded into
+        # search_results.json by the orchestrator.
         self.probing_provenance: str = "unknown"
+
+        # True once get_normalized_weights() has returned the uniform 1/N
+        # fallback because every sensitivity was <=0 -- "no signal" is
+        # otherwise indistinguishable from "genuinely flat", both in the
+        # returned dict itself and (pre-fix) in this run's logs. See
+        # get_normalized_weights().
+        self.weights_degenerate: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -135,13 +156,47 @@ class SensitivityProber:
             print(f"Baseline PPL: {self.baseline_ppl}")
             print()
 
+        # Tolerance below which a real (measured) probe PPL coming in under
+        # baseline is still plausible measurement noise rather than a
+        # physically impossible reading (a quantized probe cannot genuinely
+        # beat the unquantized baseline). Sized off this run's own reported
+        # baseline error when the caller supplied one, else a flat ~2%
+        # default -- see magicquant.utils.measurement.measurement_eps.
+        eps = measurement_eps(self.baseline_ppl, self.baseline_ppl_err)
+
         measured_count = 0
+        clamped_count = 0
         for group in groups:
             ppl, measured = self._probe_single_group(
                 group, aggressive_scheme, keep_scheme, verbose
             )
             if measured:
                 measured_count += 1
+
+            # A real probe reading below baseline*(1-eps) is physically
+            # impossible (quantizing a group cannot IMPROVE perplexity) --
+            # not just "low sensitivity". The unguarded
+            # ``max(0.0, ppl - baseline)`` below already silently clamps this
+            # to exactly 0.0 with no record of WHY; that 0.0 is indistin-
+            # guishable from a genuinely flat/robust group, and the whole
+            # entry still gets ``measured: true`` (see incident notes: a
+            # NaN-driven measured search recorded 8/9 groups this way).
+            is_clamped = measured and ppl < self.baseline_ppl * (1 - eps)
+            if is_clamped:
+                clamped_count += 1
+                _log.warning(
+                    "sensitivity probe for group '%s' measured PPL %.4f "
+                    "below baseline %.4f (tolerance %.4f) -- a quantized "
+                    "probe cannot genuinely beat its own baseline; clamping "
+                    "sensitivity to 0.0 and flagging this probe as "
+                    "'clamped' rather than treating it as a real zero",
+                    group, ppl, self.baseline_ppl, eps,
+                )
+                if verbose:
+                    print(
+                        f"  WARNING: group '{group}' probe PPL {ppl:.4f} "
+                        f"below baseline {self.baseline_ppl:.4f} -- clamped"
+                    )
 
             sensitivity = max(0.0, ppl - self.baseline_ppl) / self.baseline_ppl
 
@@ -152,6 +207,7 @@ class SensitivityProber:
                 "probe_ppl": ppl,
                 "sensitivity": sensitivity,
                 "measured": measured,
+                "clamped": is_clamped,
             })
 
             if verbose:
@@ -178,18 +234,51 @@ class SensitivityProber:
         else:
             self.probing_provenance = "partial"
 
+        # More than half the groups' MEASURED probes came back physically
+        # impossible (clamped) -- the run technically has "measured"/
+        # "partial" provenance, but that provenance claims a real signal
+        # this run doesn't actually have. Downgrade to "suspect" so
+        # search_results.json / the orchestrator stop asserting a
+        # measurement that's mostly noise-floor artifacts (the exact
+        # incident: 8/9 groups clamped, provenance still said "measured").
+        if total > 0 and clamped_count > total / 2:
+            _log.warning(
+                "sensitivity probing: %d/%d groups' measured probes were "
+                "physically impossible (clamped below baseline) -- "
+                "downgrading probing_provenance from %r to 'suspect'",
+                clamped_count, total, self.probing_provenance,
+            )
+            self.probing_provenance = "suspect"
+
         return self.sensitivity_results
 
     def get_normalized_weights(self) -> Dict[str, float]:
         """
         Get normalized sensitivity weights that sum to 1.0.
+
+        When every sensitivity is <=0, the search has NO real signal to
+        weight groups by -- the uniform 1/N fallback below is kept (callers
+        depend on always getting a usable vector), but this is otherwise
+        indistinguishable from a genuinely flat result. Logs a WARNING and
+        sets ``self.weights_degenerate = True`` so a caller (e.g. the
+        orchestrator, via sensitivity.json) can surface that this run's
+        evolutionary search proceeded without sensitivity signal.
         """
         total = sum(max(0, s) for s in self.sensitivity_results.values())
 
         if total == 0:
+            self.weights_degenerate = True
+            if self.sensitivity_results:
+                _log.warning(
+                    "sensitivity probing produced a total weight of 0.0 "
+                    "across all %d group(s) -- the evolutionary search will "
+                    "run WITHOUT sensitivity signal (uniform weights)",
+                    len(self.sensitivity_results),
+                )
             return {g: 1.0 / len(self.sensitivity_results)
                     for g in self.sensitivity_results}
 
+        self.weights_degenerate = False
         return {g: max(0, s) / total
                 for g, s in self.sensitivity_results.items()}
 
@@ -201,10 +290,12 @@ class SensitivityProber:
 
     def save_results(self, path: str):
         """Persist sensitivity data to *path* as JSON."""
+        normalized_weights = self.get_normalized_weights()
         data = {
             "baseline_ppl": self.baseline_ppl,
             "sensitivity": self.sensitivity_results,
-            "normalized_weights": self.get_normalized_weights(),
+            "normalized_weights": normalized_weights,
+            "weights_degenerate": self.weights_degenerate,
             "probes": self.probe_models,
             "probing_provenance": self.probing_provenance,
         }

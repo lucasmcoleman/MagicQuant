@@ -368,6 +368,66 @@ def _is_f32_required_ssm_operand(name: str) -> bool:
     return bool(_SSM_F32_REQUIRED_NAME_RE.search(name))
 
 
+# IEEE 754 half precision (F16): max finite magnitude. Values with |v| >
+# this overflow to +/-Inf on conversion -- the hazard this check exists to
+# catch (see the writer's own warning: "Out-of-F16-range values may become
+# Inf/0").
+_F16_MAX_FINITE = 65504.0
+
+
+def _bf16_to_f16_would_corrupt(source, tensor_name: str) -> bool:
+    """Would converting *tensor_name*'s real values from BF16 to F16
+    silently produce Inf for any of them?
+
+    Only called when a tensor is ACTUALLY about to be downgraded (so this
+    never runs for tensors that stay at their requested scheme -- keeps
+    Pass 1's "no data reading" fast path fast for everything else). Reads
+    the tensor's real float values once via ``source.read_tensor_f32`` and
+    does a single max-abs reduction over them -- cheap relative to the
+    tensor read itself, which dominates.
+
+    Conservative by construction: if the source can't decode this tensor at
+    all (``read_tensor_f32`` returns ``None`` -- e.g. a quantized source
+    with dequant not enabled), or it decodes to zero elements, this returns
+    False (same as the historical unconditional-downgrade behavior) rather
+    than blocking on data it doesn't have. Existing non-finite values in the
+    SOURCE itself (already NaN/Inf before this conversion) also count as
+    "would corrupt": true either way, this tensor writing through as
+    plain F16 is not safe.
+
+    Deliberately does NOT flag subnormal underflow (|v| < F16's smallest
+    subnormal, ~5.96e-8): a prior version of this check did, and it fired
+    on essentially every real weight tensor -- e.g. a 4096x4096 N(0, 0.02)
+    tensor (max|v|~=0.11, nowhere near F16's 65504 ceiling) still has some
+    element by chance landing below the subnormal floor, so EVERY BF16-
+    designated group was silently substituted with Q8_0 across the board.
+    Underflow of a ~1e-9 weight to zero is inconsequential; overflow to Inf
+    (handled above) is the real hazard.
+    """
+    try:
+        values = source.read_tensor_f32(tensor_name)
+    except Exception:
+        # A read failure here must not mask itself as "safe to downgrade" --
+        # but it also must not crash Pass 1 (a real read failure surfaces
+        # properly later, in the data pass that actually needs these bytes).
+        return False
+    if values is None or values.size == 0:
+        return False
+
+    finite_mask = np.isfinite(values)
+    if not finite_mask.all():
+        # Non-finite in the SOURCE data already -- not something THIS
+        # conversion introduces, but writing it through as F16 doesn't fix
+        # it either.
+        return True
+
+    max_abs = float(np.max(np.abs(values)))
+    if max_abs > _F16_MAX_FINITE:
+        return True
+
+    return False
+
+
 def _read_encode_worker(source, entries, result_queue, imatrix=None):
     """
     Background thread: reads each tensor from source, encodes to ggml bytes,
@@ -778,18 +838,67 @@ class GGUFWriter:
                 # BF16 → F16 conversion: llama.cpp has incomplete BF16
                 # support in its compute graph (binary ops, some matmuls
                 # assert sizeof(float) stride).  F16 is universally supported.
-                # This is a deliberate compatibility tradeoff — make it
-                # non-silent by warning once per writer instance.
+                # This is a deliberate compatibility tradeoff.
+                #
+                # CHOSEN BEHAVIOR (2026-07 incident fix -- see probing.py's
+                # clamp guard and llamacpp.py's parser fix from the same
+                # investigation): this used to warn ONCE and proceed
+                # unconditionally, even though BF16 has ~8 more exponent
+                # bits than F16 -- any source value with |v| > 65504 (F16's
+                # max finite) or in F16's subnormal-underflow range becomes
+                # Inf/0 on disk with nothing downstream reacting. Silently
+                # Inf/0-poisoned tensors (typically embeddings/lm_head,
+                # since those are the groups most often left at BF16) then
+                # measure as NaN perplexity -- which is exactly the
+                # degenerate input the parser/clamp fixes exist to catch,
+                # but catching it downstream is strictly worse than not
+                # producing it here.
+                #
+                # Detection is a single max-abs reduction over the
+                # tensor's REAL values -- read
+                # via source.read_tensor_f32 only when a downgrade is
+                # actually happening (every other tensor in this header-only
+                # pass never pays this cost; see the "Pass 1: ... (no data
+                # reading)" comment above this loop).
+                #
+                # On detection: SUBSTITUTE Q8_0 for this one tensor rather
+                # than raising. A raise would abort an otherwise-fine
+                # multi-hour hybrid build over a single outlier tensor
+                # (embeddings in particular routinely have some large
+                # magnitude rows); Q8_0 keeps real dynamic range for exactly
+                # this tensor at ~1/4 the size of F32/BF16, instead of
+                # writing Inf/0 for it. If a future caller needs "abort
+                # instead", it's a one-line change here.
                 if target_ggml_name == "BF16":
-                    if not self._bf16_downgrade_warned:
+                    out_of_range = _bf16_to_f16_would_corrupt(source, name)
+
+                    if out_of_range:
                         logger.warning(
-                            "BF16-designated group(s) written as F16 on disk "
-                            "(llama.cpp BF16 compute-graph limitation). Out-of-F16-"
-                            "range values may become Inf/0."
+                            "%s: BF16->F16 downgrade would produce Inf/0 "
+                            "(value(s) outside F16's finite/normal range) -- "
+                            "substituting Q8_0 for this tensor instead of "
+                            "writing corrupted data",
+                            name,
                         )
-                        self._bf16_downgrade_warned = True
-                    target_ggml_name = "F16"
-                    target_ggml_id = GGML_TYPE["F16"]
+                        self._fallbacks.append({
+                            "tensor": name,
+                            "group": group,
+                            "requested": "BF16",
+                            "actual": "Q8_0",
+                            "reason": "bf16-f16-out-of-range",
+                        })
+                        target_ggml_name = "Q8_0"
+                        target_ggml_id = GGML_TYPE["Q8_0"]
+                    else:
+                        if not self._bf16_downgrade_warned:
+                            logger.warning(
+                                "BF16-designated group(s) written as F16 on disk "
+                                "(llama.cpp BF16 compute-graph limitation). Out-of-F16-"
+                                "range values may become Inf/0."
+                            )
+                            self._bf16_downgrade_warned = True
+                        target_ggml_name = "F16"
+                        target_ggml_id = GGML_TYPE["F16"]
 
                 # Block-size compatibility check: quantized types require the
                 # contiguous row dimension (ne[0] in GGUF) to be a multiple of
@@ -1102,17 +1211,26 @@ class GGUFWriter:
                 print(f"Done. {output_size_mb:.1f} MB in {elapsed:.1f}s "
                       f"({output_size_mb / max(elapsed, 0.001):.0f} MB/s)")
 
-            # Data-integrity notice: surface block-size fallbacks even when
-            # verbose=False. One summary line regardless of how many tensors
-            # were affected — per-tensor detail lives in self._fallbacks.
+            # Data-integrity notice: surface fallbacks even when
+            # verbose=False. self._fallbacks now carries more than one
+            # reason (block-size, f32-required-operand, and
+            # bf16-f16-out-of-range) -- a single line hardcoding
+            # "due to block-size" misattributed every non-block-size
+            # fallback observed live. Group by reason and summarize each
+            # group with one example, instead of blaming them all on the
+            # same cause. Per-tensor detail always lives in self._fallbacks.
             if self._fallbacks:
-                first = self._fallbacks[0]
-                logger.warning(
-                    "%d tensor(s) fell back from their requested quant due to "
-                    "block-size (e.g. %s: %s->%s)",
-                    len(self._fallbacks), first["tensor"],
-                    first["requested"], first["actual"],
-                )
+                by_reason: Dict[str, List[Dict[str, str]]] = collections.defaultdict(list)
+                for entry in self._fallbacks:
+                    by_reason[entry.get("reason", "unknown")].append(entry)
+                for reason, entries in by_reason.items():
+                    first = entries[0]
+                    logger.warning(
+                        "%d tensor(s) fell back from their requested quant "
+                        "due to %s (e.g. %s: %s->%s)",
+                        len(entries), reason, first["tensor"],
+                        first["requested"], first["actual"],
+                    )
 
             return self.output_path
 

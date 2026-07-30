@@ -574,11 +574,17 @@ def test_save_results_persists_kl_and_bench_fields(tmp_path):
 def test_measured_search_raises_when_every_candidate_build_fails(tmp_path, monkeypatch):
     """F3: a measured search where every build/measure fails must not report
     success -- self._measured stays empty, so run_measured_search must raise
-    instead of falling through to _select_final_survivors/_save_results."""
+    instead of falling through to _select_final_survivors/_save_results.
+
+    (MAJOR 2 reworded the guard's message to "zero VALID measurements" --
+    same guard, now also covering the all-measurement_invalid case; see
+    tests/test_measurement_validity.py::
+    test_all_invalid_measurements_raises_instead_of_completing_with_zero_tiers.)
+    """
     orch, _ = _make_orchestrator(tmp_path, monkeypatch)
     monkeypatch.setattr(orch, "_build_candidate", lambda *a, **k: None)
 
-    with pytest.raises(RuntimeError, match="zero successful"):
+    with pytest.raises(RuntimeError, match="zero VALID"):
         orch.run_measured_search(
             search_generations=2, population_size=8,
             measurement_rounds=1, candidates_per_round=2, verbose=False,
@@ -604,7 +610,7 @@ def test_measured_search_raises_when_every_perplexity_measurement_fails(tmp_path
 
     monkeypatch.setattr(fake_tools, "calculate_perplexity", flaky_perplexity)
 
-    with pytest.raises(RuntimeError, match="zero successful"):
+    with pytest.raises(RuntimeError, match="zero VALID"):
         orch.run_measured_search(
             search_generations=2, population_size=8,
             measurement_rounds=1, candidates_per_round=2, verbose=False,
