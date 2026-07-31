@@ -8,6 +8,8 @@ path (huggingface_hub) can be layered on top by the CLI.
 
 from typing import Dict, List, Optional
 
+from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION, tier_scheme_version
+
 
 def _format_scheme_map(config: Dict[str, str]) -> str:
     """Render a per-group scheme map like ``E:BF16 H:BF16 Q:Q6_K ...``."""
@@ -47,6 +49,17 @@ def generate_model_card(
     lines.append("")
     if baseline_ppl is not None:
         lines.append(f"**Baseline (BF16) perplexity:** {baseline_ppl}")
+        lines.append("")
+
+    version = tier_scheme_version(results)
+    if version < CURRENT_TIER_SCHEME_VERSION:
+        lines.append(
+            f"> ⚠️ This search ran under tier_scheme_version={version} "
+            f"(current: {CURRENT_TIER_SCHEME_VERSION}) -- tier labels below "
+            f"follow OLDER, wider size-ratio boundaries. Compare the actual "
+            f"**Size (GB)** column rather than assuming a tier name (e.g. "
+            f"\"Q5\") matches its current meaning."
+        )
         lines.append("")
 
     lines.append("## Tiers")

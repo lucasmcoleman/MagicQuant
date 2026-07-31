@@ -121,14 +121,25 @@ class MagicQuantOrchestrator:
         # a candidate actually has a "kl" measurement recorded.
         self._kl_weight: float = 0.0
         # When True, _select_final_survivors re-ranks WITHIN a tier's
-        # near-tied candidates (measured_loss within self._speed_epsilon
-        # relative of the tier's best) by measured tg throughput instead of
-        # taking the flat quality-best. Off by default -- today's plain
-        # KL-blended measured_loss selection, unchanged. See
-        # run_measured_search's speed_aware/speed_epsilon params and
-        # _speed_aware_pick.
-        self._speed_aware: bool = False
-        self._speed_epsilon: float = 0.005
+        # near-tied candidates (raw measured_loss within self._speed_epsilon
+        # relative of the tier's best) by size_gb (default "bytes" metric) or
+        # measured tg throughput ("bench"), instead of a bare argmin over the
+        # KL-blended score. ON by default since the 2026-07 fix (see
+        # run_measured_search's speed_aware/speed_epsilon params): a real
+        # ThinkingCap run shipped a "Q5" winner that was BOTH larger and had
+        # HIGHER raw PPL than a candidate it beat, purely because the KL
+        # tiebreak tipped a near-noise-level PPL difference -- selection was
+        # size-blind. Set speed_aware=False to restore the pre-fix bare
+        # argmin-over-KL-blended-score behavior. See _speed_aware_pick.
+        self._speed_aware: bool = True
+        # None resolves lazily in _select_final_survivors to
+        # magicquant.utils.measurement.measurement_eps(self.baseline_ppl, ...)
+        # -- the same measurement-noise tolerance used elsewhere (
+        # DEFAULT_RELATIVE_EPS=0.05, REPORTED_ERR_SIGMAS=3), rather than an
+        # invented flat 0.5% that turned out to be too tight to absorb real
+        # measurement noise (see run_measured_search's speed_epsilon
+        # docstring for the ThinkingCap numbers that motivated this).
+        self._speed_epsilon: Optional[float] = None
 
     def _apply_seed(self, seed: Optional[int]) -> None:
         """Seed the RNGs once for a reproducible search.
@@ -316,8 +327,8 @@ class MagicQuantOrchestrator:
         enable_kl: bool = False,
         kl_weight: float = 0.1,
         enable_speed_bench: bool = False,
-        speed_aware: bool = False,
-        speed_epsilon: float = 0.005,
+        speed_aware: bool = True,
+        speed_epsilon: Optional[float] = None,
         speed_metric: str = "bytes",
         measurement_chunks: Optional[int] = None,
         seed_incumbents: bool = True,
@@ -364,19 +375,67 @@ class MagicQuantOrchestrator:
                 precision is a bandwidth tax the PPL objective never sees).
                 A bias, not a hard exclusion. Off by default (unchanged
                 sampling for every group, including H).
-            speed_aware: within each tier, when candidates carry bench data
-                (see ``enable_speed_bench``), prefer the candidate with the
-                best measured tg throughput among those whose measured_loss
-                is within ``speed_epsilon`` relative of the tier's best
-                instead of the flat quality-best (see
-                ``_select_final_survivors`` / ``_speed_aware_pick``). Pure
+            speed_aware: within each tier, stop taking a bare argmin over the
+                KL-blended selection score. Instead, find the tier's best
+                RAW ``measured_loss`` (a Pareto/knee rule over
+                (measured_loss, size_gb), not the KL-blended score -- KL can
+                still legitimately separate two candidates whose PPL is
+                genuinely different, but it must not be the thing that
+                decides a near-noise-level PPL tie), band every candidate
+                within ``speed_epsilon`` relative of that best, and among
+                the band prefer the smallest ``size_gb`` (default
+                ``speed_metric="bytes"``) or, when candidates carry bench
+                data (``enable_speed_bench``), the best measured tg
+                throughput (``speed_metric="bench"``) -- see
+                ``_select_final_survivors`` / ``_speed_aware_pick``. Pure
                 post-hoc re-ranking of already-recorded measurements -- no
-                extra GPU calls. Off by default, and a no-op even when True
-                if no candidate in a tier has bench data (falls back to
-                today's plain measured_loss/KL-blended selection).
-            speed_epsilon: relative measured_loss tolerance (default 0.005 =
-                0.5%) defining "near-tied" for ``speed_aware``. Only
-                meaningful when ``speed_aware=True``.
+                extra GPU calls.
+                ON by default since the 2026-07 fix: a real ThinkingCap run
+                shipped a "Q5" tier winner that was BOTH larger (20.89 GB vs
+                17.68 GB) AND had HIGHER raw PPL (6.827036 vs 6.826419) than
+                a candidate in the same tier -- it won purely because the KL
+                tiebreak (kl_weight * |mean_kl|) tipped a PPL difference
+                (~0.009%) that was two orders of magnitude below the run's
+                own reported measurement error (+/- ~1.6%). Selection was
+                size-blind and let noise-level KL swings override a real,
+                smaller, better-PPL candidate. Pass ``speed_aware=False`` to
+                restore the pre-fix bare argmin-over-KL-blended-score
+                behavior.
+            speed_epsilon: relative tolerance (applied as
+                ``epsilon * abs(best_raw_measured_loss)``) defining
+                "near-tied" for ``speed_aware``. ``None`` (the default)
+                resolves lazily, per tier, once each tier's quality-winner
+                is known, to
+                ``magicquant.utils.measurement.measurement_eps(baseline_ppl,
+                reported_err)`` -- the SAME measurement-noise tolerance used
+                by the "is this PPL reading physically plausible" guard
+                elsewhere in this module (``DEFAULT_RELATIVE_EPS=0.05``,
+                ``REPORTED_ERR_SIGMAS=3``), rather than a second, invented
+                tolerance. ``reported_err`` is that tier's quality-winner's
+                own fused-KL-pass ``ppl_err`` when one was measured (same
+                threading as the per-candidate ``measurement_invalid``
+                check's ``kl_result.get("ppl_err")``), so the 3-sigma path
+                actually gets exercised on real runs instead of always
+                falling back to the flat default; it falls back to
+                ``DEFAULT_RELATIVE_EPS`` when no such measurement is
+                reachable (e.g. ``enable_kl=False``). The historical flat
+                0.005 (0.5%) was too tight to absorb real measurement noise
+                -- see the ThinkingCap numbers above, where the "near tied"
+                PPL gap was itself only ~0.009% but still fell entirely
+                within normal run-to-run jitter. Only meaningful when
+                ``speed_aware=True``; pass an explicit float to pin a fixed
+                tolerance instead of the noise-derived default.
+                IMPORTANT: widening this epsilon is NOT what fixes the
+                ThinkingCap bug above -- that candidate pair's raw PPL gap
+                (~0.0091% of baseline in measured_loss units) sits
+                well inside even the old, tighter 0.005
+                (0.5%) band, so any reasonable epsilon puts them "near
+                tied". What actually fixes it is banding on RAW
+                ``measured_loss`` (this function's ``score_of`` param, see
+                ``_speed_aware_pick``) instead of the KL-blended
+                ``_selection_score`` -- the old bug was that KL, not PPL,
+                decided the tier winner. Do not "tune" this epsilon
+                expecting it to change tier-winner selection by itself.
             measurement_chunks: cap every perplexity/KL pass in this run to
                 this many ctx_size-token chunks instead of the whole corpus
                 (overrides LlamaCppTools' own MAGICQUANT_PPL_CHUNKS env
@@ -1254,9 +1313,14 @@ class MagicQuantOrchestrator:
         candidates: List[Dict], quality_best: Dict, epsilon: float, score_of,
         speed_metric: str = "bytes",
     ) -> Dict:
-        """Within a tier, among candidates whose *selection score* is within
-        ``epsilon`` relative of the tier's best, pick the fastest -- otherwise
+        """Within a tier, among candidates whose *raw measured_loss* is within
+        ``epsilon`` relative of the tier's best, pick the smallest -- otherwise
         leave ``quality_best`` (the flat score winner) untouched.
+
+        NOTE the ranking key is raw ``measured_loss``, NOT the KL-blended
+        ``_selection_score``. That distinction IS the 2026-07 fix: banding on
+        the blended score let a noise-level KL swing hand a tier to a larger,
+        worse-PPL candidate. See ``speed_epsilon`` in ``run_measured_search``.
 
         ``speed_metric`` chooses how "fastest" is measured:
           - ``"bytes"`` (default): smallest ``size_gb``. tg is memory-
@@ -1273,12 +1337,38 @@ class MagicQuantOrchestrator:
             candidate carries bench data this is a no-op and ``quality_best``
             is returned unchanged.
 
-        ``score_of`` is the KL-guarded scoring callable
-        ``_select_final_survivors`` ranks by, NOT raw measured_loss: the band
-        inherits the "a KL-failed candidate can't beat one that measured real
-        KL" guard, and additionally, when the quality winner is KL-confirmed,
-        only KL-confirmed candidates may win the speed tiebreak (an
-        unconfirmed candidate's real quality could be terrible).
+        ``score_of`` is the metric the epsilon band is computed over.
+        ``_select_final_survivors`` passes raw ``measured_loss`` (NOT the
+        KL-blended ``_selection_score``) -- the Pareto/knee rule is over
+        (measured_loss, size_gb) per the 2026-07 fix: KL must not be able to
+        smuggle a genuinely-worse-PPL, larger candidate past a real PPL
+        advantage just because the KL term swung the blended score (this is
+        exactly what happened on the real ThinkingCap run that motivated
+        this fix -- see ``run_measured_search``'s ``speed_aware`` docstring).
+        KL still matters -- it decided which candidate is ``quality_best``
+        (used as the fallback return and to gate KL-failed candidates below)
+        -- but no longer overrides a raw quality/size Pareto tradeoff within
+        the noise band.
+        The in-band filter separately guards on KL *presence*, independent
+        of ``score_of``: a candidate whose KL measurement failed (no "kl"
+        key) can never beat one that measured real KL when the quality
+        winner itself is KL-confirmed -- otherwise a measurement failure
+        gets rewarded over real (if poor) data.
+
+        DELIBERATE DEMOTION -- KL's ``mean_kl`` VALUE plays no role in
+        picking the in-band winner below (only its *presence*, via the
+        gate above): the final ``min(..., key=size_gb)`` /
+        ``max(..., key=tg_ts)`` picks purely on size/speed among in-band
+        candidates, even when two in-band candidates have very different
+        ``mean_kl``. This is intentional, not an oversight -- reinstating
+        KL as a value-based tiebreak here would reopen exactly the
+        ThinkingCap failure mode this function exists to close (a KL swing
+        deciding the tier winner instead of raw quality/size), just scoped
+        to a narrower slice of candidates. If a future run shows KL-value
+        blindness within the band causing a real regression (analogous to
+        the ThinkingCap PPL/size one), prefer adding a documented, narrowly-
+        scoped exception here over quietly blending KL back into the
+        ranking key.
         """
         best_has_kl = bool(
             quality_best.get("kl") and quality_best["kl"].get("mean_kl") is not None
@@ -1319,8 +1409,14 @@ class MagicQuantOrchestrator:
             tier = self._classify_tier(info["size_gb"], baseline_gb)
             by_tier[tier].append(info)
 
+        # Conservative getattr fallback (False/None) for instances built via
+        # bare __new__ that predate this feature entirely -- a normally
+        # constructed orchestrator always has these attributes set (True /
+        # None by __init__, then possibly overridden by run_measured_search's
+        # own speed_aware/speed_epsilon params), so real callers get the new
+        # default; only pre-feature/stripped-down test doubles fall back here.
         speed_aware = getattr(self, "_speed_aware", False)
-        speed_epsilon = getattr(self, "_speed_epsilon", 0.005)
+        speed_epsilon_override = getattr(self, "_speed_epsilon", None)
         speed_metric = getattr(self, "_speed_metric", "bytes")
 
         result = {}
@@ -1349,8 +1445,35 @@ class MagicQuantOrchestrator:
 
                 best = min(candidates, key=_score)
                 if speed_aware:
+                    if speed_epsilon_override is not None:
+                        speed_epsilon = speed_epsilon_override
+                    else:
+                        # Reuse the same measurement-noise tolerance the "is
+                        # this PPL physically plausible" guard uses (see
+                        # run_measured_search's speed_epsilon docstring),
+                        # AND actually exercise its 3-sigma path: thread the
+                        # tier-quality-winner's own reported KL ppl_err
+                        # through when a fused KL pass measured one, exactly
+                        # like the per-candidate measurement_invalid check
+                        # above does with kl_result.get("ppl_err"). Without
+                        # this, measurement_eps always fell back to its flat
+                        # DEFAULT_RELATIVE_EPS regardless of how precise this
+                        # run's own measurements actually were. NOTE: this
+                        # epsilon width is NOT what fixes the ThinkingCap
+                        # bug -- that fix is banding on raw measured_loss
+                        # (score_of below / _speed_aware_pick's docstring)
+                        # instead of the KL-blended score. A future reader
+                        # should not "tune" this epsilon expecting it to
+                        # change tier-winner selection by itself.
+                        reported_err = (
+                            best["kl"].get("ppl_err")
+                            if best.get("kl") else None
+                        )
+                        baseline_ppl = getattr(self, "baseline_ppl", None) or 0.0
+                        speed_epsilon = measurement_eps(baseline_ppl, reported_err)
                     best = self._speed_aware_pick(
-                        candidates, best, speed_epsilon, _score, speed_metric
+                        candidates, best, speed_epsilon,
+                        lambda info: info["measured_loss"], speed_metric,
                     )
                 result[tier] = best
         return result
@@ -1416,7 +1539,17 @@ class MagicQuantOrchestrator:
         ``load_hybrid_config``, Foundry's rocmfpx MQ-hybrid mode) only require
         ``tiered[tier]["config"]``, which both paths provide.
         """
+        from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION
+
         results = {
+            # Which TIER_BOUNDARIES set classified the tier labels below.
+            # Old files without this key predate the fix and must be read as
+            # LEGACY_TIER_SCHEME_VERSION -- see magicquant.quant.tiers'
+            # module docstring and tier_scheme_version() for the
+            # compatibility read path. This never causes old artifacts to
+            # fail to load: the per-tier config content is unaffected by the
+            # label's meaning, only its human-facing interpretation is.
+            "tier_scheme_version": CURRENT_TIER_SCHEME_VERSION,
             "baseline_ppl": self.baseline_ppl,
             "baseline_provenance": self.baseline_provenance,
             "probing_provenance": getattr(self, "probing_provenance", "unknown"),
@@ -1455,6 +1588,18 @@ class MagicQuantOrchestrator:
                     "ppl": info.get("ppl"),
                     "measured_loss": info.get("measured_loss"),
                     "size_gb": info.get("size_gb", info.get("predicted_size_gb")),
+                    # "incumbent" when this tier's winner IS one of
+                    # magicquant.incumbents' seeded llama.cpp-mixture
+                    # configs (info["incumbent"] holds the seed tier tag,
+                    # e.g. "Q4"), "evolved" when the search itself produced
+                    # the winner. Previously invisible -- across four real
+                    # models the Q4/Q5 tiers were repeatedly won by the
+                    # incumbent seed with the search contributing nothing,
+                    # and there was no field recording that fact. Only
+                    # populated by the measured-search path (run_full_search's
+                    # prediction-only tiers don't carry seed provenance, so
+                    # they always read "evolved" here).
+                    "source": "incumbent" if info.get("incumbent") else "evolved",
                 }
                 for tier, info in tiered.items()
             },
@@ -1465,6 +1610,7 @@ class MagicQuantOrchestrator:
                     "measured_loss": info.get("measured_loss"),
                     "predicted_loss": info.get("predicted_loss"),
                     "size_gb": info.get("size_gb", info.get("predicted_size_gb")),
+                    "source": "incumbent" if info.get("incumbent") else "evolved",
                 }
                 for tier, info in tiered.items()
             },
@@ -1838,19 +1984,45 @@ class MagicQuantOrchestrator:
     ) -> List[str]:
         """Generate one hybrid GGUF per compression tier.
 
-        NOTE: the Q2 tier (size ratio <= 0.16) is currently UNREACHABLE — the
-        smallest registered scheme is Q2_K (bpw=2.625 -> ratio ~0.164, just
-        outside the band). It will log "No config for tier, skipping" until
-        PR3 adds sub-Q2 IQ-quants. Q2 is kept in the default list (and now has
-        an HF filename label) so it fills automatically once PR3 lands.
+        Under TIER_SCHEME_VERSION 2 (see magicquant.quant.tiers' module
+        docstring), the Q2 tier IS reachable: its band is
+        ``(0, _Q2_CEILING]`` = ``(0, 0.178]``, and both Q2_K (ratio ~0.1641)
+        and IQ2_S (ratio ~0.1602) classify into it. (Under the old v1
+        boundaries Q2 sat just outside the band and was genuinely
+        unreachable without sub-Q2 IQ-quants -- that limitation no longer
+        applies.) A tier can still legitimately come back empty if the
+        search/incumbents never produced a config whose measured/predicted
+        size lands in that tier's band; see the requested-but-empty warning
+        below for how that's surfaced.
         """
+        from magicquant.quant.tiers import describe_tier_band
+
         if tiers is None:
             tiers = ["Q8", "Q6", "Q5", "Q4", "Q2"]
 
+        # Every tier in `tiers` (whether the caller passed it explicitly or
+        # it came from the default list above) was REQUESTED -- a caller
+        # asking for e.g. tiers=["Q4", "Q5", "Q6"] expects to get (up to)
+        # three files back. Under the narrower v2 bands, a requested tier
+        # with no measured/predicted config in it is a real, actionable gap
+        # (fewer files shipped than asked for), not a routine no-op -- log
+        # it loudly (not INFO) and record it so a downstream reader of
+        # search_results.json (e.g. the publish path) can see it too,
+        # instead of it only ever being visible in a log line. This does
+        # NOT hard-fail: a genuinely empty band (nothing measured/predicted
+        # landed there) is legitimate and the run's other tiers still ship.
+        missing_requested = []
         generated = []
         for tier in tiers:
             if tier not in tiered:
-                log.info("No config for tier, skipping", stage="generate", tier=tier)
+                band = describe_tier_band(tier)
+                log.warning(
+                    "Requested tier has no config -- skipping "
+                    "(narrower v2 tier bands can leave a tier empty; see "
+                    "magicquant.quant.tiers module docstring)",
+                    stage="generate", tier=tier, band=band,
+                )
+                missing_requested.append({"tier": tier, "band": band})
                 continue
 
             entry = tiered[tier]
@@ -1884,7 +2056,39 @@ class MagicQuantOrchestrator:
             else:
                 log.error("Tier generation failed", stage="generate", tier=tier)
 
+        if missing_requested:
+            self._record_missing_requested_tiers(missing_requested)
+
         return generated
+
+    def _record_missing_requested_tiers(self, missing_requested: List[Dict[str, str]]) -> None:
+        """Stamp ``requested_tiers_missing`` into the already-written
+        search_results.json so a downstream reader (e.g. the publish path)
+        can see that fewer files were generated than were asked for, without
+        having to scrape logs. Best-effort: search_results.json is written
+        by ``_save_results`` earlier in the run (both search paths call it
+        before ``generate_tiered_models`` runs), but ``generate_tiered_models``
+        can also be invoked standalone (see ``magicquant/__main__.py``'s
+        ``generate`` subcommand, loading a prior run's file) against a
+        directory where the file may be missing/unreadable -- in which case
+        this logs and gives up rather than raising, since the GGUF files
+        themselves were already generated successfully and that must not be
+        undone by a diagnostics-only write failing.
+        """
+        results_path = self.output_dir / "search_results.json"
+        try:
+            existing = json.loads(results_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning(
+                "Could not read search_results.json to record missing "
+                "requested tiers -- the tiers listed above were still "
+                "skipped, but this run's search_results.json won't "
+                "reflect it",
+                stage="generate", error=str(exc),
+            )
+            return
+        existing["requested_tiers_missing"] = missing_requested
+        results_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
 
     def generate_top_models(
         self, results: List[Dict], top_n: int = 3,

@@ -16,9 +16,13 @@ import json
 import os
 from typing import Dict, Union
 
+from magicquant.logging import get_logger
 from magicquant.quant.schemes import get_scheme_by_name
+from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION, tier_scheme_version
 
 PathLike = Union[str, "os.PathLike[str]"]
+
+log = get_logger(__name__)
 
 
 def load_hybrid_config(search_results_path: PathLike, tier: str) -> Dict[str, str]:
@@ -37,9 +41,33 @@ def load_hybrid_config(search_results_path: PathLike, tier: str) -> Dict[str, st
     Raises:
         KeyError: if ``tier`` (or the ``tiered`` block) isn't present; the message
             lists the tiers that *are* available.
+
+    Compatibility: a ``search_results.json`` written before the 2026-07
+    TIER_SCHEME_VERSION fix (``magicquant.quant.tiers``) has no
+    ``tier_scheme_version`` field and its tier labels follow the OLD, wider
+    size-ratio boundaries -- e.g. its "Q5" entry may actually be Q6_K-sized.
+    This file STILL LOADS (the per-group config content stored under a tier
+    key is unaffected by which boundaries produced the label -- only the
+    label's human-facing meaning differs), but a non-fatal warning is logged
+    so a QAT run doesn't silently assume "Q5" means what it means today.
     """
     with open(search_results_path, encoding="utf-8") as f:
         results = json.load(f)
+
+    version = tier_scheme_version(results)
+    if version < CURRENT_TIER_SCHEME_VERSION:
+        log.warning(
+            f"{search_results_path} was written under tier_scheme_version="
+            f"{version} (current: {CURRENT_TIER_SCHEME_VERSION}) -- its tier "
+            f"labels follow OLDER, wider size-ratio boundaries (see the "
+            f"magicquant.quant.tiers module docstring). The requested tier "
+            f"{tier!r} config still loads correctly, but its size may not "
+            f"match what {tier!r} means under the current scheme (e.g. an "
+            f"old 'Q5' can be Q6_K-sized). Re-run the search for labels "
+            f"matching current semantics if that matters for this QAT run.",
+            stage="qat_config", search_results_path=str(search_results_path),
+            tier=tier, tier_scheme_version=version,
+        )
 
     tiered = results.get("tiered")
     if not tiered:

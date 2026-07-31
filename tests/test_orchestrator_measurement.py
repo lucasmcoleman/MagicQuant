@@ -571,6 +571,50 @@ def test_save_results_persists_kl_and_bench_fields(tmp_path):
     assert entry["bench"] == {"pp_tps": 90.0}
 
 
+def test_save_results_stamps_current_tier_scheme_version(tmp_path):
+    from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION
+
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch.output_dir = tmp_path
+    orch.baseline_ppl = 5.0
+    orch.baseline_provenance = "measured"
+    orch.probing_provenance = "measured"
+    orch._search_seed = None
+    orch._measured = {}
+    orch._save_results([], {})
+
+    saved = json.loads((tmp_path / "search_results.json").read_text())
+    assert saved["tier_scheme_version"] == CURRENT_TIER_SCHEME_VERSION
+
+
+def test_save_results_records_incumbent_vs_evolved_source_per_tier_winner(tmp_path):
+    """The ALSO ask: today (pre-fix) it's invisible whether a tier winner
+    came from magicquant.incumbents' seeded llama.cpp mixture or the
+    evolutionary search itself -- across four real models the Q4/Q5 tiers
+    were repeatedly won by the incumbent seed with the search contributing
+    nothing, unnoticed for lack of exactly this field."""
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch.output_dir = tmp_path
+    orch.baseline_ppl = 5.0
+    orch.baseline_provenance = "measured"
+    orch.probing_provenance = "measured"
+    orch._search_seed = None
+    orch._measured = {}
+    tiered = {
+        "Q4": {"config": {"E": "Q4_K_M"}, "measured_loss": 0.02,
+               "size_gb": 4.0, "incumbent": "Q4"},
+        "Q6": {"config": {"E": "IQ4_XS"}, "measured_loss": 0.01,
+               "size_gb": 6.0},  # no "incumbent" key -> evolved
+    }
+    orch._save_results([], tiered)
+    saved = json.loads((tmp_path / "search_results.json").read_text())
+
+    assert saved["tiered"]["Q4"]["source"] == "incumbent"
+    assert saved["tiered"]["Q6"]["source"] == "evolved"
+    assert saved["tiered_survivors"]["Q4"]["source"] == "incumbent"
+    assert saved["tiered_survivors"]["Q6"]["source"] == "evolved"
+
+
 def test_measured_search_raises_when_every_candidate_build_fails(tmp_path, monkeypatch):
     """F3: a measured search where every build/measure fails must not report
     success -- self._measured stays empty, so run_measured_search must raise

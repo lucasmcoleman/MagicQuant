@@ -66,3 +66,64 @@ def test_unknown_scheme_name_passes_through_unchanged(tmp_path):
     )
     cfg = load_hybrid_config(str(p), tier="Q4")
     assert cfg == {"U": "TOTALLY_MADE_UP"}
+
+
+# ── tier_scheme_version compatibility (2026-07 fix) ──────────────────────
+
+def test_legacy_fixture_has_no_tier_scheme_version():
+    """FIXTURE predates the versioning stamp entirely -- confirms every test
+    above already exercises the legacy/compat path, not just a version==1
+    file constructed for the occasion."""
+    raw = json.loads(FIXTURE.read_text())
+    assert "tier_scheme_version" not in raw
+
+
+def test_legacy_file_still_loads_but_warns(monkeypatch, tmp_path):
+    """A pre-versioning search_results.json (no tier_scheme_version key)
+    must still load successfully -- old artifacts keep working -- but logs a
+    non-fatal warning so a QAT run doesn't silently assume 'Q5' means what
+    it means today."""
+    import magicquant.qat.config as config_mod
+
+    warnings = []
+    monkeypatch.setattr(
+        config_mod.log, "warning", lambda msg, **kw: warnings.append((msg, kw))
+    )
+    cfg = load_hybrid_config(str(FIXTURE), tier="Q4")
+    assert cfg["U"] == "MXFP4"  # loaded correctly despite being legacy
+    assert len(warnings) == 1
+    assert warnings[0][1]["tier_scheme_version"] == 1
+
+
+def test_explicit_legacy_version_1_also_warns(monkeypatch, tmp_path):
+    p = tmp_path / "sr.json"
+    p.write_text(json.dumps({
+        "tier_scheme_version": 1,
+        "tiered": {"Q4": {"config": {"U": "MXFP4_MOE"}}},
+    }))
+    import magicquant.qat.config as config_mod
+
+    warnings = []
+    monkeypatch.setattr(
+        config_mod.log, "warning", lambda msg, **kw: warnings.append((msg, kw))
+    )
+    load_hybrid_config(str(p), tier="Q4")
+    assert len(warnings) == 1
+
+
+def test_current_version_file_does_not_warn(monkeypatch, tmp_path):
+    from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION
+    import magicquant.qat.config as config_mod
+
+    p = tmp_path / "sr.json"
+    p.write_text(json.dumps({
+        "tier_scheme_version": CURRENT_TIER_SCHEME_VERSION,
+        "tiered": {"Q4": {"config": {"U": "MXFP4_MOE"}}},
+    }))
+    warnings = []
+    monkeypatch.setattr(
+        config_mod.log, "warning", lambda msg, **kw: warnings.append((msg, kw))
+    )
+    cfg = load_hybrid_config(str(p), tier="Q4")
+    assert cfg["U"] == "MXFP4"
+    assert warnings == []
