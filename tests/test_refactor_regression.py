@@ -4,6 +4,19 @@ Pins random.seed and numpy.random seed, runs a small evolutionary search,
 captures the candidate sequence, and asserts it matches a stored fixture.
 
 This test must pass identically before and after the scheme-registry refactor.
+
+The fixture (tests/fixtures/refactor_regression_seed42.json) was
+DELIBERATELY regenerated for the 2026-07 TIER_SCHEME_VERSION 2 fix
+(magicquant.quant.tiers.TIER_BOUNDARIES): EvolutionarySurvivor's per-
+generation tournament selection classifies the population into tiers via
+``classify_tier`` (see survival.py's ``_classify_into_tiers``), so shifting
+the boundaries changes which candidates compete against which within a
+generation -- and therefore the whole downstream trajectory, even under an
+identical RNG seed. This is intentional, expected drift from that fix, not
+an unrelated behavior change the fixture is supposed to catch -- re-verify
+manually (inspect the captured configs for sanity: real scheme names, no
+crash/NaN artifacts) before regenerating this fixture again for any FUTURE
+change, exactly as was done here.
 """
 import json
 import random

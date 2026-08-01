@@ -19,15 +19,26 @@ dependencies = [
     # used by magicquant.quant.ggml_binding for all quantized encoders.
     # Discovery prefers system llama.cpp if available; falls back to this.
     "llama-cpp-python>=0.3.0",
+    # gguf (llama.cpp's own pure-python package) is the canonical source of
+    # ggml type name/id/block-size/type-size facts, imported at module load
+    # by magicquant.quant.ggml_facts -- a hard dependency now, not just a
+    # test-time convenience, so those facts are never hand-copied and left
+    # to drift (see ggml_facts.py's docstring).
+    # Floor raised 0.10.0 -> 0.18.0: 0.10.0's GGMLQuantizationType predates
+    # the MXFP4/TQ1_0/TQ2_0 members MagicQuant dispatches/writes -- with
+    # 0.10.0 installed, referencing those members either KeyErrors or (worse)
+    # silently degrades to a Q4_0 fallback in the GGUF writer instead of
+    # failing loudly. ggml_facts.REQUIRED_STOCK_NAMES's import-time guard
+    # enforces this floor at runtime too (raises ImportError naming any
+    # missing member), so an accidental pin-back is caught immediately.
+    "gguf>=0.18.0",
 ]
 
 [project.optional-dependencies]
 yaml = ["pyyaml>=6.0"]
 # huggingface_hub is only needed for `magicquant card --upload`.
 hf = ["huggingface_hub>=0.20.0"]
-# `gguf` is needed by tests/integration/test_encoder_parity.py to write/read
-# reference GGUFs; without it the parity test skips (not fails).
-dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0", "gguf>=0.10.0", "ruff>=0.5.0"]
+dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0", "ruff>=0.5.0"]
 # Quantization-Aware Training (QAT-LoRA). Heavy training stack — only needed for
 # `magicquant qat`; the core install is unchanged. torch must be the build that
 # works on this box (ROCm/CPU); install the matching wheel as appropriate.

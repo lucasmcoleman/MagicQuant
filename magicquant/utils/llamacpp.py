@@ -3,6 +3,8 @@ llama.cpp integration - Wrapper for calling llama.cpp quantization tools.
 """
 
 import json
+import logging
+import math
 import subprocess
 import os
 import re
@@ -10,6 +12,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+_log = logging.getLogger(__name__)
 
 
 # Default timeout for subprocess calls (seconds)
@@ -78,6 +82,9 @@ class LlamaCppTools:
         # capping trades some statistical resolution for tractable wall-clock
         # while keeping every measurement in the run on the same corpus slice.
         self.ppl_chunks = _env_int("MAGICQUANT_PPL_CHUNKS")
+        # Set on first auto-resolution and enforced thereafter -- see
+        # _resolve_data_file's pinning wrapper.
+        self._pinned_corpus: Optional[str] = None
 
     def _gpu_flags(self) -> List[str]:
         """``-ngl``/``-t`` flags for perplexity/bench, omitted when unset.
@@ -165,16 +172,60 @@ class LlamaCppTools:
         raise FileNotFoundError(f"Could not find perplexity tool in {self.llamacpp_path}")
 
     def _resolve_data_file(self, data_file: Optional[str] = None) -> Optional[str]:
-        """Resolve the dataset file for perplexity evaluation.
+        """Resolve the dataset file for perplexity evaluation, PINNED after
+        first use.
 
         Priority:
         1. Explicit *data_file* argument
         2. Instance-level ``self.data_file``
         3. Common locations relative to the llama.cpp directory
 
+        Every call made with ``data_file=None`` -- i.e. every implicit,
+        instance-driven resolution, which is what every
+        ``calculate_perplexity(path, ...)`` call during a search takes --
+        resolves to the SAME corpus for this instance's whole lifetime: the
+        first such resolution is cached on ``self._pinned_corpus``, and any
+        later resolution that would disagree raises loudly instead of
+        silently switching corpora. A measured search compares baseline and
+        every candidate's PPL against each other under the assumption they
+        all ran over the same text; a corpus that silently changed mid-run
+        (e.g. ``self.data_file`` mutated, or the wikitext file disappearing
+        out from under a fallback search) would make every number in that
+        run's search_results.json quietly incomparable (see incident notes,
+        point 5: CORPUS PROVENANCE). An explicit *data_file* argument is the
+        CALLER choosing a corpus for that one call on purpose (e.g. an
+        already-resolved KL corpus threaded through explicitly) and is never
+        pinned or checked against the pin.
+
         Returns:
             Absolute path to the data file, or *None* with a printed error.
         """
+        resolved = self._resolve_data_file_uncached(data_file)
+
+        if data_file:
+            # Explicit override: this call's choice, not the instance's
+            # ambient corpus -- bypasses pinning entirely.
+            return resolved
+
+        pinned = getattr(self, "_pinned_corpus", None)
+        if pinned is None:
+            self._pinned_corpus = resolved
+            return resolved
+        if resolved != pinned:
+            raise RuntimeError(
+                f"PPL corpus resolution changed mid-run: this LlamaCppTools "
+                f"instance pinned {pinned!r} at first use, but a later "
+                f"auto-resolution now produces {resolved!r}. Every "
+                "measurement in a run must share one corpus or PPL values "
+                "are not comparable (see incident notes, point 5: CORPUS "
+                "PROVENANCE). If a genuine corpus change is intended, "
+                "construct a new LlamaCppTools instance for it."
+            )
+        return pinned
+
+    def _resolve_data_file_uncached(self, data_file: Optional[str] = None) -> Optional[str]:
+        """Do the actual resolution work (see ``_resolve_data_file``'s
+        pinning wrapper, which is what every other caller should use)."""
         candidate = data_file or self.data_file
 
         if candidate:
@@ -584,30 +635,130 @@ class LlamaCppTools:
         return parsed
 
 
+# Measurement-failure markers: llama-perplexity prints these and still
+# exits 0 (perplexity.cpp), so a caller checking only the return code sees
+# "success". A NaN model in particular hits the first one and then never
+# reaches the "Final estimate: PPL =" print at all (perplexity.cpp:646-657
+# gates it on nll2 > 0) -- so scanning for a PPL number in this output is
+# guaranteed to either find nothing real or (pre-fix) find something bogus.
+_NEGATIVE_STDDEV_MARKER = "Unexpected negative standard deviation of log(prob)"
+_FAILED_DECODE_MARKER = "failed to decode"
+
+# "Final estimate: PPL = 5.2345 +/- 0.0123" -- the only real per-run summary
+# line llama-perplexity prints. Accepts a literal "nan"/"inf" token too (not
+# just digits): a hypothetical future llama.cpp build that prints the final
+# line even for a degenerate run must still be caught by the
+# not-finite check below rather than silently failing to match at all.
+_FINAL_ESTIMATE_RE = re.compile(
+    r"Final estimate.*?PPL\s*=\s*(-?\d+\.?\d*|-?nan|-?inf)", re.IGNORECASE
+)
+# The KL block's "Mean PPL(Q) : 13.821636 +/- 3.046334" -- the evaluated
+# model's own perplexity from a --kl-divergence run (see _parse_kl_output,
+# which extracts the same field for KL-specific callers). Recognized here
+# too so any caller that feeds KL output through this generic parser (rather
+# than the KL-specific one) still gets a real PPL instead of nothing.
+_MEAN_PPL_Q_RE = re.compile(
+    r"Mean PPL\(Q\)\s*:\s*(-?\d+\.?\d*|-?nan|-?inf)\s*(?:\xb1|\+/-)", re.IGNORECASE
+)
+
+
+def _to_finite_float(raw: str) -> Optional[float]:
+    """Parse *raw* as a float, returning None for NaN/Inf (never a sentinel
+    that later arithmetic would silently propagate as "real" data)."""
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _tail(output: str, n: int = 20) -> str:
+    """Last *n* lines of *output*, for diagnostic logging."""
+    return "\n".join(output.splitlines()[-n:])
+
+
 def _parse_perplexity_output(output: str) -> Optional[float]:
     """Extract perplexity value from llama-perplexity output.
+
+    Accepts ONLY two forms (see module-level regexes above), scanned in
+    REVERSE so the last (most complete) occurrence wins:
+      1. "Final estimate: PPL = <float>"
+      2. The KL block's "Mean PPL(Q) : <float> +/- <err>"
+
+    Everything else that used to match here is GONE -- this is the fix for
+    a real incident (2026-07): a measured search recorded sensitivity
+    probes of 2.6-2.8 against a baseline of 34.8363, driving 8/9 group
+    sensitivities to exactly 0.0. Root cause: llama.cpp prints a PROGRESS
+    line "perplexity: 2.74 seconds per pass - ETA 4.5 minutes"
+    (tools/perplexity/perplexity.cpp:605) for every chunk, and only prints
+    "Final estimate: PPL = <x>" when nll2 > 0 (perplexity.cpp:646-657) -- a
+    NaN model skips that and instead prints
+    "Unexpected negative standard deviation of log(prob)", STILL EXITING 0.
+    The old second pattern (``[Pp]erplexity\\s*[:=]\\s*(\\d+\\.?\\d*)``) and
+    third ("any line containing PPL" + a float) both matched the progress
+    line, so the parser returned 2.74 (the seconds-per-pass number) instead
+    of None. Tell-tale in hindsight: bogus values had <=2 decimals (the
+    progress line's %.2f), real ones had 4 (%.4lf) -- but the real fix is to
+    never accept anything but the two named forms.
+
+    Also returns None -- a genuine measurement failure, not "line not
+    found" -- when the output contains either measurement-failure marker
+    (NaN-model stddev message, or a decode failure), even if some other
+    line happened to look parseable.
+
+    Foundry discards llama-perplexity's stdout/stderr on a "successful"
+    (exit 0) subprocess call, so a None here is otherwise undiagnosable
+    after the fact -- the last ~20 lines of output are logged at WARNING
+    whenever this returns None.
 
     Args:
         output: Combined stdout+stderr from llama-perplexity (the
             "Final estimate: PPL =" line is emitted on stderr).
 
     Returns:
-        The parsed perplexity float, or None if not found.
+        The parsed perplexity float, or None if no real measurement is
+        present (not found, or found but NaN/Inf, or an explicit failure
+        marker is present).
     """
+    if _NEGATIVE_STDDEV_MARKER in output or _FAILED_DECODE_MARKER in output:
+        _log.warning(
+            "llama-perplexity output contains a measurement-failure marker "
+            "(NaN model / decode failure) -- refusing to parse a PPL from "
+            "it. Last %d lines of output:\n%s",
+            20, _tail(output),
+        )
+        return None
+
     for line in reversed(output.split("\n")):
-        # llama.cpp "Final estimate: PPL = 5.2345 +/- 0.0123"
-        m = re.search(r"Final estimate.*?PPL\s*=\s*(\d+\.?\d*)", line)
+        m = _FINAL_ESTIMATE_RE.search(line)
         if m:
-            return float(m.group(1))
-        # Alternative: "perplexity = 5.2345"
-        m = re.search(r"[Pp]erplexity\s*[:=]\s*(\d+\.?\d*)", line)
+            value = _to_finite_float(m.group(1))
+            if value is None:
+                _log.warning(
+                    "llama-perplexity printed a non-finite 'Final estimate' "
+                    "PPL (%r) -- treating as a measurement failure. Last %d "
+                    "lines of output:\n%s",
+                    m.group(1), 20, _tail(output),
+                )
+            return value
+        m = _MEAN_PPL_Q_RE.search(line)
         if m:
-            return float(m.group(1))
-        # Last resort: any line containing "PPL" with a float
-        if "PPL" in line:
-            m = re.search(r"(\d+\.\d+)", line)
-            if m:
-                return float(m.group(1))
+            value = _to_finite_float(m.group(1))
+            if value is None:
+                _log.warning(
+                    "llama-perplexity printed a non-finite 'Mean PPL(Q)' "
+                    "(%r) -- treating as a measurement failure. Last %d "
+                    "lines of output:\n%s",
+                    m.group(1), 20, _tail(output),
+                )
+            return value
+
+    _log.warning(
+        "no 'Final estimate: PPL =' or 'Mean PPL(Q)' line found in "
+        "llama-perplexity output -- returning None instead of guessing. "
+        "Last %d lines of output:\n%s",
+        20, _tail(output),
+    )
     return None
 
 
@@ -694,10 +845,21 @@ def _parse_kl_output(output: str) -> Optional[dict]:
     """
     result: dict = {}
 
-    m = re.search(r"Mean\s+KLD:\s*(-?\d+\.?\d*)", output)
+    # llama.cpp prints "Mean    KLD:   0.154163 ±   0.001946". Capturing the
+    # error term is what makes KL usable as a PROBE signal rather than just a
+    # report: it is computed over every evaluated token (~50k at 100 chunks)
+    # instead of over 100 chunk means, which is why one real probe resolved
+    # at 79 sigma by KL against 0.55 sigma for the same probe judged by
+    # perplexity. Optional in the pattern -- older builds print a bare mean.
+    m = re.search(
+        r"Mean\s+KLD:\s*(-?\d+\.?\d*)(?:\s*(?:\xb1|\+/-)\s*(\d+\.?\d*))?",
+        output,
+    )
     if not m:
         return None
     result["mean_kl"] = float(m.group(1))
+    if m.group(2) is not None:
+        result["mean_kl_err"] = float(m.group(2))
 
     m = re.search(r"Maximum\s+KLD:\s*(-?\d+\.?\d*)", output)
     if m:

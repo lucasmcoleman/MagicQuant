@@ -105,3 +105,53 @@ def test_writer_logs_one_summary_line_on_fallback(tmp_path, monkeypatch, caplog)
     assert len(fallback_records) == 1, caplog.text
     assert "blk.0.ffn_down_exps.weight" in fallback_records[0].getMessage()
     assert "Q3_K->MXFP4" in fallback_records[0].getMessage()
+
+
+def test_writer_summary_groups_by_reason_not_hardcoded_block_size(tmp_path, monkeypatch, caplog):
+    """MINOR regression: the summary log used to hardcode "due to
+    block-size" while iterating self._fallbacks, which now also carries
+    reason=bf16-f16-out-of-range (and f32-required-operand) -- misattributing
+    those live. A run with BOTH a block-size fallback and a BF16->F16
+    out-of-range fallback must produce two separately-attributed summary
+    lines, neither blaming the wrong reason."""
+    from tests.test_bf16_downgrade_guard import _f32_tensor
+
+    # A BF16-designated tensor with one out-of-F16-range value -> substituted
+    # with Q8_0, reason="bf16-f16-out-of-range".
+    bf16_values = [1.0] * 255 + [1.0e10]
+    src = StubSource([
+        _f32_tensor("token_embd.weight", (1, 256), bf16_values),
+        _expert("blk.0.ffn_down_exps.weight", 4, 256, 128),  # block-size fallback
+        _f32_tensor("blk.0.attn_q.weight", (256, 256)),
+        _f32_tensor("output.weight", (256, 256)),
+    ])
+    monkeypatch.setattr(source_mod, "open_model_source", lambda *a, **k: src)
+
+    writer = GGUFWriter(str(tmp_path / "h.gguf"))
+    with caplog.at_level("WARNING", logger="magicquant.gguf.writer"):
+        writer.create_hybrid_gguf(
+            "ignored",
+            {"base": "Q4_K_M", "groups": {"E": "BF16", "X": "Q3_K"}},
+            verbose=False,
+        )
+
+    reasons_present = {f["reason"] for f in writer._fallbacks}
+    assert "bf16-f16-out-of-range" in reasons_present
+    assert "block-size" in reasons_present
+
+    fallback_records = [
+        r for r in caplog.records
+        if "fell back from their requested quant" in r.getMessage()
+    ]
+    # One summary line per distinct reason, not one line total blaming
+    # everything on "block-size".
+    assert len(fallback_records) == 2, caplog.text
+    messages = " | ".join(r.getMessage() for r in fallback_records)
+    assert "due to block-size" in messages
+    assert "due to bf16-f16-out-of-range" in messages
+    # The bf16-out-of-range line must not itself claim "block-size".
+    bf16_line = next(
+        r.getMessage() for r in fallback_records if "token_embd" in r.getMessage()
+    )
+    assert "due to bf16-f16-out-of-range" in bf16_line
+    assert "due to block-size" not in bf16_line

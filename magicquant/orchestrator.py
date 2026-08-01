@@ -24,6 +24,7 @@ from magicquant.evolution.probing import SensitivityProber
 from magicquant.gguf.tensor_groups import TensorGroupClassifier
 from magicquant.utils.naming import generate_name
 from magicquant.utils.llamacpp import LlamaCppTools, get_llamacpp_quant_type
+from magicquant.utils.measurement import measurement_eps
 from magicquant.logging import get_logger
 from magicquant.quant.schemes import get_scheme_by_name
 
@@ -55,6 +56,10 @@ class MagicQuantOrchestrator:
 
         self._llamacpp_path = llamacpp_path
         self._llama_tools: Optional[LlamaCppTools] = None
+        # Last successfully-resolved corpus path (see _safe_resolve_corpus)
+        # -- kept so a pin-violation RuntimeError there can report this
+        # instead of silently going to None.
+        self._last_resolved_corpus: Optional[str] = None
 
         self.baseline_ppl: Optional[float] = None
         # How baseline_ppl was obtained: "measured" (real llama-perplexity),
@@ -71,6 +76,17 @@ class MagicQuantOrchestrator:
         # from SensitivityProber.probing_provenance right after probing;
         # stamped into search_results.json alongside baseline_provenance.
         self.probing_provenance: str = "unknown"
+        # True once SensitivityProber.get_normalized_weights() had to fall
+        # back to uniform weights for this run's probing (total sensitivity
+        # <= 0 across every group) -- copied from
+        # SensitivityProber.weights_degenerate right after probing. See
+        # _enforce_probing_signal_gate.
+        self.weights_degenerate: bool = False
+        # Set by probing: fraction of the model (by parameter mass) whose
+        # sensitivity was resolved above the measurement's own noise, and the
+        # per-group resolution states behind it.
+        self.resolved_mass_fraction: float = 0.0
+        self.probe_resolutions: Dict[str, str] = {}
         self.predictor: Optional[PredictiveScorer] = None
 
         # Track all measured configs across rounds
@@ -110,14 +126,25 @@ class MagicQuantOrchestrator:
         # a candidate actually has a "kl" measurement recorded.
         self._kl_weight: float = 0.0
         # When True, _select_final_survivors re-ranks WITHIN a tier's
-        # near-tied candidates (measured_loss within self._speed_epsilon
-        # relative of the tier's best) by measured tg throughput instead of
-        # taking the flat quality-best. Off by default -- today's plain
-        # KL-blended measured_loss selection, unchanged. See
-        # run_measured_search's speed_aware/speed_epsilon params and
-        # _speed_aware_pick.
-        self._speed_aware: bool = False
-        self._speed_epsilon: float = 0.005
+        # near-tied candidates (raw measured_loss within self._speed_epsilon
+        # relative of the tier's best) by size_gb (default "bytes" metric) or
+        # measured tg throughput ("bench"), instead of a bare argmin over the
+        # KL-blended score. ON by default since the 2026-07 fix (see
+        # run_measured_search's speed_aware/speed_epsilon params): a real
+        # ThinkingCap run shipped a "Q5" winner that was BOTH larger and had
+        # HIGHER raw PPL than a candidate it beat, purely because the KL
+        # tiebreak tipped a near-noise-level PPL difference -- selection was
+        # size-blind. Set speed_aware=False to restore the pre-fix bare
+        # argmin-over-KL-blended-score behavior. See _speed_aware_pick.
+        self._speed_aware: bool = True
+        # None resolves lazily in _select_final_survivors to
+        # magicquant.utils.measurement.measurement_eps(self.baseline_ppl, ...)
+        # -- the same measurement-noise tolerance used elsewhere (
+        # DEFAULT_RELATIVE_EPS=0.05, REPORTED_ERR_SIGMAS=3), rather than an
+        # invented flat 0.5% that turned out to be too tight to absorb real
+        # measurement noise (see run_measured_search's speed_epsilon
+        # docstring for the ThinkingCap numbers that motivated this).
+        self._speed_epsilon: Optional[float] = None
 
     def _apply_seed(self, seed: Optional[int]) -> None:
         """Seed the RNGs once for a reproducible search.
@@ -139,6 +166,61 @@ class MagicQuantOrchestrator:
             _np.random.seed(seed & 0xFFFFFFFF)
         except Exception:
             pass
+
+    _ALLOW_DEGENERATE_PROBING_ENV = "MAGICQUANT_ALLOW_DEGENERATE_PROBING"
+
+    def _enforce_probing_signal_gate(self) -> None:
+        """MAJOR 4: refuse to proceed on a search whose sensitivity probing
+        came back with no reliable signal.
+
+        Before this fix, ``probing_provenance == "suspect"`` (more than
+        half the probed groups' MEASURED probes were physically-impossible
+        clamped readings -- see ``probing.py``'s ``probe_all_groups``) and
+        ``weights_degenerate`` (every sensitivity was <=0, so the search
+        fell back to uniform 1/N weights -- see ``get_normalized_weights``)
+        were WRITE-ONLY: stamped into ``sensitivity.json``/
+        ``search_results.json`` for a human to notice later, but nothing
+        actually gated on them. A search positively identified as
+        signal-less still completed and shipped tiers exactly like a
+        healthy measured run.
+
+        Raises loudly by default. Set
+        ``MAGICQUANT_ALLOW_DEGENERATE_PROBING=1`` to proceed anyway (e.g. a
+        deliberate re-run against a known-flat/tiny model where a uniform
+        weighting is expected, not a symptom of a broken measurement).
+        """
+        degenerate = (
+            self.probing_provenance in ("suspect", "insufficient")
+            or self.weights_degenerate
+        )
+        if not degenerate:
+            return
+
+        if os.environ.get(self._ALLOW_DEGENERATE_PROBING_ENV) == "1":
+            log.warning(
+                "Sensitivity probing produced no reliable signal but "
+                f"{self._ALLOW_DEGENERATE_PROBING_ENV}=1 is set -- "
+                "proceeding anyway. This search's tiers rank candidates on "
+                "uniform/noise-floor weights, not real per-group "
+                "sensitivity -- disclose this before shipping.",
+                stage="probing",
+                probing_provenance=self.probing_provenance,
+                weights_degenerate=self.weights_degenerate,
+            )
+            return
+
+        raise RuntimeError(
+            "Sensitivity probing produced no reliable signal for this "
+            f"search (probing_provenance={self.probing_provenance!r}, "
+            f"weights_degenerate={self.weights_degenerate}): more than half "
+            "the probed groups' measured probes were physically-impossible "
+            "clamped readings, or every group's sensitivity was <=0. "
+            "Proceeding would rank the evolutionary search's candidates on "
+            "uniform/noise-floor weights while still shipping tiers as if "
+            "this were a healthy measured search. Check the llama.cpp "
+            "build, corpus, and baseline measurement, or set "
+            f"{self._ALLOW_DEGENERATE_PROBING_ENV}=1 to proceed anyway."
+        )
 
     # Default precision:size ratio score_hybrid's own weights carry
     # (0.50:0.35) -- _build_objective_weights preserves this ratio while
@@ -253,8 +335,8 @@ class MagicQuantOrchestrator:
         enable_kl: bool = False,
         kl_weight: float = 0.1,
         enable_speed_bench: bool = False,
-        speed_aware: bool = False,
-        speed_epsilon: float = 0.005,
+        speed_aware: bool = True,
+        speed_epsilon: Optional[float] = None,
         speed_metric: str = "bytes",
         measurement_chunks: Optional[int] = None,
         seed_incumbents: bool = True,
@@ -301,19 +383,67 @@ class MagicQuantOrchestrator:
                 precision is a bandwidth tax the PPL objective never sees).
                 A bias, not a hard exclusion. Off by default (unchanged
                 sampling for every group, including H).
-            speed_aware: within each tier, when candidates carry bench data
-                (see ``enable_speed_bench``), prefer the candidate with the
-                best measured tg throughput among those whose measured_loss
-                is within ``speed_epsilon`` relative of the tier's best
-                instead of the flat quality-best (see
-                ``_select_final_survivors`` / ``_speed_aware_pick``). Pure
+            speed_aware: within each tier, stop taking a bare argmin over the
+                KL-blended selection score. Instead, find the tier's best
+                RAW ``measured_loss`` (a Pareto/knee rule over
+                (measured_loss, size_gb), not the KL-blended score -- KL can
+                still legitimately separate two candidates whose PPL is
+                genuinely different, but it must not be the thing that
+                decides a near-noise-level PPL tie), band every candidate
+                within ``speed_epsilon`` relative of that best, and among
+                the band prefer the smallest ``size_gb`` (default
+                ``speed_metric="bytes"``) or, when candidates carry bench
+                data (``enable_speed_bench``), the best measured tg
+                throughput (``speed_metric="bench"``) -- see
+                ``_select_final_survivors`` / ``_speed_aware_pick``. Pure
                 post-hoc re-ranking of already-recorded measurements -- no
-                extra GPU calls. Off by default, and a no-op even when True
-                if no candidate in a tier has bench data (falls back to
-                today's plain measured_loss/KL-blended selection).
-            speed_epsilon: relative measured_loss tolerance (default 0.005 =
-                0.5%) defining "near-tied" for ``speed_aware``. Only
-                meaningful when ``speed_aware=True``.
+                extra GPU calls.
+                ON by default since the 2026-07 fix: a real ThinkingCap run
+                shipped a "Q5" tier winner that was BOTH larger (20.89 GB vs
+                17.68 GB) AND had HIGHER raw PPL (6.827036 vs 6.826419) than
+                a candidate in the same tier -- it won purely because the KL
+                tiebreak (kl_weight * |mean_kl|) tipped a PPL difference
+                (~0.009%) that was two orders of magnitude below the run's
+                own reported measurement error (+/- ~1.6%). Selection was
+                size-blind and let noise-level KL swings override a real,
+                smaller, better-PPL candidate. Pass ``speed_aware=False`` to
+                restore the pre-fix bare argmin-over-KL-blended-score
+                behavior.
+            speed_epsilon: relative tolerance (applied as
+                ``epsilon * abs(best_raw_measured_loss)``) defining
+                "near-tied" for ``speed_aware``. ``None`` (the default)
+                resolves lazily, per tier, once each tier's quality-winner
+                is known, to
+                ``magicquant.utils.measurement.measurement_eps(baseline_ppl,
+                reported_err)`` -- the SAME measurement-noise tolerance used
+                by the "is this PPL reading physically plausible" guard
+                elsewhere in this module (``DEFAULT_RELATIVE_EPS=0.05``,
+                ``REPORTED_ERR_SIGMAS=3``), rather than a second, invented
+                tolerance. ``reported_err`` is that tier's quality-winner's
+                own fused-KL-pass ``ppl_err`` when one was measured (same
+                threading as the per-candidate ``measurement_invalid``
+                check's ``kl_result.get("ppl_err")``), so the 3-sigma path
+                actually gets exercised on real runs instead of always
+                falling back to the flat default; it falls back to
+                ``DEFAULT_RELATIVE_EPS`` when no such measurement is
+                reachable (e.g. ``enable_kl=False``). The historical flat
+                0.005 (0.5%) was too tight to absorb real measurement noise
+                -- see the ThinkingCap numbers above, where the "near tied"
+                PPL gap was itself only ~0.009% but still fell entirely
+                within normal run-to-run jitter. Only meaningful when
+                ``speed_aware=True``; pass an explicit float to pin a fixed
+                tolerance instead of the noise-derived default.
+                IMPORTANT: widening this epsilon is NOT what fixes the
+                ThinkingCap bug above -- that candidate pair's raw PPL gap
+                (~0.0091% of baseline in measured_loss units) sits
+                well inside even the old, tighter 0.005
+                (0.5%) band, so any reasonable epsilon puts them "near
+                tied". What actually fixes it is banding on RAW
+                ``measured_loss`` (this function's ``score_of`` param, see
+                ``_speed_aware_pick``) instead of the KL-blended
+                ``_selection_score`` -- the old bug was that KL, not PPL,
+                decided the tier winner. Do not "tune" this epsilon
+                expecting it to change tier-winner selection by itself.
             measurement_chunks: cap every perplexity/KL pass in this run to
                 this many ctx_size-token chunks instead of the whole corpus
                 (overrides LlamaCppTools' own MAGICQUANT_PPL_CHUNKS env
@@ -420,8 +550,25 @@ class MagicQuantOrchestrator:
         if checkpoint is not None:
             self.baseline_ppl = checkpoint["baseline_ppl"]
             self.baseline_provenance = checkpoint["baseline_provenance"]
-            for key, entry in checkpoint.get("measured", {}).items():
-                self._measured[key] = dict(entry)
+            # Pre-v2 checkpoints predate the measurement-validity flag AND
+            # the strict perplexity parser, so their per-candidate readings may
+            # contain fabricated values (a parsed progress-line timing) with no
+            # way to tell them apart -- info.get("measurement_invalid") is
+            # simply absent, reads falsy, and such an entry can win a tier. The
+            # BASELINE is kept (it is a single expensive measurement and is
+            # re-validated by the source-identity + conditions match above);
+            # only the candidate measurements are discarded.
+            ck_version = checkpoint.get("version", 1)
+            if ck_version >= 2:
+                for key, entry in checkpoint.get("measured", {}).items():
+                    self._measured[key] = dict(entry)
+            elif checkpoint.get("measured"):
+                log.warning(
+                    "Discarding pre-v2 checkpoint measurements (no validity "
+                    "flag; may predate the strict PPL parser) -- baseline kept",
+                    stage="resume", version=ck_version,
+                    discarded=len(checkpoint.get("measured", {})),
+                )
             baseline_needs_standalone_measurement = False
             if verbose:
                 log.info(
@@ -543,13 +690,28 @@ class MagicQuantOrchestrator:
             groups.extend(["X", "R"])
         if any(classifier.classify_tensor(t) == "S" for t in tensor_names):
             groups.append("S")
+        # This loop drove classify_tensor() one name at a time (not
+        # classify_tensors(), which fires the summary automatically) across
+        # the full model's tensor_names -- surface the unclassified-tensor
+        # summary now that the pass is complete. See
+        # TensorGroupClassifier.warn_unclassified_once()'s docstring.
+        classifier.warn_unclassified_once()
         # Remember the full detected group set so run_evolution actually
         # varies X/R/S (otherwise it falls back to DEFAULT_GROUPS).
         self._search_groups = groups
 
-        if checkpoint is not None:
+        # A checkpoint can legitimately carry a baseline but NO sensitivities:
+        # a run killed between the baseline measurement and probing, or a
+        # deliberately injected baseline (measuring an oversized source once,
+        # out-of-band, so the search itself never has to load it). Restoring a
+        # null unconditionally used to skip probing and then crash in the
+        # predictor with `'NoneType' object has no attribute 'get'`, which
+        # reads as a corrupt checkpoint rather than a missing-probe state.
+        # Treat absent/empty weights as "not restored" and probe normally.
+        if checkpoint is not None and checkpoint.get("sensitivity_weights"):
             self.sensitivity_weights = checkpoint["sensitivity_weights"]
             self.probing_provenance = checkpoint["probing_provenance"]
+            self.weights_degenerate = checkpoint.get("weights_degenerate", False)
             if verbose:
                 log.info(
                     "Resumed sensitivity weights from checkpoint", stage="resume",
@@ -558,15 +720,43 @@ class MagicQuantOrchestrator:
             if verbose:
                 log.info("Sensitivity probing", stage="probing")
 
+            # Populate self._param_counts before probing so the prober can
+            # judge its coverage by parameter MASS rather than group count --
+            # three of nine groups resolving meant 1.6% of the model on
+            # Laguna-S. (Header-only read; Step 3 calls this again for size.)
+            self._estimate_model_size(self.source_model_path)
+
             prober = SensitivityProber(
                 base_model_path=self.source_model_path,
                 baseline_perplexity=self.baseline_ppl,
                 perplexity_calculator=self.llama_tools,
                 output_dir=str(self.output_dir / "_probes"),
+                parameter_counts=self._param_counts,
+                # When this run saved reference logits (enable_kl), score
+                # probes by KL divergence instead of perplexity. Perplexity's
+                # error is the spread over chunk means and cannot separate a
+                # single-group probe's effect from zero; KL's is per token.
+                # Measured on one real probe: 79 sigma vs 0.55 sigma.
+                kl_base_logits_path=self._kl_base_logits_path,
+                kl_corpus_path=self._kl_corpus_path,
+                # A MEASURED search must never silently rank candidates on
+                # fabricated (heuristic) sensitivities: a failed probe now
+                # raises ProbeMeasurementError after a retry instead of
+                # poisoning the whole run. run_full_search (prediction-only)
+                # keeps the heuristic fallback — there it's the documented
+                # design, not a degradation. See probing.ProbeMeasurementError.
+                strict=True,
             )
             prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
             self.sensitivity_weights = prober.get_normalized_weights()
             self.probing_provenance = prober.probing_provenance
+            self.weights_degenerate = prober.weights_degenerate
+            # Fraction of the model, by parameter mass, whose sensitivity the
+            # probes actually resolved. Surfaced so a reader of
+            # search_results.json can tell a search steered by real signal
+            # from one steered by rounding.
+            self.resolved_mass_fraction = prober.resolved_mass_fraction
+            self.probe_resolutions = dict(prober.resolutions)
             prober.save_results(str(self.output_dir / "sensitivity.json"))
 
             if verbose:
@@ -575,6 +765,11 @@ class MagicQuantOrchestrator:
                     stage="probing",
                     weights={g: round(w, 3) for g, w in self.sensitivity_weights.items()},
                 )
+
+        # MAJOR 4: a search whose probing came back with no reliable signal
+        # (suspect provenance / degenerate uniform weights) must not
+        # silently proceed and ship tiers as if it were healthy.
+        self._enforce_probing_signal_gate()
 
         # Baseline + probing are complete (whether resumed or freshly
         # measured) -- checkpoint now so a kill during Step 4 can resume
@@ -804,13 +999,56 @@ class MagicQuantOrchestrator:
                             )
                             kl_result = None
 
+                    # Track which corpus THIS measurement actually used --
+                    # recorded per-entry below (fix for CORPUS PROVENANCE:
+                    # search_results.json used to stamp one corpus value at
+                    # save time, which can't catch a corpus that changed
+                    # mid-run). The KL path already threads self._kl_corpus_
+                    # path through explicitly; the plain path re-resolves via
+                    # LlamaCppTools, which now pins its own auto-resolution
+                    # and raises if a later call would disagree -- so this is
+                    # cheap (no new subprocess) and guaranteed consistent
+                    # with what calculate_perplexity itself just measured
+                    # over.
                     if kl_result is not None and kl_result.get("ppl") is not None:
                         ppl = kl_result["ppl"]
+                        measurement_corpus = self._kl_corpus_path
                     else:
                         ppl = self.llama_tools.calculate_perplexity(path, verbose=verbose)
+                        measurement_corpus = self.llama_tools._resolve_data_file(None)
 
                     if ppl is not None:
                         measured_loss = (ppl - self.baseline_ppl) / self.baseline_ppl
+
+                        # A quantized candidate cannot genuinely beat the
+                        # baseline it's a lossy compression OF -- a
+                        # measured_loss below -eps is a failed/noise-floor
+                        # measurement, not a quality win. Unguarded, this fed
+                        # straight into _select_final_survivors' min()
+                        # selection; the incident that motivated this fix saw
+                        # a NaN-driven "measured_loss=-0.9225" WIN a tier.
+                        # eps is sized off this candidate's own reported KL
+                        # ppl_err when available, else the same shared default
+                        # probing.py's clamp uses (magicquant.utils
+                        # .measurement.measurement_eps).
+                        eps = measurement_eps(
+                            self.baseline_ppl,
+                            kl_result.get("ppl_err") if kl_result else None,
+                        )
+                        measurement_invalid = measured_loss < -eps
+                        if measurement_invalid:
+                            log.warning(
+                                "Candidate measurement is physically "
+                                "impossible (measured_loss below -eps) -- "
+                                "flagging invalid instead of letting it win "
+                                "a tier",
+                                stage="measurement",
+                                measured_loss=round(measured_loss, 4),
+                                eps=round(eps, 4),
+                                ppl=round(ppl, 4),
+                                baseline_ppl=round(self.baseline_ppl, 4),
+                            )
+
                         predicted_loss = self.predictor.predict_loss(config)
                         residual = measured_loss - predicted_loss
 
@@ -824,6 +1062,8 @@ class MagicQuantOrchestrator:
                             "residual": residual,
                             "path": path,
                             "size_gb": candidate_path.stat().st_size / (1024 ** 3),
+                            "corpus_path": measurement_corpus,
+                            "measurement_invalid": measurement_invalid,
                         }
                         if config_key in incumbent_tier_by_key:
                             self._measured[config_key]["incumbent"] = (
@@ -850,8 +1090,14 @@ class MagicQuantOrchestrator:
                                     "without it", stage="bench", error=str(exc),
                                 )
 
-                        # Active learning: feed residual back
-                        self.predictor.record_residual(config, residual)
+                        # Active learning: feed residual back -- but never
+                        # from an invalid measurement. A physically
+                        # impossible ppl reading would poison the predictor
+                        # with a bogus residual that then biases every LATER
+                        # candidate's predicted_loss in this search, not just
+                        # this one candidate's own record.
+                        if not measurement_invalid:
+                            self.predictor.record_residual(config, residual)
 
                         if verbose:
                             log.info(
@@ -908,21 +1154,31 @@ class MagicQuantOrchestrator:
                     mean_abs_residual=round(avg_residual, 4),
                 )
 
-        # A measured search whose every candidate build/measure failed must
-        # not report success: self._measured stays empty, _select_final_
-        # survivors would return {}, and _save_results would still write a
-        # valid-looking search_results.json with zero measurements -- an
-        # overnight run that silently accomplished nothing. Fail loudly
-        # instead of falling through to Step 5.
-        if measurement_rounds > 0 and not self._measured:
+        # A measured search whose every candidate build/measure failed --
+        # OR whose every candidate measurement came back physically
+        # impossible (measurement_invalid, see the measurement loop above)
+        # -- must not report success: _select_final_survivors excludes
+        # invalid entries from tier competition, so counting emptiness of
+        # self._measured itself misses the case where self._measured is
+        # non-empty but every single entry is invalid (retained there
+        # deliberately, for diagnostics). That let a run "successfully"
+        # complete with zero tiers instead of failing loudly. Count VALID
+        # measurements, matching the existing guard's style.
+        n_valid = sum(
+            1 for info in self._measured.values()
+            if not info.get("measurement_invalid")
+        )
+        if measurement_rounds > 0 and n_valid == 0:
             raise RuntimeError(
                 "Measured search completed all "
-                f"{measurement_rounds} round(s) but produced zero successful "
-                "measurements (every candidate build or perplexity "
-                "measurement failed). Refusing to write search_results.json "
+                f"{measurement_rounds} round(s) but produced zero VALID "
+                "measurements (every candidate build/perplexity measurement "
+                "either failed outright, or came back physically impossible "
+                "-- measured_loss below -eps -- and was flagged "
+                "measurement_invalid). Refusing to write search_results.json "
                 "as if this were a normal partial run -- check the "
-                "llama.cpp build, disk space, and per-candidate build errors "
-                "logged above."
+                "llama.cpp build, disk space, corpus, and per-candidate "
+                "build errors logged above."
             )
 
         # ── Step 5: Select final survivors per tier ──
@@ -1085,9 +1341,14 @@ class MagicQuantOrchestrator:
         candidates: List[Dict], quality_best: Dict, epsilon: float, score_of,
         speed_metric: str = "bytes",
     ) -> Dict:
-        """Within a tier, among candidates whose *selection score* is within
-        ``epsilon`` relative of the tier's best, pick the fastest -- otherwise
+        """Within a tier, among candidates whose *raw measured_loss* is within
+        ``epsilon`` relative of the tier's best, pick the smallest -- otherwise
         leave ``quality_best`` (the flat score winner) untouched.
+
+        NOTE the ranking key is raw ``measured_loss``, NOT the KL-blended
+        ``_selection_score``. That distinction IS the 2026-07 fix: banding on
+        the blended score let a noise-level KL swing hand a tier to a larger,
+        worse-PPL candidate. See ``speed_epsilon`` in ``run_measured_search``.
 
         ``speed_metric`` chooses how "fastest" is measured:
           - ``"bytes"`` (default): smallest ``size_gb``. tg is memory-
@@ -1104,12 +1365,38 @@ class MagicQuantOrchestrator:
             candidate carries bench data this is a no-op and ``quality_best``
             is returned unchanged.
 
-        ``score_of`` is the KL-guarded scoring callable
-        ``_select_final_survivors`` ranks by, NOT raw measured_loss: the band
-        inherits the "a KL-failed candidate can't beat one that measured real
-        KL" guard, and additionally, when the quality winner is KL-confirmed,
-        only KL-confirmed candidates may win the speed tiebreak (an
-        unconfirmed candidate's real quality could be terrible).
+        ``score_of`` is the metric the epsilon band is computed over.
+        ``_select_final_survivors`` passes raw ``measured_loss`` (NOT the
+        KL-blended ``_selection_score``) -- the Pareto/knee rule is over
+        (measured_loss, size_gb) per the 2026-07 fix: KL must not be able to
+        smuggle a genuinely-worse-PPL, larger candidate past a real PPL
+        advantage just because the KL term swung the blended score (this is
+        exactly what happened on the real ThinkingCap run that motivated
+        this fix -- see ``run_measured_search``'s ``speed_aware`` docstring).
+        KL still matters -- it decided which candidate is ``quality_best``
+        (used as the fallback return and to gate KL-failed candidates below)
+        -- but no longer overrides a raw quality/size Pareto tradeoff within
+        the noise band.
+        The in-band filter separately guards on KL *presence*, independent
+        of ``score_of``: a candidate whose KL measurement failed (no "kl"
+        key) can never beat one that measured real KL when the quality
+        winner itself is KL-confirmed -- otherwise a measurement failure
+        gets rewarded over real (if poor) data.
+
+        DELIBERATE DEMOTION -- KL's ``mean_kl`` VALUE plays no role in
+        picking the in-band winner below (only its *presence*, via the
+        gate above): the final ``min(..., key=size_gb)`` /
+        ``max(..., key=tg_ts)`` picks purely on size/speed among in-band
+        candidates, even when two in-band candidates have very different
+        ``mean_kl``. This is intentional, not an oversight -- reinstating
+        KL as a value-based tiebreak here would reopen exactly the
+        ThinkingCap failure mode this function exists to close (a KL swing
+        deciding the tier winner instead of raw quality/size), just scoped
+        to a narrower slice of candidates. If a future run shows KL-value
+        blindness within the band causing a real regression (analogous to
+        the ThinkingCap PPL/size one), prefer adding a documented, narrowly-
+        scoped exception here over quietly blending KL back into the
+        ranking key.
         """
         best_has_kl = bool(
             quality_best.get("kl") and quality_best["kl"].get("mean_kl") is not None
@@ -1135,14 +1422,29 @@ class MagicQuantOrchestrator:
         return min(contenders, key=lambda c: c["size_gb"])
 
     def _select_final_survivors(self, baseline_gb: float) -> Dict[str, Dict]:
-        """From all measured configs, pick the best per tier."""
+        """From all measured configs, pick the best per tier.
+
+        Candidates flagged ``measurement_invalid`` (measured_loss below
+        -eps -- a physically impossible reading, see the measurement loop in
+        ``run_measured_search``) are excluded from tier competition here but
+        left in ``self._measured`` / search_results.json for diagnostics --
+        "drop from selection, don't erase the record".
+        """
         by_tier: Dict[str, List[Dict]] = defaultdict(list)
         for info in self._measured.values():
+            if info.get("measurement_invalid"):
+                continue
             tier = self._classify_tier(info["size_gb"], baseline_gb)
             by_tier[tier].append(info)
 
+        # Conservative getattr fallback (False/None) for instances built via
+        # bare __new__ that predate this feature entirely -- a normally
+        # constructed orchestrator always has these attributes set (True /
+        # None by __init__, then possibly overridden by run_measured_search's
+        # own speed_aware/speed_epsilon params), so real callers get the new
+        # default; only pre-feature/stripped-down test doubles fall back here.
         speed_aware = getattr(self, "_speed_aware", False)
-        speed_epsilon = getattr(self, "_speed_epsilon", 0.005)
+        speed_epsilon_override = getattr(self, "_speed_epsilon", None)
         speed_metric = getattr(self, "_speed_metric", "bytes")
 
         result = {}
@@ -1171,8 +1473,35 @@ class MagicQuantOrchestrator:
 
                 best = min(candidates, key=_score)
                 if speed_aware:
+                    if speed_epsilon_override is not None:
+                        speed_epsilon = speed_epsilon_override
+                    else:
+                        # Reuse the same measurement-noise tolerance the "is
+                        # this PPL physically plausible" guard uses (see
+                        # run_measured_search's speed_epsilon docstring),
+                        # AND actually exercise its 3-sigma path: thread the
+                        # tier-quality-winner's own reported KL ppl_err
+                        # through when a fused KL pass measured one, exactly
+                        # like the per-candidate measurement_invalid check
+                        # above does with kl_result.get("ppl_err"). Without
+                        # this, measurement_eps always fell back to its flat
+                        # DEFAULT_RELATIVE_EPS regardless of how precise this
+                        # run's own measurements actually were. NOTE: this
+                        # epsilon width is NOT what fixes the ThinkingCap
+                        # bug -- that fix is banding on raw measured_loss
+                        # (score_of below / _speed_aware_pick's docstring)
+                        # instead of the KL-blended score. A future reader
+                        # should not "tune" this epsilon expecting it to
+                        # change tier-winner selection by itself.
+                        reported_err = (
+                            best["kl"].get("ppl_err")
+                            if best.get("kl") else None
+                        )
+                        baseline_ppl = getattr(self, "baseline_ppl", None) or 0.0
+                        speed_epsilon = measurement_eps(baseline_ppl, reported_err)
                     best = self._speed_aware_pick(
-                        candidates, best, speed_epsilon, _score, speed_metric
+                        candidates, best, speed_epsilon,
+                        lambda info: info["measured_loss"], speed_metric,
                     )
                 result[tier] = best
         return result
@@ -1197,6 +1526,7 @@ class MagicQuantOrchestrator:
         imatrix = getattr(self, "_imatrix", None)
 
         probing_provenance = None
+        weights_degenerate = None
         output_dir = getattr(self, "output_dir", None)
         if output_dir is not None:
             try:
@@ -1204,8 +1534,12 @@ class MagicQuantOrchestrator:
                 if sensitivity_path.is_file():
                     sensitivity_data = json.loads(sensitivity_path.read_text())
                     probing_provenance = sensitivity_data.get("probing_provenance")
+                    # Absent on sensitivity.json written before this field
+                    # existed -- None rather than a misleading False.
+                    weights_degenerate = sensitivity_data.get("weights_degenerate")
             except Exception:
                 probing_provenance = None
+                weights_degenerate = None
 
         return {
             "chunks": getattr(llama, "ppl_chunks", None),
@@ -1216,6 +1550,11 @@ class MagicQuantOrchestrator:
             "kl_enabled": bool(getattr(self, "_kl_base_logits_path", None)),
             "kl_weight": getattr(self, "_kl_weight", 0.0),
             "probing_provenance": probing_provenance,
+            # True when SensitivityProber.get_normalized_weights() had to
+            # fall back to uniform weights (total sensitivity == 0) -- see
+            # probing.py's weights_degenerate. None when unknown (no
+            # sensitivity.json / prediction-only run).
+            "weights_degenerate": weights_degenerate,
         }
 
     def _save_results(self, all_configs, tiered):
@@ -1228,7 +1567,17 @@ class MagicQuantOrchestrator:
         ``load_hybrid_config``, Foundry's rocmfpx MQ-hybrid mode) only require
         ``tiered[tier]["config"]``, which both paths provide.
         """
+        from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION
+
         results = {
+            # Which TIER_BOUNDARIES set classified the tier labels below.
+            # Old files without this key predate the fix and must be read as
+            # LEGACY_TIER_SCHEME_VERSION -- see magicquant.quant.tiers'
+            # module docstring and tier_scheme_version() for the
+            # compatibility read path. This never causes old artifacts to
+            # fail to load: the per-tier config content is unaffected by the
+            # label's meaning, only its human-facing interpretation is.
+            "tier_scheme_version": CURRENT_TIER_SCHEME_VERSION,
             "baseline_ppl": self.baseline_ppl,
             "baseline_provenance": self.baseline_provenance,
             "probing_provenance": getattr(self, "probing_provenance", "unknown"),
@@ -1245,6 +1594,19 @@ class MagicQuantOrchestrator:
                     "kl": v.get("kl"),
                     "bench": v.get("bench"),
                     "incumbent": v.get("incumbent"),
+                    # Per-measurement corpus (fix for CORPUS PROVENANCE: the
+                    # top-level "measurement"/"corpus" field below is still
+                    # stamped once, kept for backward compat with older
+                    # readers, but each measurement now carries the corpus
+                    # it was ACTUALLY taken over, so a mid-run change would
+                    # be visible here even if the single summary field
+                    # wasn't updated).
+                    "corpus_path": v.get("corpus_path"),
+                    # True when this reading was physically impossible
+                    # (measured_loss below -eps) and excluded from
+                    # _select_final_survivors -- kept in the record for
+                    # diagnostics rather than silently dropped.
+                    "measurement_invalid": v.get("measurement_invalid", False),
                 }
                 for k, v in self._measured.items()
             },
@@ -1254,6 +1616,18 @@ class MagicQuantOrchestrator:
                     "ppl": info.get("ppl"),
                     "measured_loss": info.get("measured_loss"),
                     "size_gb": info.get("size_gb", info.get("predicted_size_gb")),
+                    # "incumbent" when this tier's winner IS one of
+                    # magicquant.incumbents' seeded llama.cpp-mixture
+                    # configs (info["incumbent"] holds the seed tier tag,
+                    # e.g. "Q4"), "evolved" when the search itself produced
+                    # the winner. Previously invisible -- across four real
+                    # models the Q4/Q5 tiers were repeatedly won by the
+                    # incumbent seed with the search contributing nothing,
+                    # and there was no field recording that fact. Only
+                    # populated by the measured-search path (run_full_search's
+                    # prediction-only tiers don't carry seed provenance, so
+                    # they always read "evolved" here).
+                    "source": "incumbent" if info.get("incumbent") else "evolved",
                 }
                 for tier, info in tiered.items()
             },
@@ -1264,6 +1638,7 @@ class MagicQuantOrchestrator:
                     "measured_loss": info.get("measured_loss"),
                     "predicted_loss": info.get("predicted_loss"),
                     "size_gb": info.get("size_gb", info.get("predicted_size_gb")),
+                    "source": "incumbent" if info.get("incumbent") else "evolved",
                 }
                 for tier, info in tiered.items()
             },
@@ -1355,7 +1730,14 @@ class MagicQuantOrchestrator:
                     source=results_path,
                 )
                 for info in self._measured.values()
+                # MAJOR 3: filtering only on "measured_loss is not None" let
+                # measurement_invalid (physically-impossible, measured_loss
+                # below -eps) readings into the noise-factor fit -- the
+                # exact poisoning the measurement loop's active-learning
+                # feed (record_residual) already avoids for the predictor,
+                # made persistent here in noise_calibration.json instead.
                 if info.get("measured_loss") is not None
+                and not info.get("measurement_invalid")
             ]
             if not inputs:
                 log.warning(
@@ -1499,6 +1881,12 @@ class MagicQuantOrchestrator:
             groups.extend(["X", "R"])
         if any(classifier.classify_tensor(t) == "S" for t in tensor_names):
             groups.append("S")
+        # This loop drove classify_tensor() one name at a time (not
+        # classify_tensors(), which fires the summary automatically) across
+        # the full model's tensor_names -- surface the unclassified-tensor
+        # summary now that the pass is complete. See
+        # TensorGroupClassifier.warn_unclassified_once()'s docstring.
+        classifier.warn_unclassified_once()
         # Remember the full detected group set so run_evolution actually
         # varies X/R/S (otherwise it falls back to DEFAULT_GROUPS).
         self._search_groups = groups
@@ -1506,7 +1894,17 @@ class MagicQuantOrchestrator:
         prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
         self.sensitivity_weights = prober.get_normalized_weights()
         self.probing_provenance = prober.probing_provenance
+        self.weights_degenerate = prober.weights_degenerate
         prober.save_results(str(self.output_dir / "sensitivity.json"))
+
+        # MAJOR 4: same gate as run_measured_search -- "suspect"/degenerate
+        # provenance can occur here too whenever a real llama_tools was
+        # available and used for probing (this run's probes were not all
+        # heuristic). A purely heuristic run (no llama.cpp) never reaches
+        # "suspect" (see _enforce_probing_signal_gate's docstring / MAJOR 4
+        # discussion), so this does not regress the documented
+        # prediction-only heuristic-fallback design.
+        self._enforce_probing_signal_gate()
 
         # (_estimate_model_size also populates self._param_counts per group.)
         baseline_size_gb = self._estimate_model_size(self.source_model_path)
@@ -1614,19 +2012,45 @@ class MagicQuantOrchestrator:
     ) -> List[str]:
         """Generate one hybrid GGUF per compression tier.
 
-        NOTE: the Q2 tier (size ratio <= 0.16) is currently UNREACHABLE — the
-        smallest registered scheme is Q2_K (bpw=2.625 -> ratio ~0.164, just
-        outside the band). It will log "No config for tier, skipping" until
-        PR3 adds sub-Q2 IQ-quants. Q2 is kept in the default list (and now has
-        an HF filename label) so it fills automatically once PR3 lands.
+        Under TIER_SCHEME_VERSION 2 (see magicquant.quant.tiers' module
+        docstring), the Q2 tier IS reachable: its band is
+        ``(0, _Q2_CEILING]`` = ``(0, 0.178]``, and both Q2_K (ratio ~0.1641)
+        and IQ2_S (ratio ~0.1602) classify into it. (Under the old v1
+        boundaries Q2 sat just outside the band and was genuinely
+        unreachable without sub-Q2 IQ-quants -- that limitation no longer
+        applies.) A tier can still legitimately come back empty if the
+        search/incumbents never produced a config whose measured/predicted
+        size lands in that tier's band; see the requested-but-empty warning
+        below for how that's surfaced.
         """
+        from magicquant.quant.tiers import describe_tier_band
+
         if tiers is None:
             tiers = ["Q8", "Q6", "Q5", "Q4", "Q2"]
 
+        # Every tier in `tiers` (whether the caller passed it explicitly or
+        # it came from the default list above) was REQUESTED -- a caller
+        # asking for e.g. tiers=["Q4", "Q5", "Q6"] expects to get (up to)
+        # three files back. Under the narrower v2 bands, a requested tier
+        # with no measured/predicted config in it is a real, actionable gap
+        # (fewer files shipped than asked for), not a routine no-op -- log
+        # it loudly (not INFO) and record it so a downstream reader of
+        # search_results.json (e.g. the publish path) can see it too,
+        # instead of it only ever being visible in a log line. This does
+        # NOT hard-fail: a genuinely empty band (nothing measured/predicted
+        # landed there) is legitimate and the run's other tiers still ship.
+        missing_requested = []
         generated = []
         for tier in tiers:
             if tier not in tiered:
-                log.info("No config for tier, skipping", stage="generate", tier=tier)
+                band = describe_tier_band(tier)
+                log.warning(
+                    "Requested tier has no config -- skipping "
+                    "(narrower v2 tier bands can leave a tier empty; see "
+                    "magicquant.quant.tiers module docstring)",
+                    stage="generate", tier=tier, band=band,
+                )
+                missing_requested.append({"tier": tier, "band": band})
                 continue
 
             entry = tiered[tier]
@@ -1660,7 +2084,39 @@ class MagicQuantOrchestrator:
             else:
                 log.error("Tier generation failed", stage="generate", tier=tier)
 
+        if missing_requested:
+            self._record_missing_requested_tiers(missing_requested)
+
         return generated
+
+    def _record_missing_requested_tiers(self, missing_requested: List[Dict[str, str]]) -> None:
+        """Stamp ``requested_tiers_missing`` into the already-written
+        search_results.json so a downstream reader (e.g. the publish path)
+        can see that fewer files were generated than were asked for, without
+        having to scrape logs. Best-effort: search_results.json is written
+        by ``_save_results`` earlier in the run (both search paths call it
+        before ``generate_tiered_models`` runs), but ``generate_tiered_models``
+        can also be invoked standalone (see ``magicquant/__main__.py``'s
+        ``generate`` subcommand, loading a prior run's file) against a
+        directory where the file may be missing/unreadable -- in which case
+        this logs and gives up rather than raising, since the GGUF files
+        themselves were already generated successfully and that must not be
+        undone by a diagnostics-only write failing.
+        """
+        results_path = self.output_dir / "search_results.json"
+        try:
+            existing = json.loads(results_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning(
+                "Could not read search_results.json to record missing "
+                "requested tiers -- the tiers listed above were still "
+                "skipped, but this run's search_results.json won't "
+                "reflect it",
+                stage="generate", error=str(exc),
+            )
+            return
+        existing["requested_tiers_missing"] = missing_requested
+        results_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
 
     def generate_top_models(
         self, results: List[Dict], top_n: int = 3,
@@ -1756,10 +2212,41 @@ class MagicQuantOrchestrator:
             return {"path": str(p), "size": None, "mtime": None}
 
     def _safe_resolve_corpus(self) -> Optional[str]:
-        try:
-            return self.llama_tools._resolve_data_file(None)
-        except Exception:
+        """Resolve the corpus llama_tools would use, for measurement-
+        condition comparisons -- never raises.
+
+        MINOR fix: this used to swallow ALL exceptions, including the pin-
+        violation ``RuntimeError`` ``LlamaCppTools._resolve_data_file`` now
+        raises when the auto-resolved corpus disagrees with what it pinned
+        earlier in this run (see its docstring). Swallowing THAT turned the
+        corpus into ``None`` silently, voiding this run's own resume
+        comparisons: a checkpoint's ``measurement_conditions["corpus"]``
+        would then always "match" a future ``None`` instead of ever
+        catching the change. A pin violation is a real invariant break, not
+        a "no corpus configured" no-op -- log it loudly and keep reporting
+        the last known-good corpus instead of erasing it.
+        """
+        llama = self.llama_tools
+        if llama is None:
             return None
+        try:
+            resolved = llama._resolve_data_file(None)
+        except RuntimeError as exc:
+            log.error(
+                "Corpus resolution failed (pin violation) -- keeping last "
+                "known-good corpus for measurement-condition comparisons "
+                "instead of silently voiding them",
+                stage="resume", error=str(exc),
+            )
+            return getattr(self, "_last_resolved_corpus", None)
+        except Exception as exc:
+            log.warning(
+                "Corpus resolution failed unexpectedly", stage="resume",
+                error=str(exc), exc_info=exc,
+            )
+            return getattr(self, "_last_resolved_corpus", None)
+        self._last_resolved_corpus = resolved
+        return resolved
 
     def _current_measurement_conditions(self) -> Dict[str, Any]:
         """The subset of measurement conditions that must match between a
@@ -1836,7 +2323,7 @@ class MagicQuantOrchestrator:
         attempts to parse.
         """
         checkpoint = {
-            "version": 1,
+            "version": 2,
             "seed": self._search_seed,
             "source_model": self._source_identity(),
             "measurement_conditions": self._current_measurement_conditions(),
@@ -1844,6 +2331,9 @@ class MagicQuantOrchestrator:
             "baseline_provenance": self.baseline_provenance,
             "sensitivity_weights": self.sensitivity_weights,
             "probing_provenance": self.probing_provenance,
+            # So a resumed run's _enforce_probing_signal_gate sees the same
+            # signal a fresh run would have -- see MAJOR 4.
+            "weights_degenerate": getattr(self, "weights_degenerate", False),
             "kl": {
                 "enabled": bool(self._kl_base_logits_path),
                 "base_logits_path": self._kl_base_logits_path,
@@ -1865,6 +2355,16 @@ class MagicQuantOrchestrator:
                     "kl": v.get("kl"),
                     "bench": v.get("bench"),
                     "incumbent": v.get("incumbent"),
+                    # BLOCKER fix: this whitelist used to omit
+                    # measurement_invalid/corpus_path, so a resumed run's
+                    # entries came back WITHOUT them -- info.get(
+                    # "measurement_invalid") is None (falsy) post-resume,
+                    # and a physically-impossible candidate could win a
+                    # tier again across a resume boundary. See
+                    # tests/test_measured_search_checkpoint_resume.py::
+                    # test_measurement_invalid_and_corpus_path_survive_checkpoint_round_trip.
+                    "measurement_invalid": v.get("measurement_invalid", False),
+                    "corpus_path": v.get("corpus_path"),
                 }
                 for k, v in self._measured.items()
             },

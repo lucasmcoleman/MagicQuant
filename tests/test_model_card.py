@@ -54,3 +54,21 @@ def test_card_uses_tiered_survivors_fallback():
     }
     card = generate_model_card(data, base_model_name="Y")
     assert "| Q8 |" in card
+
+
+def test_card_warns_on_legacy_tier_scheme_version():
+    """A search_results.json with no tier_scheme_version (pre-2026-07 fix,
+    like SAMPLE above) must surface a disclosure banner -- its tier labels
+    follow the OLD, wider size-ratio boundaries."""
+    card = generate_model_card(SAMPLE, base_model_name="Qwen3-4B")
+    assert "tier_scheme_version=1" in card
+    assert "OLDER, wider size-ratio boundaries" in card
+
+
+def test_card_no_warning_on_current_tier_scheme_version():
+    from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION
+
+    current = dict(SAMPLE, tier_scheme_version=CURRENT_TIER_SCHEME_VERSION)
+    card = generate_model_card(current, base_model_name="Qwen3-4B")
+    assert "tier_scheme_version=" not in card
+    assert "OLDER, wider size-ratio boundaries" not in card

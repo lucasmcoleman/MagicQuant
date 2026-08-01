@@ -36,6 +36,31 @@ python -m pytest tests/ -q          # unit + writer + search + integration
   REGENERATE `tests/fixtures/refactor_regression_seed42.json` whenever noise_factors,
   group sets, the sensitive-group floor clamp, or early-stop change behavior.
 
+## v2 budget search (`--algo v2`, docs/redesign.md)
+
+`magicquant search <model> --algo v2 --budget-gb <B>` runs the 2026-07
+algorithmic redesign (`magicquant/v2/`): per-tensor × per-scheme distortion
+table (imatrix-weighted encode+decode through libggml — needs the new
+`ggml_binding.ggml_decode`; CPU-only, cached), optional chunk-capped group
+probes fitting per-group amplification κ, then an exact multiple-choice
+knapsack (`v2/allocate.py`: convex-hull Lagrangian greedy + polish) that
+allocates per-TENSOR schemes to the byte budget and emits the whole
+predicted quality-size frontier in one solve. Only 2–3 frontier anchors get
+full-corpus perplexity verification. Outputs `v2_results.json` +
+`frontier.json` + the budget GGUF (built via the writer's per-tensor
+`"tensors"` override key). Failure doctrine: measurements either succeed or
+are recorded as failures (`v2_results.json "failures"`); probes never fall
+back to fabricated heuristics (strict; `--allow-partial-probes` for imputed-
+median κ, loudly tagged). `--target-profile q4nx` restricts choices to
+Q4_0/Q4_1/Q8_0/MXFP4 so the output packs losslessly for the FLM NPU
+converter. Q4_0/Q4_1 exist in the registry for this but are excluded from
+v1 sampling (`LEGACY_Q4_SCHEME_NAMES`), keeping the seed-pinned fixture
+stable. The v1 evolutionary path is the untouched default; the one
+deliberate v1 behavior change from this work: `run_measured_search` now
+constructs its `SensitivityProber` with `strict=True`, so a failed probe
+raises `ProbeMeasurementError` instead of silently poisoning the run with
+heuristic sensitivities (prediction-only search keeps the fallback).
+
 ## Architecture
 
 The pipeline has two paths:

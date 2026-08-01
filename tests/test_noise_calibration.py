@@ -182,6 +182,32 @@ def test_write_noise_calibration_survives_missing_repo_root_on_sys_path(
     assert (orch.output_dir / "noise_calibration.json").exists()
 
 
+def test_write_noise_calibration_excludes_measurement_invalid_entries(tmp_path):
+    """MAJOR 3 regression: _write_noise_calibration used to build FitInput
+    rows filtering only on ``measured_loss is not None``, so a
+    measurement_invalid (physically-impossible, e.g. NaN-driven) reading
+    got fitted into noise_calibration.json -- the same poisoning the
+    measurement loop's active-learning feed already avoids for the
+    predictor, made persistent here instead."""
+    orch = _make_bare_orchestrator(tmp_path)
+    # Poison the fit with an incident-shaped impossible reading.
+    orch._measured["poisoned"] = {
+        "config": {"Q": "Q4_K_M", "U": "IQ4_NL", "D": "MXFP4_MOE"},
+        "measured_loss": -0.9225,
+        "measurement_invalid": True,
+    }
+    orch._write_noise_calibration()
+
+    calib_path = orch.output_dir / "noise_calibration.json"
+    envelope = json.loads(calib_path.read_text())
+    for scheme, truth in GROUND_TRUTH_NOISE.items():
+        loaded = calibration.calibrated_noise_factor(scheme, str(calib_path))
+        assert loaded == pytest.approx(truth, abs=1e-3), (
+            f"{scheme}: fit was poisoned by a measurement_invalid entry -- "
+            f"loaded {loaded} vs ground truth {truth}"
+        )
+
+
 def test_write_noise_calibration_ignores_entries_without_measured_loss(tmp_path):
     orch = MagicQuantOrchestrator(
         source_model_path=str(tmp_path / "nonexistent.gguf"),

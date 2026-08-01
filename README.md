@@ -233,7 +233,7 @@ override them. Defaults below are the single source of truth (`config.py`):
 ## Docker
 
 ```bash
-docker build -t magicquant:latest .
+docker build -f docker/Dockerfile -t magicquant:latest .
 docker run --rm -v ./output:/app/output magicquant:latest search /data/model.gguf
 ```
 

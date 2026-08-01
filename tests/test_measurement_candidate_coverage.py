@@ -21,9 +21,11 @@ def test_tier_winners_survive_even_when_more_tiers_than_n(monkeypatch):
     returned, not just the first two by tier-iteration order."""
     orch = _orch()
     # baseline_gb=10.0; sizes chosen to land one config in each of Q8, Q6,
-    # Q5, Q4, Q3, Q2 (see magicquant.quant.tiers.TIER_BOUNDARIES).
+    # Q5, Q4, Q3, Q2 (see magicquant.quant.tiers.TIER_BOUNDARIES -- 2026-07
+    # fix, TIER_SCHEME_VERSION 2: Q6 (0.375,0.46], Q5 (0.328,0.375],
+    # Q4 (0.242,0.328], Q3 (0.178,0.242]).
     sizes = {
-        "Q8": 8.0, "Q6": 6.0, "Q5": 4.0, "Q4": 3.0, "Q3": 2.0, "Q2": 1.0,
+        "Q8": 8.0, "Q6": 4.2, "Q5": 3.5, "Q4": 2.8, "Q3": 2.0, "Q2": 1.0,
     }
     configs = [
         {"config": {"E": f"cfg_{tier}"}, "predicted_size_gb": size, "composite_score": 1.0}

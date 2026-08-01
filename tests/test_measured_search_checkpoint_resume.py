@@ -428,3 +428,78 @@ def test_checkpoint_tolerates_numpy_typed_measurements(tmp_path):
     import json as _json
     data = _json.loads(out.read_text())
     assert data["measured"]["a"]["kl"]["mean_kl"] == pytest.approx(0.01)
+
+
+# ── BLOCKER: measurement_invalid / corpus_path must survive a checkpoint
+# round-trip, or the resume-boundary defeats the impossible-measurement
+# guard entirely ────────────────────────────────────────────────────────
+
+
+def test_measurement_invalid_and_corpus_path_survive_checkpoint_round_trip(tmp_path):
+    """_write_measured_checkpoint writes each measurement via an explicit
+    key whitelist. If that whitelist is never extended with
+    ``measurement_invalid``/``corpus_path``, a resumed run loses both
+    fields -- info.get("measurement_invalid") comes back None (falsy) and
+    a physically-impossible candidate that was correctly flagged before the
+    kill can win a tier again after resume. This must not regress."""
+    from magicquant.orchestrator import MagicQuantOrchestrator
+
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch._search_seed = 42
+    orch.baseline_ppl = 34.8363
+    orch.baseline_provenance = "measured"
+    orch.probing_provenance = "measured"
+    orch.sensitivity_weights = {"E": 0.5}
+    orch._kl_base_logits_path = None
+    orch._kl_corpus_path = None
+    orch.source_model_path = str(tmp_path / "m.gguf")
+    from pathlib import Path as _P
+    _P(orch.source_model_path).write_bytes(b"g")
+    orch._llama_tools = None
+    orch._llamacpp_path = None
+    orch._imatrix = None
+    orch._measured = {
+        "impossible": {
+            "config": {"E": "IMPOSSIBLE"},
+            # Impossibly low measured_loss -- the "best" number in the tier
+            # by min(), which is exactly why it must stay excluded.
+            "measured_loss": -0.9225,
+            "size_gb": 4.0,
+            "measurement_invalid": True,
+            "corpus_path": "/fake/corpus.txt",
+        },
+        "real": {
+            "config": {"E": "REAL"},
+            "measured_loss": 0.15,
+            "size_gb": 4.0,
+            "measurement_invalid": False,
+            "corpus_path": "/fake/corpus.txt",
+        },
+    }
+
+    ckpt_path = tmp_path / "ckpt.json"
+    orch._write_measured_checkpoint(ckpt_path)
+    checkpoint = json.loads(ckpt_path.read_text())
+
+    # Simulate exactly what run_measured_search's resume path does with a
+    # loaded checkpoint (orchestrator.py ~line 424-425).
+    orch2 = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch2._kl_weight = 0.0
+    orch2._speed_aware = False
+    orch2._measured = {}
+    for key, entry in checkpoint.get("measured", {}).items():
+        orch2._measured[key] = dict(entry)
+
+    assert orch2._measured["impossible"]["measurement_invalid"] is True, (
+        "measurement_invalid must survive a checkpoint write+load round trip"
+    )
+    assert orch2._measured["impossible"]["corpus_path"] == "/fake/corpus.txt", (
+        "corpus_path must survive a checkpoint write+load round trip"
+    )
+
+    result = orch2._select_final_survivors(baseline_gb=8.0)
+    tier = orch2._classify_tier(4.0, 8.0)
+    assert result[tier]["config"] == {"E": "REAL"}, (
+        "a candidate flagged measurement_invalid before a kill must still "
+        "be excluded from tier selection after a checkpoint resume"
+    )

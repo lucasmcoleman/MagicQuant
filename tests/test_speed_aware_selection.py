@@ -266,14 +266,20 @@ def test_run_measured_search_threads_speed_aware_params(tmp_path, monkeypatch):
     assert orch._speed_epsilon == 0.02
 
 
-def test_run_measured_search_defaults_speed_aware_off(tmp_path, monkeypatch):
+def test_run_measured_search_defaults_speed_aware_on(tmp_path, monkeypatch):
+    """2026-07 fix: speed_aware defaults ON (a real ThinkingCap run shipped a
+    larger, worse-raw-PPL "Q5" winner purely via a KL tiebreak -- selection
+    was size-blind by default). speed_epsilon defaults to None, resolved
+    lazily by _select_final_survivors via measurement.measurement_eps(...)
+    rather than a fixed float. Pass speed_aware=False to restore the old
+    bare argmin-over-KL-blended-score behavior."""
     orch, _ = _make_orchestrator(tmp_path, monkeypatch)
     orch.run_measured_search(
         search_generations=1, population_size=4, measurement_rounds=1,
         candidates_per_round=1, verbose=False, seed_incumbents=False,
     )
-    assert orch._speed_aware is False
-    assert orch._speed_epsilon == 0.005
+    assert orch._speed_aware is True
+    assert orch._speed_epsilon is None
 
 
 def test_run_measured_search_speed_aware_end_to_end_prefers_faster_tied_candidate(
@@ -394,6 +400,86 @@ def test_speed_aware_bytes_honors_kl_guard():
     assert result[tier]["config"] == {"E": "GOOD"}
 
 
+# ── Real-run regression: ThinkingCap-Qwen3.6-27B measured search ────────────
+#
+# output/ThinkingCap-Qwen3.6-27B/magicquant/search_results.json (a real
+# measured run, kl_weight=0.1): the shipped "Q5" tier winner was the uniform
+# Q6_K config -- BOTH larger (20.89 GB vs 17.68 GB) AND worse raw PPL
+# (6.827036 vs 6.826419) than the uniform Q5_K config it beat. It won only
+# because the KL tiebreak (kl_weight * |mean_kl|) tipped the combined score:
+# Q6_K's mean_kl (0.010119) was lower than Q5_K's (0.0185), enough to
+# outweigh Q6_K's slightly WORSE raw measured_loss once kl_weight=0.1 was
+# applied -- even though the raw PPL gap between them (~0.009%) was two
+# orders of magnitude below the run's own reported measurement error
+# (ppl_err ~0.107, i.e. ~1.6% of baseline_ppl=6.7803).
+_THINKINGCAP_BASELINE_PPL = 6.7803
+_THINKINGCAP_Q5_K = {
+    "config": {"D": "Q5_K", "E": "Q5_K", "H": "Q6_K", "K": "Q5_K",
+               "O": "Q5_K", "Q": "Q5_K", "S": "Q5_K", "U": "Q5_K"},
+    "measured_loss": 0.006801911419848551,
+    "size_gb": 17.675239741802216,
+    "kl": {"mean_kl": 0.0185, "max_kl": 18.072206, "p90_kl": 0.020889,
+           "ppl": 6.826419, "ppl_err": 0.107295},
+}
+_THINKINGCAP_Q6_K = {
+    "config": {"D": "Q6_K", "E": "Q6_K", "H": "Q6_K", "K": "Q6_K",
+               "O": "Q6_K", "Q": "Q6_K", "S": "Q6_K", "U": "Q6_K"},
+    "measured_loss": 0.006892910343200038,
+    "size_gb": 20.890495479106903,
+    "kl": {"mean_kl": 0.010119, "max_kl": 16.915789, "p90_kl": 0.01204,
+           "ppl": 6.827036, "ppl_err": 0.10734},
+}
+
+
+def test_thinkingcap_smaller_better_ppl_candidate_wins_default():
+    """Regression for the real ThinkingCap bug: with speed_aware ON
+    (default), the smaller AND better-raw-PPL Q5_K config must win its tier
+    over the larger, worse-raw-PPL Q6_K config that a bare KL-blended argmin
+    picked instead.
+
+    Proven to fail pre-fix: before this fix, _select_final_survivors' bare
+    ``min(candidates, key=_score)`` (KL-blended) picked the Q6_K config --
+    the exact real-world failure this test guards against.
+    """
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch._kl_weight = 0.1
+    orch._speed_aware = True
+    orch._speed_epsilon = None
+    orch.baseline_ppl = _THINKINGCAP_BASELINE_PPL
+    orch._measured = {
+        "q5k": dict(_THINKINGCAP_Q5_K),
+        "q6k": dict(_THINKINGCAP_Q6_K),
+    }
+    # Force both real candidates into ONE tier band -- independent of
+    # whatever TIER_BOUNDARIES currently says about their actual sizes
+    # (post-Fix-B they'd classify into DIFFERENT tiers; this test is about
+    # WITHIN-tier selection, so it pins them together deliberately).
+    orch._classify_tier = staticmethod(lambda size_gb, baseline_gb: "Q5")
+    result = orch._select_final_survivors(baseline_gb=50.0)
+    assert result["Q5"]["config"] == _THINKINGCAP_Q5_K["config"], (
+        "the larger, worse-raw-PPL Q6_K candidate won again -- "
+        f"got {result['Q5']['config']}"
+    )
+
+
+def test_thinkingcap_bare_argmin_reproduces_the_original_bug():
+    """With speed_aware=False (the escape hatch), the ORIGINAL KL-blended
+    bare-argmin behavior is restored exactly -- including its bug. Documents
+    that speed_aware=False is a genuine behavioral restoration, not just a
+    epsilon=0 special case."""
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch._kl_weight = 0.1
+    orch._speed_aware = False
+    orch.baseline_ppl = _THINKINGCAP_BASELINE_PPL
+    orch._measured = {
+        "q5k": dict(_THINKINGCAP_Q5_K),
+        "q6k": dict(_THINKINGCAP_Q6_K),
+    }
+    orch._classify_tier = staticmethod(lambda size_gb, baseline_gb: "Q5")
+    result = orch._select_final_survivors(baseline_gb=50.0)
+    assert result["Q5"]["config"] == _THINKINGCAP_Q6_K["config"]
+
+
 def test_select_final_survivors_default_speed_metric_is_bytes():
     orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
     orch._kl_weight = 0.0
@@ -409,3 +495,57 @@ def test_select_final_survivors_default_speed_metric_is_bytes():
     result = orch._select_final_survivors(baseline_gb=8.0)
     tier = orch._classify_tier(4.0, 8.0)
     assert result[tier]["config"] == {"E": "SMALL"}
+
+
+# ── speed_epsilon must actually thread the run's own reported ppl_err ──────
+#
+# _select_final_survivors resolves speed_epsilon (when the instance's
+# _speed_epsilon is None, the documented default) via
+# magicquant.utils.measurement.measurement_eps(baseline_ppl, reported_err).
+# Before this fix, the call site passed NO reported_err at all -- always
+# measurement_eps(baseline_ppl), which per measurement.py's signature always
+# falls back to the flat DEFAULT_RELATIVE_EPS=0.05 regardless of how
+# precise (or imprecise) this run's own measurements actually were. This
+# threads the tier quality-winner's fused-KL-pass ppl_err through, exactly
+# like the per-candidate measurement_invalid check already does.
+def test_select_final_survivors_threads_reported_ppl_err_into_speed_epsilon():
+    """A run with a genuinely large reported measurement error (ppl_err) must
+    widen the speed-aware epsilon band beyond the flat 0.05 default -- i.e.
+    the 3-sigma path in measurement_eps must actually get exercised using
+    THIS run's own numbers, not silently ignored.
+
+    Proven to fail pre-fix: the old call site was
+    ``speed_epsilon = measurement_eps(baseline_ppl)`` with no reported_err,
+    which is pinned at the flat 0.05 default no matter what. baseline_ppl=10,
+    A's measured_loss=0.02 (quality_best, kl.ppl_err=1.0 -- a genuinely
+    noisy run, 3*1.0/10=0.3 relative), B's measured_loss=0.024 (+20%
+    relative to A, size 8 < A's size 10). Under the flat 0.05 default the
+    threshold is only 0.02*1.05=0.021 -- B (0.024) falls OUTSIDE the band,
+    so the (larger) quality-best A wins. Under the correctly-threaded
+    3-sigma epsilon (0.3), the threshold is 0.02*1.3=0.026 -- B falls
+    INSIDE the band and, being smaller, wins the bytes-based speed-aware
+    pick instead.
+    """
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch._kl_weight = 0.0  # keep _score == raw measured_loss, no KL blending
+    orch._speed_aware = True
+    orch._speed_epsilon = None  # resolve lazily via measurement_eps(...)
+    orch.baseline_ppl = 10.0
+    orch._measured = {
+        "a": {
+            "config": {"E": "A"}, "measured_loss": 0.02, "size_gb": 10.0,
+            "kl": {"mean_kl": 0.001, "ppl_err": 1.0},
+        },
+        "b": {
+            "config": {"E": "B"}, "measured_loss": 0.024, "size_gb": 8.0,
+            "kl": {"mean_kl": 0.001, "ppl_err": 1.0},
+        },
+    }
+    orch._classify_tier = staticmethod(lambda size_gb, baseline_gb: "Q5")
+    result = orch._select_final_survivors(baseline_gb=50.0)
+    assert result["Q5"]["config"] == {"E": "B"}, (
+        "expected the smaller in-band candidate B to win once this run's "
+        "own reported ppl_err (0.3 relative, well above the flat 0.05 "
+        "default) is actually threaded into the speed-aware epsilon -- "
+        f"got {result['Q5']['config']}"
+    )

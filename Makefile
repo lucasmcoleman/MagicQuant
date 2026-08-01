@@ -16,7 +16,7 @@ build:
 	python -m build
 
 docker-build:
-	docker build -t magicquant:latest .
+	docker build -f docker/Dockerfile -t magicquant:latest .
 
 docker-up:
 	docker run --rm -it magicquant:latest
