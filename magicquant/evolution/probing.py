@@ -69,6 +69,11 @@ MIN_RESOLVED_MASS = 0.50
 # ones land at ~2900x (uniform logits: PPL == vocab size) or NaN.
 BROKEN_PROBE_RATIO = 50.0
 
+# Fallback resolution floor for KL-scored probes when llama.cpp's "Mean KLD"
+# line carries no "+/- err" term. Real per-group readings on this hardware sit
+# around 0.10-0.16 nats with errors near 0.002.
+MIN_KL_SIGNAL = 0.001
+
 
 class ProbeMeasurementError(RuntimeError):
     """A sensitivity probe failed to produce a real measurement in a
@@ -253,7 +258,20 @@ class SensitivityProber:
             # guishable from a genuinely flat/robust group, and the whole
             # entry still gets ``measured: true`` (see incident notes: a
             # NaN-driven measured search recorded 8/9 groups this way).
-            is_clamped = measured and ppl < self.baseline_ppl * (1 - eps)
+            # ...and it applies to PERPLEXITY readings only. In KL mode the
+            # reading is a divergence, not a perplexity: it is non-negative by
+            # construction, 0.0 means "identical to the reference", and there
+            # is no baseline to come in under. Comparing a KLD of ~0.1 against
+            # baseline_ppl*(1-eps) (~33 for this model) flags every single
+            # probe as physically impossible, which then trips the
+            # >half-clamped rule and downgrades a perfectly healthy run to
+            # provenance "suspect". Observed exactly that: 9/9 groups resolved
+            # with 100% mass coverage, and the run still failed its own gate.
+            is_clamped = (
+                measured
+                and not self.kl_base_logits_path
+                and ppl < self.baseline_ppl * (1 - eps)
+            )
             if is_clamped:
                 clamped_count += 1
                 _log.warning(
@@ -296,7 +314,15 @@ class SensitivityProber:
             if self.kl_base_logits_path:
                 delta = ppl
                 sensitivity = max(0.0, ppl)
-                floor = None
+                # Fallback for builds whose "Mean KLD" line carries no
+                # "+/- err" term. Without a floor here, a missing error would
+                # send classify_probe_signal down its no-basis path and mark
+                # EVERY group unresolved -- turning a cosmetic parsing gap
+                # into a refused run. Real per-group readings on this box sit
+                # around 0.10-0.16 nats with errors near 0.002, so a
+                # thousandth of a nat is comfortably below any genuine signal
+                # while still rejecting numerical dust.
+                floor = MIN_KL_SIGNAL
             else:
                 # Keep the SIGNED delta as well as the clamped sensitivity. A
                 # probe reading below baseline is a real, reproducible,

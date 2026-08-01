@@ -289,3 +289,58 @@ Maximum KLD:   6.792666
         assert classify_probe_signal(
             result["mean_kl"], result.get("mean_kl_err")
         ) == PROBE_RESOLVED
+
+
+class TestKLModeDoesNotUsePerplexityGuards:
+    """A KL divergence is not a perplexity, and must not be judged as one.
+
+    Regression for a real overnight failure: with KL scoring on, every probe
+    reading (~0.1 nats) was compared against baseline_ppl*(1-eps) (~33 for
+    that model) by the "a quantized probe cannot beat its own baseline"
+    clamp. All 9 probes were flagged physically impossible, which tripped the
+    >half-clamped rule and downgraded the run to provenance "suspect" -- even
+    though all 9 groups resolved and mass coverage was 100%.
+    """
+
+    @staticmethod
+    def _prober(**kw):
+        from magicquant.evolution.probing import SensitivityProber
+        return SensitivityProber(
+            base_model_path="/nonexistent.gguf",
+            baseline_perplexity=34.8363,
+            baseline_ppl_err=0.78041,
+            **kw,
+        )
+
+    def _run(self, prober, monkeypatch, value):
+        """Drive probe_all_groups with a stubbed single-probe reading."""
+        def _stub(self, g, a, k, v):
+            # _real_probe normally publishes the reading's own error here;
+            # the stub must too, or resolution has nothing to judge against.
+            self._last_probe_err = 0.002 if self.kl_base_logits_path else None
+            return (value, True)
+
+        monkeypatch.setattr(type(prober), "_probe_single_group", _stub)
+        prober.probe_all_groups(
+            groups=["X", "O", "Q", "H", "E"], verbose=False
+        )
+        return prober
+
+    def test_kl_readings_are_not_clamped_as_impossible(self, monkeypatch):
+        # 0.1578 was the real X-group KLD on Laguna-XS.
+        p = self._run(self._prober(kl_base_logits_path="/tmp/base.logits"),
+                      monkeypatch, 0.1578)
+        assert p.probing_provenance == "measured"
+        assert all(m["clamped"] is False for m in p.probe_models)
+        assert all(s == PROBE_RESOLVED for s in p.resolutions.values())
+
+    def test_perplexity_mode_still_clamps_sub_baseline_readings(self, monkeypatch):
+        # Same numeric value, but read as a PERPLEXITY it is impossible.
+        p = self._run(self._prober(), monkeypatch, 0.1578)
+        assert p.probing_provenance == "suspect"
+        assert all(m["clamped"] is True for m in p.probe_models)
+
+    def test_kl_sensitivity_is_the_divergence_itself(self, monkeypatch):
+        p = self._run(self._prober(kl_base_logits_path="/tmp/base.logits"),
+                      monkeypatch, 0.1578)
+        assert p.sensitivity_results["X"] == pytest.approx(0.1578)
