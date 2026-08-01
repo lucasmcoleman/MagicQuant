@@ -72,6 +72,8 @@ class SensitivityProber:
         strict: bool = False,
         baseline_ppl_err: Optional[float] = None,
         parameter_counts: Optional[Dict[str, int]] = None,
+        kl_base_logits_path: Optional[str] = None,
+        kl_corpus_path: Optional[str] = None,
     ):
         """
         Args:
@@ -117,6 +119,19 @@ class SensitivityProber:
         # Populated by probe_all_groups.
         self.resolutions: Dict[str, str] = {}
         self.resolved_mass_fraction: float = 0.0
+
+        # When set, probes are scored by KL divergence against these saved
+        # reference logits instead of by their own perplexity. Perplexity's
+        # reported error is the spread over chunk means (~2% of baseline at
+        # 100 chunks), which is too coarse to separate a real sub-percent
+        # probe delta from zero; KL's is over every evaluated token. Both
+        # come from the same single llama-perplexity invocation.
+        self.kl_base_logits_path = kl_base_logits_path
+        self.kl_corpus_path = kl_corpus_path
+
+        # Error term reported alongside the most recent probe reading, used
+        # to decide whether that reading resolved anything.
+        self._last_probe_err: Optional[float] = None
 
         # Results from probes
         self.sensitivity_results: Dict[str, float] = {}
@@ -224,24 +239,32 @@ class SensitivityProber:
                         f"below baseline {self.baseline_ppl:.4f} -- clamped"
                     )
 
-            # Keep the SIGNED delta as well as the clamped sensitivity. A
-            # probe reading below baseline is a real, reproducible,
-            # corpus-specific effect (llama-perplexity is deterministic on a
-            # fixed model+corpus), so max(0, ...) is discarding information,
-            # not filtering noise.
-            delta = ppl - self.baseline_ppl
-            sensitivity = max(0.0, delta) / self.baseline_ppl
+            # In KL mode ``ppl`` holds the probe's mean KL divergence, which
+            # is already a non-negative measure of how far this group's
+            # quantization moved the output distribution -- no baseline to
+            # subtract and no sign to clamp.
+            if self.kl_base_logits_path:
+                delta = ppl
+                sensitivity = max(0.0, ppl)
+                floor = None
+            else:
+                # Keep the SIGNED delta as well as the clamped sensitivity. A
+                # probe reading below baseline is a real, reproducible,
+                # corpus-specific effect (llama-perplexity is deterministic
+                # on a fixed model+corpus), so max(0, ...) discards
+                # information rather than filtering noise.
+                delta = ppl - self.baseline_ppl
+                sensitivity = max(0.0, delta) / self.baseline_ppl
+                floor = self.baseline_ppl * DEFAULT_RELATIVE_EPS
 
-            # Was this delta big enough to mean anything? The estimator's
-            # precision -- llama-perplexity's "+/- err", the spread over
-            # chunks -- is what decides, NOT its reproducibility. At 100
-            # chunks that error is ~2% of baseline, so sub-percent probe
-            # deltas are exact and still uninformative.
+            # Was this reading big enough to mean anything? The estimator's
+            # precision decides -- NOT its reproducibility. Perplexity's
+            # "+/- err" is the spread over chunk means (~2% of baseline at
+            # 100 chunks), so sub-percent probe deltas are exact and still
+            # uninformative; KL's is over every evaluated token.
             resolution = (
                 classify_probe_signal(
-                    delta,
-                    self.baseline_ppl_err,
-                    fallback_floor=self.baseline_ppl * DEFAULT_RELATIVE_EPS,
+                    delta, self._last_probe_err, fallback_floor=floor
                 )
                 if measured
                 else PROBE_UNRESOLVED
@@ -487,7 +510,30 @@ class SensitivityProber:
                 probe_path, group, scheme, keep_scheme, classifier
             )
 
+            # KL mode: compare this probe's per-token output distribution
+            # against the reference logits instead of its corpus-mean
+            # perplexity. Same single llama-perplexity pass, but the error
+            # term is over every evaluated token rather than over chunk
+            # means, so a probe delta that perplexity cannot separate from
+            # zero resolves cleanly. Measured on one real probe: 79 sigma by
+            # KL vs 0.55 sigma by unpaired perplexity.
+            if self.kl_base_logits_path:
+                kl = self.perplexity_calculator.calculate_kl_divergence(
+                    probe_path, self.kl_base_logits_path, self.kl_corpus_path
+                )
+                if kl is None or kl.get("mean_kl") is None:
+                    if self.strict:
+                        raise ProbeMeasurementError(
+                            f"KL probe for group '{group}' produced no "
+                            "parseable KL divergence. Refusing to substitute "
+                            "a fabricated value in a measured search."
+                        )
+                    return self._heuristic_probe(group, scheme), False
+                self._last_probe_err = kl.get("mean_kl_err")
+                return float(kl["mean_kl"]), True
+
             # Measure perplexity
+            self._last_probe_err = self.baseline_ppl_err
             ppl = self.perplexity_calculator.calculate_perplexity(
                 probe_path, verbose=verbose
             )

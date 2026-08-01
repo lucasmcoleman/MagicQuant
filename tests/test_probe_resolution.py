@@ -220,6 +220,26 @@ class TestProbeArtifactVerification:
                 "p.gguf", "X", "Q4_K_M", "BF16", self._Classifier
             )
 
+    def test_kl_mode_resolves_what_perplexity_mode_cannot(self):
+        """Same probe, same corpus, two metrics -- one usable.
+
+        Real numbers from one X-group probe on Laguna-XS: llama-perplexity
+        reports the probe at PPL 35.2671 +/- 0.7901 against a 34.8363
+        baseline, and mean KLD 0.154163 +/- 0.001946 for the same run.
+        """
+        baseline_ppl, baseline_err = 34.8363, 0.78041
+        probe_ppl = 35.267084
+        kl, kl_err = 0.154163, 0.001946
+
+        assert classify_probe_signal(
+            probe_ppl - baseline_ppl, baseline_err
+        ) == PROBE_UNRESOLVED
+        assert classify_probe_signal(kl, kl_err) == PROBE_RESOLVED
+
+        # ...and by a wide margin, not a boundary case.
+        assert (probe_ppl - baseline_ppl) / baseline_err < 1.0
+        assert kl / kl_err > 50.0
+
     def test_partial_quantization_warns_but_proceeds(self, monkeypatch, caplog):
         # Block-size fallbacks are real and documented; they dilute the probe
         # rather than invalidating it.
@@ -232,3 +252,40 @@ class TestProbeArtifactVerification:
                 "p.gguf", "X", "Q4_K_M", "BF16", self._Classifier
             )
         assert "stayed at full precision" in caplog.text
+
+
+class TestKLProbeParsing:
+    """The KL error term is what makes KL usable as a probe signal."""
+
+    # Verbatim from a real llama-perplexity --kl-divergence run.
+    REAL_OUTPUT = """
+Mean PPL(Q)                   :  35.267084 ±   0.790065
+Mean PPL(Q)-PPL(base)         :   0.541731 ±   0.144160
+
+====== KL divergence statistics ======
+Mean    KLD:   0.154163 ±   0.001946
+Maximum KLD:   6.792666
+90.0%   KLD:   0.349414
+"""
+
+    def test_mean_kl_error_is_captured(self):
+        from magicquant.utils.llamacpp import _parse_kl_output
+
+        result = _parse_kl_output(self.REAL_OUTPUT)
+        assert result["mean_kl"] == pytest.approx(0.154163)
+        assert result["mean_kl_err"] == pytest.approx(0.001946)
+
+    def test_bare_mean_without_error_still_parses(self):
+        from magicquant.utils.llamacpp import _parse_kl_output
+
+        result = _parse_kl_output("Mean    KLD:   0.154163\n")
+        assert result["mean_kl"] == pytest.approx(0.154163)
+        assert "mean_kl_err" not in result
+
+    def test_parsed_error_makes_the_probe_resolvable(self):
+        from magicquant.utils.llamacpp import _parse_kl_output
+
+        result = _parse_kl_output(self.REAL_OUTPUT)
+        assert classify_probe_signal(
+            result["mean_kl"], result.get("mean_kl_err")
+        ) == PROBE_RESOLVED

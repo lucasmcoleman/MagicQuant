@@ -845,10 +845,21 @@ def _parse_kl_output(output: str) -> Optional[dict]:
     """
     result: dict = {}
 
-    m = re.search(r"Mean\s+KLD:\s*(-?\d+\.?\d*)", output)
+    # llama.cpp prints "Mean    KLD:   0.154163 ±   0.001946". Capturing the
+    # error term is what makes KL usable as a PROBE signal rather than just a
+    # report: it is computed over every evaluated token (~50k at 100 chunks)
+    # instead of over 100 chunk means, which is why one real probe resolved
+    # at 79 sigma by KL against 0.55 sigma for the same probe judged by
+    # perplexity. Optional in the pattern -- older builds print a bare mean.
+    m = re.search(
+        r"Mean\s+KLD:\s*(-?\d+\.?\d*)(?:\s*(?:\xb1|\+/-)\s*(\d+\.?\d*))?",
+        output,
+    )
     if not m:
         return None
     result["mean_kl"] = float(m.group(1))
+    if m.group(2) is not None:
+        result["mean_kl_err"] = float(m.group(2))
 
     m = re.search(r"Maximum\s+KLD:\s*(-?\d+\.?\d*)", output)
     if m:
