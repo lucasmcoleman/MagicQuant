@@ -7,8 +7,33 @@ creating sensitivity weights that guide the evolutionary search.
 
 Strategy:
   For each tensor group G, create a temporary GGUF where G is quantised
-  with an aggressive scheme (e.g. Q4_K_M) while all other groups stay at
-  BF16.  Measure perplexity of each probe model and compare to baseline.
+  with an aggressive scheme (e.g. Q4_K_M) while all other groups stay at a
+  near-lossless keep scheme.  Measure each probe model and compare to
+  baseline.
+
+Why the keep scheme is Q8_0 and not BF16
+----------------------------------------
+It was BF16 until 2026-07-31, and that silently produced BROKEN probe
+models. llama.cpp cannot run a BF16 compute graph here, so the writer
+downgrades BF16-designated tensors to F16 on disk (it warns, and the warning
+was treated as cosmetic). Mixing those F16 tensors with a *quantized* probed
+group yields a model that does not merely measure badly -- it measures
+nothing:
+
+    probe H -> Q4_K_M, rest "BF16"   PPL = nan on every chunk
+    probe H -> Q6_K,   rest "BF16"   PPL = 100352.0000  (= the vocab size,
+                                     i.e. a uniform distribution)
+    probe H -> Q4_K_M, rest Q8_0     PPL = 50.8959  (baseline 50.8509)
+
+The same head quantized to Q6_K inside a fully uniform Q6_K build measures a
+healthy 34.9771, so neither the head nor the scheme is at fault -- the F16
+mixture is. A NaN probe exits 0 without printing "Final estimate", which is
+exactly what the pre-a6f8dd0 perplexity parser turned into a fabricated
+reading by matching the seconds-per-pass progress line (the 2.6-3.0 "PPLs"
+against a 34.84 baseline in Laguna-XS's stored sensitivity.json).
+
+Q8_0 is near-lossless, block-scaled, roughly half the bytes of F16, and
+keeps every tensor on a path llama.cpp actually executes.
 """
 
 from typing import Dict, List, Tuple, Optional
@@ -37,6 +62,12 @@ _log = logging.getLogger(__name__)
 # "every group resolved". Laguna-S scored 0.016 against this and would have
 # been refused; a healthy dense run resolves most of its mass.
 MIN_RESOLVED_MASS = 0.50
+
+# A probe measuring worse than this multiple of baseline is a broken build,
+# not a sensitive group. Generous on purpose: the worst *legitimate* single-
+# group probe observed is a few percent over baseline, while the real broken
+# ones land at ~2900x (uniform logits: PPL == vocab size) or NaN.
+BROKEN_PROBE_RATIO = 50.0
 
 
 class ProbeMeasurementError(RuntimeError):
@@ -163,7 +194,7 @@ class SensitivityProber:
         self,
         groups: List[str],
         aggressive_scheme: str = "Q4_K_M",
-        keep_scheme: str = "BF16",
+        keep_scheme: str = "Q8_0",
         verbose: bool = True,
     ) -> Dict[str, float]:
         """
@@ -243,6 +274,25 @@ class SensitivityProber:
             # is already a non-negative measure of how far this group's
             # quantization moved the output distribution -- no baseline to
             # subtract and no sign to clamp.
+            # A probe that came back catastrophically worse than baseline is
+            # a broken model, not a sensitive group. Two real signatures:
+            # NaN (which llama.cpp reports without a "Final estimate" line)
+            # and PPL equal to the vocabulary size, i.e. a uniform output
+            # distribution -- an H probe measured exactly 100352.0000 here
+            # against a 34.84 baseline. Ranking such a reading as
+            # "maximum sensitivity" would hand that group full weight and
+            # steer the whole search off one corrupt build.
+            if measured and not self.kl_base_logits_path:
+                if ppl != ppl or ppl > self.baseline_ppl * BROKEN_PROBE_RATIO:
+                    raise ProbeMeasurementError(
+                        f"Sensitivity probe for group '{group}' measured PPL "
+                        f"{ppl} against baseline {self.baseline_ppl} "
+                        f"({BROKEN_PROBE_RATIO}x is the sanity bound). That "
+                        f"is a broken probe model, not a sensitivity "
+                        f"reading -- a uniform output distribution scores "
+                        f"PPL == vocab size. Refusing to rank it."
+                    )
+
             if self.kl_base_logits_path:
                 delta = ppl
                 sensitivity = max(0.0, ppl)
