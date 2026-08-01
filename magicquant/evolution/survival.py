@@ -742,7 +742,20 @@ class EvolutionarySurvivor:
     def _find_crusher_target(
         self, config: Dict[str, str], groups: List[str]
     ) -> Optional[Dict]:
-        """Find the most robust FFN layer that's above minimum precision."""
+        """Find the most robust FFN layer that's above minimum precision.
+
+        Ties on sensitivity break by parameter mass, largest first. The
+        crusher exists to buy size, so among groups that look equally robust
+        it must take the one that actually holds bytes.
+
+        Without that tie-break the choice fell to group ORDER: Python's sort
+        is stable and the candidate list is built by iterating ``groups``
+        (E,H,Q,K,O,U,D,X,R). On the 2026-07 MoE runs the probes left both D
+        and X at sensitivity 0.0, so D -- 0.3% of the model's parameters --
+        won every tie, and X, holding 93.4%, was never crushed once. The
+        operator fired every generation and bought essentially nothing.
+        """
+        counts = getattr(self.predictor, "parameter_counts", None) or {}
         candidates = []
         for g in groups:
             if g not in self._LOW_SENSITIVITY:
@@ -752,11 +765,12 @@ class EvolutionarySurvivor:
             if self._downgrade(scheme) is not None and scheme != self._min_scheme_for_class('robust'):
                 sensitivity = self.predictor.sensitivity_weights.get(g, 0.5)
                 candidates.append({
-                    'group': g, 'scheme': scheme, 'sensitivity': sensitivity
+                    'group': g, 'scheme': scheme, 'sensitivity': sensitivity,
+                    'params': counts.get(g, 0),
                 })
         if not candidates:
             return None
-        candidates.sort(key=lambda x: x['sensitivity'])
+        candidates.sort(key=lambda x: (x['sensitivity'], -x['params']))
         return candidates[0]
 
     # ------------------------------------------------------------------

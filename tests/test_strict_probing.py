@@ -41,6 +41,16 @@ def fake_build(monkeypatch, tmp_path):
 
     monkeypatch.setattr(writer_mod, "create_hybrid_gguf", _fake_create)
 
+    # These tests exercise measurement/provenance handling, not artifact
+    # building: the writer above is a stub that never produces a real GGUF,
+    # so the probe-artifact check has nothing to inspect. Stub it out
+    # explicitly rather than letting it fail here -- it has its own
+    # coverage in test_probe_artifact_verification.py.
+    monkeypatch.setattr(
+        "magicquant.evolution.probing.SensitivityProber._verify_probe_artifact",
+        lambda *a, **k: None,
+    )
+
     # _real_probe also opens the source with GGUFReader to enumerate groups;
     # stub that out too.
     import magicquant.gguf.reader as reader_mod

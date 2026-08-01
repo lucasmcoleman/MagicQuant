@@ -20,9 +20,23 @@ import numpy as np
 
 from magicquant.quant import calibration
 from magicquant.quant.schemes import get_scheme_by_name
-from magicquant.utils.measurement import measurement_eps
+from magicquant.utils.measurement import (
+    DEFAULT_RELATIVE_EPS,
+    PROBE_RESOLVED,
+    PROBE_UNRESOLVED,
+    classify_probe_signal,
+    measurement_eps,
+    resolution_coverage,
+)
 
 _log = logging.getLogger(__name__)
+
+# Fraction of the model's parameters whose sensitivity must be resolved for
+# the resulting weight vector to be worth searching on. Deliberately modest:
+# the bar is "the probes said something about the bulk of the model", not
+# "every group resolved". Laguna-S scored 0.016 against this and would have
+# been refused; a healthy dense run resolves most of its mass.
+MIN_RESOLVED_MASS = 0.50
 
 
 class ProbeMeasurementError(RuntimeError):
@@ -57,6 +71,7 @@ class SensitivityProber:
         output_dir: Optional[str] = None,
         strict: bool = False,
         baseline_ppl_err: Optional[float] = None,
+        parameter_counts: Optional[Dict[str, int]] = None,
     ):
         """
         Args:
@@ -91,6 +106,17 @@ class SensitivityProber:
         self.perplexity_calculator = perplexity_calculator
         self.output_dir = output_dir
         self.strict = strict
+        # Per-group parameter counts, when the caller has them. Used to judge
+        # probe coverage by MODEL MASS rather than by group count -- three of
+        # nine groups resolving reads as 33% coverage but was 1.6% of the
+        # actual model on Laguna-S. See utils.measurement.resolution_coverage.
+        self.parameter_counts: Dict[str, int] = parameter_counts or {}
+
+        # Per-group probe resolution ("resolved"/"unresolved"/"implausible"),
+        # and the mass-weighted fraction of the model actually resolved.
+        # Populated by probe_all_groups.
+        self.resolutions: Dict[str, str] = {}
+        self.resolved_mass_fraction: float = 0.0
 
         # Results from probes
         self.sensitivity_results: Dict[str, float] = {}
@@ -198,14 +224,38 @@ class SensitivityProber:
                         f"below baseline {self.baseline_ppl:.4f} -- clamped"
                     )
 
-            sensitivity = max(0.0, ppl - self.baseline_ppl) / self.baseline_ppl
+            # Keep the SIGNED delta as well as the clamped sensitivity. A
+            # probe reading below baseline is a real, reproducible,
+            # corpus-specific effect (llama-perplexity is deterministic on a
+            # fixed model+corpus), so max(0, ...) is discarding information,
+            # not filtering noise.
+            delta = ppl - self.baseline_ppl
+            sensitivity = max(0.0, delta) / self.baseline_ppl
+
+            # Was this delta big enough to mean anything? The estimator's
+            # precision -- llama-perplexity's "+/- err", the spread over
+            # chunks -- is what decides, NOT its reproducibility. At 100
+            # chunks that error is ~2% of baseline, so sub-percent probe
+            # deltas are exact and still uninformative.
+            resolution = (
+                classify_probe_signal(
+                    delta,
+                    self.baseline_ppl_err,
+                    fallback_floor=self.baseline_ppl * DEFAULT_RELATIVE_EPS,
+                )
+                if measured
+                else PROBE_UNRESOLVED
+            )
+            self.resolutions[group] = resolution
 
             self.sensitivity_results[group] = sensitivity
             self.probe_models.append({
                 "group": group,
                 "aggressive_scheme": aggressive_scheme,
                 "probe_ppl": ppl,
+                "delta": delta,
                 "sensitivity": sensitivity,
+                "resolution": resolution,
                 "measured": measured,
                 "clamped": is_clamped,
             })
@@ -249,6 +299,48 @@ class SensitivityProber:
                 clamped_count, total, self.probing_provenance,
             )
             self.probing_provenance = "suspect"
+
+        # How much of the MODEL -- by parameter mass, not by group count --
+        # did these probes actually resolve? This is the check that the
+        # 2026-07 MoE runs needed and did not have. Laguna-S resolved three
+        # of nine groups, which sounds like a third of the signal; those
+        # three held 1.6% of the weights while X, at 93.4%, went unresolved
+        # and was handed weight 0.000.
+        self.resolved_mass_fraction = resolution_coverage(
+            self.resolutions, self.parameter_counts
+        )
+        resolved_groups = [
+            g for g, s in self.resolutions.items() if s == PROBE_RESOLVED
+        ]
+        # Only applies to runs that CLAIM a real measurement. "heuristic"
+        # (every probe fell back) and "suspect" (most readings physically
+        # impossible) already say something more specific about why the
+        # signal is missing; overwriting them with "insufficient" would lose
+        # the more useful diagnosis.
+        if (
+            total > 0
+            and self.probing_provenance in ("measured", "partial")
+            and self.resolved_mass_fraction < MIN_RESOLVED_MASS
+        ):
+            _log.warning(
+                "sensitivity probing resolved only %.1f%% of the model by "
+                "parameter mass (%d/%d groups: %s) -- below the %.0f%% "
+                "needed to steer a search. The weight vector this produces "
+                "is mostly zeros for the groups that hold the bytes; "
+                "downgrading probing_provenance from %r to 'insufficient' "
+                "so the caller can fall back to incumbents instead of "
+                "optimizing an uninformative objective.",
+                100 * self.resolved_mass_fraction, len(resolved_groups),
+                total, ",".join(sorted(resolved_groups)) or "none",
+                100 * MIN_RESOLVED_MASS, self.probing_provenance,
+            )
+            if verbose:
+                print(
+                    f"WARNING: probes resolved only "
+                    f"{100 * self.resolved_mass_fraction:.1f}% of the model "
+                    f"by parameter mass -- provenance 'insufficient'"
+                )
+            self.probing_provenance = "insufficient"
 
         return self.sensitivity_results
 
@@ -386,6 +478,15 @@ class SensitivityProber:
                 verbose=False,
             )
 
+            # A probe measures nothing unless the group it names actually
+            # got requantized. Verify that against the artifact before
+            # spending a perplexity pass on it -- a probe that silently kept
+            # its target at BF16 reports "this group is insensitive", which
+            # is the most damaging wrong answer this module can produce.
+            self._verify_probe_artifact(
+                probe_path, group, scheme, keep_scheme, classifier
+            )
+
             # Measure perplexity
             ppl = self.perplexity_calculator.calculate_perplexity(
                 probe_path, verbose=verbose
@@ -465,6 +566,90 @@ class SensitivityProber:
                         print(f"    Cleaned up {probe_path}")
                 except OSError:
                     pass
+
+    def _verify_probe_artifact(
+        self,
+        probe_path: str,
+        group: str,
+        scheme: str,
+        keep_scheme: str,
+        classifier,
+    ) -> None:
+        """Confirm the probe GGUF actually requantized the group it names.
+
+        A probe's whole claim is "group G was compressed and everything else
+        was not". Nothing downstream re-checks that, so any failure to apply
+        the target scheme -- a tensor-name pattern that misses this
+        architecture, a writer fallback, a config key that never reaches the
+        encoder -- produces a probe numerically identical to the baseline.
+        That reads as "group G is completely insensitive to quantization",
+        which is the most damaging wrong answer this module can emit: the
+        group gets weight 0.0 and the search is then free to crush it.
+
+        The check is exact rather than size-based: read the tensor types back
+        off the artifact and require that no tensor in the probed group is
+        still sitting at the keep scheme's type. Block-size fallbacks to
+        *other* quantized types are tolerated (the writer documents and
+        reports those); staying at full precision is not.
+
+        Raises:
+            ProbeMeasurementError: if the probed group was not requantized.
+                Always raised, in strict mode or not -- an unverified probe
+                is worse than a missing one, because it looks like data.
+        """
+        from gguf import GGUFReader as _UpstreamReader
+
+        keep_type = get_scheme_by_name(keep_scheme).ggml_type_name
+        target_type = get_scheme_by_name(scheme).ggml_type_name
+
+        try:
+            reader = _UpstreamReader(probe_path)
+            tensors = [
+                t for t in reader.tensors
+                if classifier.classify_tensor(t.name) == group
+            ]
+        except Exception as exc:  # unreadable artifact == unusable probe
+            raise ProbeMeasurementError(
+                f"Sensitivity probe for group '{group}' produced an "
+                f"unreadable GGUF ({type(exc).__name__}: {exc})."
+            ) from exc
+
+        if not tensors:
+            raise ProbeMeasurementError(
+                f"Sensitivity probe for group '{group}' contains no tensors "
+                f"classified into that group -- the probe measured nothing. "
+                f"Check TensorGroupClassifier's patterns against this "
+                f"architecture's tensor names."
+            )
+
+        # F32 is the writer's documented floor for 1-D and non-32-divisible
+        # rows; those were never candidates for the target scheme.
+        untouched = [
+            t.name for t in tensors
+            if t.tensor_type.name in (keep_type, "F32", "F16", "BF16")
+            and t.tensor_type.name != target_type
+        ]
+        quantized = len(tensors) - len(untouched)
+
+        if quantized == 0:
+            raise ProbeMeasurementError(
+                f"Sensitivity probe for group '{group}' requested "
+                f"{scheme} ({target_type}) but all {len(tensors)} of the "
+                f"group's tensors are still at full precision "
+                f"({keep_type}/F32/F16). The probe is numerically identical "
+                f"to the baseline, so its perplexity says nothing about "
+                f"'{group}'. Refusing to report it as a measurement. "
+                f"First few: {untouched[:3]}"
+            )
+
+        if untouched:
+            _log.warning(
+                "sensitivity probe for group '%s': %d/%d tensors stayed at "
+                "full precision (expected %s). Probe signal is diluted; "
+                "treat this group's sensitivity as a lower bound. First: %s",
+                group, len(untouched), len(tensors), target_type,
+                untouched[:3],
+            )
 
     def _heuristic_probe(self, group: str, scheme: str) -> float:
         """

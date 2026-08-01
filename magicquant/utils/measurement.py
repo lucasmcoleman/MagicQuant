@@ -21,7 +21,7 @@ baseline) / baseline`` with no validity check), which let a NaN-driven
 project's incident notes for the full root-cause chain.
 """
 
-from typing import Optional
+from typing import Dict, Optional
 
 # Default tolerance when no run-specific measurement error is available:
 # ~5% of baseline PPL.
@@ -84,3 +84,216 @@ def measurement_eps(
         return max(REPORTED_ERR_SIGMAS * reported_err / baseline_ppl,
                    default_relative_eps)
     return default_relative_eps
+
+
+# ---------------------------------------------------------------------------
+# Probe resolution
+# ---------------------------------------------------------------------------
+#
+# The clamp above answers "is this reading physically impossible?". It does
+# NOT answer the question that actually sank the 2026-07 MoE runs: "did this
+# probe measure anything at all?"
+#
+# On Laguna-S every one of nine probes landed within 0.70% of baseline and six
+# came in *below* it. None tripped the 5% impossibility clamp, so
+# ``max(0.0, ppl - baseline)`` silently turned six of them into sensitivity
+# 0.0 -- indistinguishable from "this group is genuinely robust". The three
+# survivors were normalized into a confident-looking weight vector, and the
+# group holding 93.4% of the model's parameters got weight exactly 0.000.
+# Predicted-vs-measured rank correlation for that run was -0.043.
+#
+# Note what the problem is NOT. llama-perplexity is deterministic on a fixed
+# model+corpus+chunk count: re-running Laguna-XS's X probe in 2026-07
+# reproduced its stored reading (PPL 35.2671) to four decimal places. So the
+# probe deltas are EXACT, and a reading below baseline is a real corpus-
+# specific effect, not jitter -- destroying its sign discards information.
+#
+# The problem is ESTIMATOR PRECISION, which is a different thing from
+# reproducibility. llama-perplexity's ``+/- err`` is the spread over chunks:
+# it says what you would get on a *different* sample of text. At 100 chunks
+# that is ~2.2% of baseline, so a 0.4% probe delta is exact but says almost
+# nothing about the model's true sensitivity. The metric has too little
+# dynamic range to rank groups spanning 0.3% to 93% of a model's parameters.
+#
+# This is the argument for probing with KL divergence instead: KL is computed
+# per token against saved reference logits, so its reported error is over
+# ~50k paired samples rather than 100 chunk means, and it is non-negative by
+# construction -- no sign to destroy. Perplexity-mode probing keeps working
+# but is necessarily conservative about what it will call resolved.
+#
+# "No signal" and "zero sensitivity" are different facts and must not share a
+# representation. These three states keep them apart.
+
+PROBE_RESOLVED = "resolved"        # signal is distinguishable from zero
+PROBE_UNRESOLVED = "unresolved"    # inside the noise floor -- no information
+PROBE_IMPLAUSIBLE = "implausible"  # below zero by more than noise -- broken
+
+# Multiple of the reported error a probe signal must clear to count as real.
+# Nine groups are probed per run, so the largest of nine pure-noise readings
+# is expected around 1.5 sigma; a 2-sigma bar would promote that to "signal"
+# more often than not. 3 sigma keeps the per-run false-positive rate low
+# enough that "resolved" means something.
+PROBE_SIGNAL_SIGMAS = 3.0
+
+
+def classify_probe_signal(
+    value: float,
+    err: Optional[float],
+    *,
+    sigmas: float = PROBE_SIGNAL_SIGMAS,
+    fallback_floor: Optional[float] = None,
+) -> str:
+    """Classify one probe reading as resolved / unresolved / implausible.
+
+    Args:
+        value: The probe's signal, oriented so MORE damage is MORE positive
+            and zero means "quantizing this group changed nothing". For a KL
+            probe that is the mean KL divergence; for a perplexity probe it
+            is ``probe_ppl - baseline_ppl``.
+        err: The reading's own reported error -- llama-perplexity prints
+            ``+/- <err>`` for both its final PPL and its mean-KLD lines.
+            *None* means the caller could not obtain one, and
+            *fallback_floor* is used instead.
+        sigmas: How many multiples of *err* the signal must clear.
+        fallback_floor: Absolute threshold used when *err* is unavailable.
+            With neither an error term nor a floor there is no basis on which
+            to call anything resolved, so the reading is reported UNRESOLVED.
+            Deliberately conservative: an unresolved group is merely excluded
+            from the weight vector, whereas a falsely "resolved" one steers
+            the entire search.
+
+    Returns:
+        One of ``PROBE_RESOLVED``, ``PROBE_UNRESOLVED``, ``PROBE_IMPLAUSIBLE``.
+    """
+    if err is not None and err > 0:
+        threshold = sigmas * err
+    elif fallback_floor is not None and fallback_floor > 0:
+        threshold = fallback_floor
+    else:
+        return PROBE_UNRESOLVED
+
+    if value > threshold:
+        return PROBE_RESOLVED
+    if value < -threshold:
+        return PROBE_IMPLAUSIBLE
+    return PROBE_UNRESOLVED
+
+
+def resolution_coverage(
+    resolutions: Dict[str, str],
+    parameter_counts: Optional[Dict[str, int]] = None,
+) -> float:
+    """Fraction of the model whose sensitivity the probes actually resolved.
+
+    Counting *groups* rather than *parameters* is what made the Laguna-S
+    failure look survivable: three of nine groups resolved reads as "a third
+    of the signal", but those three held 2.3% of the weights while the
+    unresolved X held 93.4%. Weighting by parameter mass reports 0.023
+    instead of 0.333, and the run is correctly refused.
+
+    Args:
+        resolutions: ``{group: one of the PROBE_* states}``.
+        parameter_counts: ``{group: parameter count}``. When omitted or
+            empty, groups are counted equally -- better than nothing, but
+            that is exactly the blind spot above, so callers that can supply
+            real counts should.
+
+    Returns:
+        A fraction in [0, 1]; 0.0 when there is nothing to measure.
+    """
+    if not resolutions:
+        return 0.0
+
+    if not parameter_counts:
+        resolved = sum(1 for s in resolutions.values() if s == PROBE_RESOLVED)
+        return resolved / len(resolutions)
+
+    total = sum(parameter_counts.get(g, 0) for g in resolutions)
+    if total <= 0:
+        return 0.0
+    resolved = sum(
+        parameter_counts.get(g, 0)
+        for g, state in resolutions.items()
+        if state == PROBE_RESOLVED
+    )
+    return resolved / total
+
+
+# ---------------------------------------------------------------------------
+# Predictor tracking
+# ---------------------------------------------------------------------------
+#
+# Everything above checks an INPUT to the search. This checks its OUTPUT, and
+# it is the guard that would have caught the 2026-07 failure no matter which
+# layer was at fault.
+#
+# A measured search predicts each candidate's quality loss, then measures some
+# of them. If the predictions carry information, predicted and measured loss
+# should rank candidates similarly. On Laguna-S, Kendall tau over 115
+# predicted/measured pairs was -0.043: the ranking the search optimized was
+# uncorrelated with -- fractionally worse than -- reality. Nothing computed
+# that number at the time, so the run reported success and shipped.
+#
+# Rank correlation is used rather than a fit residual because the search only
+# ever consumes the ORDERING of predictions. A predictor with a large constant
+# bias but the right order is fine; one with small residuals in the wrong
+# order is worthless.
+
+# Below this, predictions carry no usable ordering information. Set at 0.0
+# rather than something positive because the claim being tested is minimal --
+# "better than a coin flip" -- and anything at or below it means the search is
+# not being steered by its own model.
+MIN_USEFUL_TAU = 0.0
+
+# Rank correlation on a handful of pairs is mostly noise; below this many the
+# verdict is "unknown", never "broken".
+MIN_TAU_SAMPLES = 12
+
+
+def predictor_rank_correlation(
+    predicted: "list[float]",
+    measured: "list[float]",
+) -> "tuple[Optional[float], Optional[float]]":
+    """Kendall tau-b between predicted and measured loss, with its p-value.
+
+    Args:
+        predicted: Predicted quality losses.
+        measured: Measured quality losses, index-aligned with *predicted*.
+
+    Returns:
+        ``(tau, p_value)``, or ``(None, None)`` when there are too few pairs
+        or the input is degenerate (e.g. every prediction identical, which
+        makes tau undefined rather than zero).
+    """
+    if len(predicted) != len(measured) or len(predicted) < MIN_TAU_SAMPLES:
+        return None, None
+    if len(set(predicted)) < 2 or len(set(measured)) < 2:
+        return None, None
+
+    from scipy.stats import kendalltau
+
+    result = kendalltau(predicted, measured)
+    tau = float(result.statistic)
+    if tau != tau:  # NaN
+        return None, None
+    return tau, float(result.pvalue)
+
+
+def predictor_is_tracking(
+    predicted: "list[float]",
+    measured: "list[float]",
+    *,
+    min_tau: float = MIN_USEFUL_TAU,
+) -> "tuple[Optional[bool], Optional[float]]":
+    """Is the loss predictor ordering candidates better than chance?
+
+    Returns:
+        ``(verdict, tau)``. *verdict* is True when tau exceeds *min_tau*,
+        False when it does not, and *None* when there is not enough data to
+        judge -- callers must distinguish "not tracking" from "unknown", since
+        only the first is evidence of a broken run.
+    """
+    tau, _ = predictor_rank_correlation(predicted, measured)
+    if tau is None:
+        return None, None
+    return tau > min_tau, tau

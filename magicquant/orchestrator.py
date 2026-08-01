@@ -82,6 +82,11 @@ class MagicQuantOrchestrator:
         # SensitivityProber.weights_degenerate right after probing. See
         # _enforce_probing_signal_gate.
         self.weights_degenerate: bool = False
+        # Set by probing: fraction of the model (by parameter mass) whose
+        # sensitivity was resolved above the measurement's own noise, and the
+        # per-group resolution states behind it.
+        self.resolved_mass_fraction: float = 0.0
+        self.probe_resolutions: Dict[str, str] = {}
         self.predictor: Optional[PredictiveScorer] = None
 
         # Track all measured configs across rounds
@@ -184,7 +189,10 @@ class MagicQuantOrchestrator:
         deliberate re-run against a known-flat/tiny model where a uniform
         weighting is expected, not a symptom of a broken measurement).
         """
-        degenerate = self.probing_provenance == "suspect" or self.weights_degenerate
+        degenerate = (
+            self.probing_provenance in ("suspect", "insufficient")
+            or self.weights_degenerate
+        )
         if not degenerate:
             return
 
@@ -712,11 +720,18 @@ class MagicQuantOrchestrator:
             if verbose:
                 log.info("Sensitivity probing", stage="probing")
 
+            # Populate self._param_counts before probing so the prober can
+            # judge its coverage by parameter MASS rather than group count --
+            # three of nine groups resolving meant 1.6% of the model on
+            # Laguna-S. (Header-only read; Step 3 calls this again for size.)
+            self._estimate_model_size(self.source_model_path)
+
             prober = SensitivityProber(
                 base_model_path=self.source_model_path,
                 baseline_perplexity=self.baseline_ppl,
                 perplexity_calculator=self.llama_tools,
                 output_dir=str(self.output_dir / "_probes"),
+                parameter_counts=self._param_counts,
                 # A MEASURED search must never silently rank candidates on
                 # fabricated (heuristic) sensitivities: a failed probe now
                 # raises ProbeMeasurementError after a retry instead of
@@ -729,6 +744,12 @@ class MagicQuantOrchestrator:
             self.sensitivity_weights = prober.get_normalized_weights()
             self.probing_provenance = prober.probing_provenance
             self.weights_degenerate = prober.weights_degenerate
+            # Fraction of the model, by parameter mass, whose sensitivity the
+            # probes actually resolved. Surfaced so a reader of
+            # search_results.json can tell a search steered by real signal
+            # from one steered by rounding.
+            self.resolved_mass_fraction = prober.resolved_mass_fraction
+            self.probe_resolutions = dict(prober.resolutions)
             prober.save_results(str(self.output_dir / "sensitivity.json"))
 
             if verbose:
