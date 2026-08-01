@@ -352,10 +352,20 @@ class SensitivityProber:
                 "is mostly zeros for the groups that hold the bytes; "
                 "downgrading probing_provenance from %r to 'insufficient' "
                 "so the caller can fall back to incumbents instead of "
-                "optimizing an uninformative objective.",
+                "optimizing an uninformative objective.%s",
                 100 * self.resolved_mass_fraction, len(resolved_groups),
                 total, ",".join(sorted(resolved_groups)) or "none",
                 100 * MIN_RESOLVED_MASS, self.probing_provenance,
+                ""
+                if self.kl_base_logits_path
+                else (
+                    " These probes were scored by PERPLEXITY, whose reported "
+                    "error is the spread over chunk means -- too coarse to "
+                    "resolve a single-group probe at all. Re-run with "
+                    "enable_kl=True to score them by KL divergence instead "
+                    "(~144x the resolution on a measured probe, for one "
+                    "extra base-logits pass)."
+                ),
             )
             if verbose:
                 print(

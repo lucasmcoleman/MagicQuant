@@ -732,6 +732,13 @@ class MagicQuantOrchestrator:
                 perplexity_calculator=self.llama_tools,
                 output_dir=str(self.output_dir / "_probes"),
                 parameter_counts=self._param_counts,
+                # When this run saved reference logits (enable_kl), score
+                # probes by KL divergence instead of perplexity. Perplexity's
+                # error is the spread over chunk means and cannot separate a
+                # single-group probe's effect from zero; KL's is per token.
+                # Measured on one real probe: 79 sigma vs 0.55 sigma.
+                kl_base_logits_path=self._kl_base_logits_path,
+                kl_corpus_path=self._kl_corpus_path,
                 # A MEASURED search must never silently rank candidates on
                 # fabricated (heuristic) sensitivities: a failed probe now
                 # raises ProbeMeasurementError after a retry instead of
