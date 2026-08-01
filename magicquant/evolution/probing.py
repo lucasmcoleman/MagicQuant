@@ -334,8 +334,13 @@ class SensitivityProber:
             })
 
             if verbose:
-                print(f"  Group '{group}': PPL={ppl:.4f}, "
-                      f"Sensitivity={sensitivity:.4f}")
+                # Name the metric that was actually used. In KL mode this
+                # number is a divergence, not a perplexity, and calling it
+                # "PPL" in the log is the same class of mislabelling that
+                # made this module's failure so hard to see.
+                metric = "KLD" if self.kl_base_logits_path else "PPL"
+                print(f"  Group '{group}': {metric}={ppl:.6f}, "
+                      f"Sensitivity={sensitivity:.6f} [{resolution}]")
 
         total = len(groups)
         if measured_count == total:
