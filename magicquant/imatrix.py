@@ -45,10 +45,26 @@ logger = logging.getLogger(__name__)
 _SUM_SUFFIX = ".in_sum2"
 _COUNT_SUFFIX = ".counts"
 
-# Bundled default calibration corpus — a few KB of neutral, diverse English
-# prose. Good enough for a general-purpose imatrix when the caller doesn't
-# have a domain-specific corpus on hand.
+# Bundled default calibration corpus — ~1 MB blended from
+# eaddario/imatrix-calibration (MIT): 45% multilingual prose across 18
+# languages, 20% code, 20% math, 15% agentic requests. Rebuild with
+# tools/build_calib_corpus.py, which also asserts it stays disjoint from the
+# wikitext eval corpus (currently 0.00000% shared 8-grams).
+#
+# It replaced a 13 KB English-only corpus that yielded ~5 chunks at ctx 512 --
+# far too thin to estimate importance for a 27B's ~866 tensors, and with no
+# non-Latin coverage at all, which matters because a 248k-token vocab
+# calibrated on English alone leaves most embedding/head rows weighted at
+# ~zero.
 DEFAULT_CORPUS_PATH = Path(__file__).resolve().parent / "data" / "calib_corpus.txt"
+
+# Chunks to capture when the caller doesn't say. NOT -1 (whole corpus): the
+# bundled corpus holds ~580 chunks, and capture costs roughly one perplexity
+# pass per chunk-batch, so the whole thing would run ~1.5-2 h on a 27B for
+# importance estimates that stop improving well before that. 200 chunks
+# (~102k tokens) matches common llama.cpp practice and costs ~35-40 min once
+# per model, cached thereafter. Pass chunks=-1 to use everything.
+DEFAULT_CAPTURE_CHUNKS = 200
 
 
 def capture_imatrix(
@@ -237,7 +253,7 @@ def ensure_imatrix(
     *,
     corpus_path: Optional[Union[str, Path]] = None,
     cache_dir: Optional[Union[str, Path]] = None,
-    chunks: int = -1,
+    chunks: int = DEFAULT_CAPTURE_CHUNKS,
     ctx_size: int = 512,
     imatrix_bin: Optional[str] = None,
     timeout: Optional[float] = None,

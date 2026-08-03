@@ -285,6 +285,31 @@ class MagicQuantOrchestrator:
                 if sibling.exists():
                     kwargs["imatrix_bin"] = str(sibling)
 
+        # Never calibrate on the text the run is SCORED against. Doing so
+        # tunes quantization to the eval set and every measured_loss comes
+        # back optimistic with nothing in the output hinting why. The two
+        # default to different corpora, but nothing enforced it until now --
+        # one imatrix_corpus pointed at wikitext would silently invalidate a
+        # whole search's numbers.
+        if corpus_path is not None:
+            try:
+                cal = Path(corpus_path).resolve()
+                tools = self.llama_tools
+                pinned = getattr(tools, "_pinned_corpus", None) if tools else None
+                if pinned and Path(pinned).resolve() == cal:
+                    log.error(
+                        "refusing imatrix: the calibration corpus is the same "
+                        "file as the perplexity eval corpus, which would make "
+                        "every measured loss optimistic. Point imatrix_corpus "
+                        "at different text, or leave it unset for the bundled "
+                        "default.",
+                        stage="imatrix", corpus=str(cal),
+                    )
+                    self._imatrix = None
+                    return False
+            except (OSError, ValueError):
+                pass    # unresolvable path: let ensure_imatrix report it
+
         self._imatrix = ensure_imatrix(
             self.source_model_path, corpus_path=corpus_path, **kwargs
         )

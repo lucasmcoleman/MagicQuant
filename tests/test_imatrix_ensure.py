@@ -47,7 +47,12 @@ def test_ensure_imatrix_cache_hit_skips_capture(tmp_path, monkeypatch):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     corpus = imatrix.DEFAULT_CORPUS_PATH
-    key = imatrix._imatrix_cache_key(source, corpus, ctx_size=512, chunks=-1)
+    # Track the module default rather than a literal: `chunks` is part of the
+    # cache key, so hardcoding -1 here made this test a cache MISS the moment
+    # ensure_imatrix stopped defaulting to whole-corpus capture.
+    key = imatrix._imatrix_cache_key(
+        source, corpus, ctx_size=512, chunks=imatrix.DEFAULT_CAPTURE_CHUNKS
+    )
     cache_path = cache_dir / f"{key}.imatrix.gguf"
     cache_path.write_bytes(b"pre-existing cached imatrix gguf")
 
