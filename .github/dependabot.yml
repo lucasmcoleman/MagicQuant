@@ -1,0 +1,31 @@
+version: 2
+
+# Dependabot covers the boring half of staying current: version bumps for
+# things already depended on. It does NOT notice new llama.cpp quant types or
+# model architectures -- that is what .github/workflows/upstream-watch.yml is
+# for. The two are complementary, not redundant.
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    groups:
+      # gguf and llama-cpp-python move together with llama.cpp releases, and a
+      # split PR pair would test each against the other's old version.
+      llamacpp:
+        patterns:
+          - "gguf"
+          - "llama-cpp-python"
+    commit-message:
+      prefix: "deps"
+
+  # A stale actions/checkout is how workflows start warning and then failing.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"

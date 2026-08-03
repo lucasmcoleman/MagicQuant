@@ -38,7 +38,13 @@ dependencies = [
 yaml = ["pyyaml>=6.0"]
 # huggingface_hub is only needed for `magicquant card --upload`.
 hf = ["huggingface_hub>=0.20.0"]
-dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0", "ruff>=0.5.0"]
+# scipy and pyyaml sit in dev, not core, because each backs one optional thing:
+# scipy is used by a single DIAGNOSTIC (predictor_rank_correlation's Kendall
+# tau, which degrades gracefully without it) and pyyaml by the workflow-file
+# guard. Their TESTS cannot degrade, so CI needs both -- without this, the
+# suite is 3 red every run.
+dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0", "ruff>=0.5.0",
+       "scipy>=1.10.0", "pyyaml>=6.0"]
 # Quantization-Aware Training (QAT-LoRA). Heavy training stack — only needed for
 # `magicquant qat`; the core install is unchanged. torch must be the build that
 # works on this box (ROCm/CPU); install the matching wheel as appropriate.

@@ -23,6 +23,10 @@ project's incident notes for the full root-cause chain.
 
 from typing import Dict, Optional
 
+from magicquant.logging import get_logger
+
+log = get_logger(__name__)
+
 # Default tolerance when no run-specific measurement error is available:
 # ~5% of baseline PPL.
 #
@@ -270,7 +274,21 @@ def predictor_rank_correlation(
     if len(set(predicted)) < 2 or len(set(measured)) < 2:
         return None, None
 
-    from scipy.stats import kendalltau
+    try:
+        from scipy.stats import kendalltau
+    except ImportError:
+        # scipy backs this one diagnostic and lives in the [dev] extra, not the
+        # core deps. A measured search runs for hours; forfeiting it to a
+        # missing optional import at the reporting step would be absurd.
+        # (None, None) is the documented "could not compute" return that every
+        # caller already handles.
+        log.warning(
+            "scipy is not installed, so predictor rank correlation cannot be "
+            "computed. The search itself is unaffected -- only this diagnostic "
+            "is skipped. Install the [dev] extra to enable it.",
+            stage="measurement",
+        )
+        return None, None
 
     result = kendalltau(predicted, measured)
     tau = float(result.statistic)

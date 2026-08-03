@@ -1,0 +1,108 @@
+name: Upstream Watch
+
+# Keeps MagicQuant honest about llama.cpp moving underneath it, so a new model
+# release is not discovered by a conversion failing at 2am.
+#
+# Two independent things are checked, because they fail differently:
+#
+#   1. Do the tests still pass against the LATEST gguf / llama-cpp-python,
+#      rather than whatever versions happen to be pinned? ggml_facts derives
+#      block and type sizes from the installed gguf package at import time, so
+#      an upstream change lands in MagicQuant's behaviour immediately -- this
+#      is the job that notices.
+#   2. Has upstream gained quant types or model architectures MagicQuant cannot
+#      use yet? Reported as a DELTA against tools/upstream_baseline.json, so the
+#      output stays short enough to actually read.
+#
+# Findings open (or update) a single tracking issue rather than emailing a
+# failed run, because a red X on a scheduled job is exactly the signal that
+# went ignored for 61 consecutive runs when ci.yml could not parse.
+
+on:
+  schedule:
+    # Mondays 06:17 UTC. Off the hour on purpose: :00 is the busiest slot on
+    # GitHub's scheduler and delays are common there.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  # Also run when the dependency floor moves, since that is the other way
+  # upstream enters the project.
+  push:
+    paths:
+      - "pyproject.toml"
+      - "tools/check_upstream_drift.py"
+      - ".github/workflows/upstream-watch.yml"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  latest-deps:
+    name: Tests against latest upstream
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ job.status }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: "Install with the newest gguf / llama-cpp-python"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install --upgrade gguf llama-cpp-python
+          python -c "from importlib.metadata import version as v; \
+                     print('gguf', v('gguf')); \
+                     print('llama-cpp-python', v('llama-cpp-python'))"
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+  drift:
+    name: Upstream drift report
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install --upgrade gguf
+
+      - name: Check for new upstream types and architectures
+        id: drift
+        run: |
+          set +e
+          python tools/check_upstream_drift.py > drift.txt 2>&1
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          cat drift.txt
+          {
+            echo 'report<<DRIFT_EOF'
+            cat drift.txt
+            echo 'DRIFT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the tracking issue
+        if: steps.drift.outputs.exit_code == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPORT: ${{ steps.drift.outputs.report }}
+        run: |
+          TITLE="Upstream drift: new llama.cpp types or architectures"
+          BODY=$(printf '%s\n\n---\n\nFound by `tools/check_upstream_drift.py` on %s.\n\nRun `python tools/check_upstream_drift.py --update-baseline` once reviewed to stop reporting these.\n' "$REPORT" "$(date -u +%Y-%m-%d)")
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+            echo "commented on existing issue #$EXISTING"
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label upstream 2>/dev/null \
+              || gh issue create --title "$TITLE" --body "$BODY"
+          fi

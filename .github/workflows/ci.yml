@@ -18,7 +18,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install (with dev extras: pytest + gguf + ruff)
+      # Quoted deliberately: an unquoted YAML scalar cannot contain ": ".
+      # Without the quotes this line made the entire file unparseable, so
+      # GitHub never scheduled a single job -- 61 consecutive runs completed
+      # in 0s reporting "workflow file issue", which reads like transient
+      # infrastructure trouble rather than a syntax error on this line.
+      # tests/test_workflow_files_parse.py now guards against a repeat.
+      - name: "Install (with dev extras: pytest + gguf + ruff)"
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
