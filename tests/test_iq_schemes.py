@@ -13,6 +13,7 @@ import pytest
 
 from magicquant.quant.schemes import (
     get_scheme_by_name, get_all_schemes, IQ_SCHEME_NAMES,
+    IMATRIX_DEPENDENT_SCHEME_NAMES,
 )
 from magicquant.evolution.predictor import PredictiveScorer
 from magicquant.evolution.survival import EvolutionarySurvivor
@@ -144,10 +145,62 @@ def test_requires_imatrix_schemes_never_sampled_regardless_of_enable_iq():
 # yielding it.
 
 def test_downgrade_neighbor_walk_never_yields_requires_imatrix_scheme():
-    # IQ2_S -> IQ2_XS (requires_imatrix=True): must be closed off, not walked.
-    assert EvolutionarySurvivor._downgrade("IQ2_S") is None
-    # IQ1_M -> IQ1_S (requires_imatrix=True): same.
-    assert EvolutionarySurvivor._downgrade("IQ1_M") is None
+    # Now an instance method: the walk consults self.has_imatrix to decide
+    # whether imatrix-DEPENDENT schemes are skippable. requires_imatrix
+    # behaviour is unchanged and independent of that flag, so assert both.
+    for has_imatrix in (False, True):
+        s = _survivor(enable_iq=True, has_imatrix=has_imatrix)
+        # IQ2_S -> IQ2_XS (requires_imatrix=True): closed off, not walked.
+        assert s._downgrade("IQ2_S") is None
+        # IQ1_M -> IQ1_S (requires_imatrix=True): same.
+        assert s._downgrade("IQ1_M") is None
+
+
+# ── imatrix-DEPENDENT scheme gate (IQ4_NL) ───────────────────────────────────
+#
+# Distinct from requires_imatrix: IQ4_NL encodes fine unweighted, it just
+# loses. It measured 3-20x worse than same-bpw alternatives across 11
+# candidates on two 27B models (see IMATRIX_DEPENDENT_SCHEME_NAMES for the
+# data). It sits mid-chain (Q5_K <-> IQ4_NL <-> MXFP4_MOE), so the neighbour
+# walk must route AROUND it rather than stop, or Q5_K loses its downgrade.
+
+def test_imatrix_dependent_scheme_not_sampled_without_imatrix():
+    random.seed(7)
+    np.random.seed(7)
+    groups = ["E", "H", "Q", "K", "O", "U", "D", "X"]
+    configs = _survivor(enable_iq=False, has_imatrix=False).run_evolution(
+        groups=groups, verbose=False)
+    used = _all_schemes_used(configs)
+    assert not (used & IMATRIX_DEPENDENT_SCHEME_NAMES), (
+        f"imatrix-dependent scheme sampled without an imatrix: "
+        f"{used & IMATRIX_DEPENDENT_SCHEME_NAMES}"
+    )
+
+
+def test_imatrix_dependent_scheme_available_with_imatrix():
+    random.seed(7)
+    np.random.seed(7)
+    groups = ["E", "H", "Q", "K", "O", "U", "D", "X"]
+    configs = _survivor(enable_iq=False, has_imatrix=True).run_evolution(
+        groups=groups, verbose=False)
+    used = _all_schemes_used(configs)
+    assert used & IMATRIX_DEPENDENT_SCHEME_NAMES, (
+        "IQ4_NL should be reachable again once an imatrix is available"
+    )
+
+
+def test_neighbour_walk_routes_around_imatrix_dependent_scheme():
+    """The ladder must stay connected: skip IQ4_NL, do not truncate at it."""
+    no_im = _survivor(enable_iq=False, has_imatrix=False)
+    # Q5_K -> IQ4_NL -> MXFP4_MOE: land on MXFP4_MOE, never IQ4_NL, and never
+    # None (which would strand Q5_K with no downgrade at all).
+    assert no_im._downgrade("Q5_K") == "MXFP4_MOE"
+    # MXFP4_MOE -> IQ4_NL -> Q5_K, the same edge walked upward.
+    assert no_im._upgrade("MXFP4_MOE") == "Q5_K"
+    # With an imatrix the untouched chain is restored.
+    with_im = _survivor(enable_iq=False, has_imatrix=True)
+    assert with_im._downgrade("Q5_K") == "IQ4_NL"
+    assert with_im._upgrade("MXFP4_MOE") == "IQ4_NL"
 
 
 def test_mutation_leak_closed_across_full_evolution_run():

@@ -535,11 +535,40 @@ ROCMFPX_SCHEME_NAMES = frozenset({"ROCMFP8", "ROCMFP6", "ROCMFP4", "ROCMFP3"})
 LEGACY_Q4_SCHEME_NAMES = frozenset({"Q4_0", "Q4_1"})
 
 # Sub-4-bit IQ scheme names (opt-in; excluded from the default search pool).
-# Deliberately does NOT include IQ4_NL, which is an existing default-pool
-# scheme (see IQ4_NL above) and must stay sampled by default.
+# Deliberately does NOT include IQ4_NL, which is gated separately by
+# IMATRIX_DEPENDENT_SCHEME_NAMES below -- on imatrix availability rather than
+# the enable_iq opt-in, since its problem is calibration, not bit width.
 IQ_SCHEME_NAMES = frozenset({
     "IQ4_XS", "IQ3_S", "IQ3_XXS", "IQ2_S", "IQ2_XS", "IQ2_XXS", "IQ1_M", "IQ1_S",
 })
+
+# Schemes that are only COMPETITIVE with an importance matrix. Distinct from
+# `requires_imatrix` (cannot encode at all without one) and from `uses_imatrix`
+# (will consume one if offered -- true of every K-quant, all of which are fine
+# without). These encode fine unweighted, they just lose, so they are dropped
+# from the search pool when no imatrix is in play: every candidate spent on one
+# is a wasted measurement.
+#
+# IQ4_NL, measured 2026-08-03 over 11 candidates on two 27B models with
+# use_imatrix=false -- ThinkingCap on GPU and FableFusion on CPU, so neither a
+# kernel nor a hardware artifact:
+#
+#     U=Q5_K       0.0036             U=MXFP4_MOE  0.0009, 0.0184
+#     U=Q6_K       0.0021, 0.0075     U=IQ4_NL     0.0149, 0.0223, 0.0240,
+#                                                  0.0335, 0.0336
+#
+# It never won a comparison. The cleanest case had IQ4_NL as the ONLY low-bit
+# group (loss 0.0149) losing 16x to a config with TWO low-bit groups (0.0009).
+# Ruled out: corrupt block/type metadata (all match the upstream gguf package),
+# a bad HIP kernel (CPU and GPU agree), and config confounding (case above).
+#
+# Cause: its non-linear lookup places levels to minimise UNWEIGHTED error when
+# no imatrix is supplied. In isolation that wins the metric it optimises --
+# IQ4_NL round-trips real ffn_up weights at 0.051 relative RMS vs MXFP4's
+# 0.101 -- and loses badly on the one that matters. This contradicts the
+# "Lower noise than Q4_K_M" comment above the IQ4_NL definition and its
+# noise_factor=3.8, both of which silently assume calibration.
+IMATRIX_DEPENDENT_SCHEME_NAMES = frozenset({"IQ4_NL"})
 
 # Group-class floors: minimum acceptable scheme per group class.
 # "sensitive" (E, H, O, R) shouldn't go below Q8_0; "robust" (U, D, X)

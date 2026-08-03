@@ -8,6 +8,16 @@ default (seed_configs=None) path is byte-identical to the pre-existing
 seed-pinned refactor-regression fixture -- verified by re-running that exact
 fixture (not just a similar-looking search) before and after this feature
 exists.
+
+NOTE (2026-08-03): the fixture was deliberately re-pinned when IQ4_NL was
+gated behind imatrix availability (see IMATRIX_DEPENDENT_SCHEME_NAMES).
+Removing IQ4_NL from the sampling pool and from two initial seeds shifts the
+RNG draw sequence, so the trajectory diverges and the diff is far wider than
+the IQ4_NL entries alone: 13 -> 17 configs, with 4 of the 8 removed containing
+IQ4_NL outright and the remainder downstream divergence. That was verified
+before re-pinning rather than assumed. This fixture guards UNINTENDED drift
+from the new baseline; the invariant that actually matters is pinned directly
+by test_iq_schemes.py::test_imatrix_dependent_scheme_not_sampled_without_imatrix.
 """
 import json
 import random

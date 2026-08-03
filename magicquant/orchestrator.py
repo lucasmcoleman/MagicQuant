@@ -825,6 +825,10 @@ class MagicQuantOrchestrator:
                 epsilon=0.2,
                 enable_rocmfpx=enable_rocmfpx,
                 enable_iq=enable_iq,
+                # Derived from the LOADED imatrix, not the use_imatrix request:
+                # capture degrades gracefully (see enable_imatrix above), so a
+                # requested-but-missing imatrix must not unlock IQ4_NL.
+                has_imatrix=self._imatrix is not None,
                 head_aggressive=head_aggressive,
                 stream_aware=stream_aware,
                 objective_weights=objective_weights,
@@ -1930,6 +1934,7 @@ class MagicQuantOrchestrator:
             epsilon=0.2,
             enable_rocmfpx=enable_rocmfpx,
             enable_iq=enable_iq,
+            has_imatrix=self._imatrix is not None,
             head_aggressive=head_aggressive,
             stream_aware=stream_aware,
             objective_weights=self._build_objective_weights(speed_weight),

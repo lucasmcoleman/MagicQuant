@@ -18,7 +18,8 @@ import random
 import copy
 
 from magicquant.quant.schemes import (
-    get_all_schemes, get_scheme_by_name, get_floor_for_group_class
+    get_all_schemes, get_scheme_by_name, get_floor_for_group_class,
+    IMATRIX_DEPENDENT_SCHEME_NAMES,
 )
 from magicquant.quant.tiers import classify_tier
 from magicquant.logging import get_logger
@@ -52,48 +53,51 @@ class EvolutionarySurvivor:
 
     DEFAULT_GROUPS = ['E', 'H', 'Q', 'K', 'O', 'U', 'D']
 
-    @staticmethod
-    def _upgrade(scheme: str) -> Optional[str]:
-        """Return the next-better scheme, or None if at the top.
+    def _walk(self, scheme: str, attr: str) -> Optional[str]:
+        """Follow the up/downgrade chain one usable step, or None at the end.
 
-        Neighbor walks never land on a requires_imatrix scheme: the search
-        threads no imatrix, so a mutant that adopts one would hard-error the
-        GGUF writer's Pass-1 gate at encode time. This mirrors the filter
-        already applied in _generate_random_config; here it treats a
-        requires_imatrix neighbor as end-of-chain instead of dropping it
-        from a pool.
+        Two different exclusions, handled differently on purpose:
+
+        * ``requires_imatrix`` -> END OF CHAIN. Such a scheme cannot encode at
+          all without an imatrix, and neither can anything reachable only
+          through it, so stopping is correct.
+        * ``IMATRIX_DEPENDENT_SCHEME_NAMES`` (IQ4_NL) when this search has no
+          imatrix -> SKIP OVER IT. IQ4_NL sits mid-chain
+          (Q5_K <-> IQ4_NL <-> MXFP4_MOE), so treating it as end-of-chain
+          would strand Q5_K with no downgrade and MXFP4_MOE with no upgrade.
+          Routing around it keeps the ladder connected while never landing on
+          a scheme that has lost every measured comparison uncalibrated.
         """
-        try:
-            neighbor = get_scheme_by_name(scheme).upgrade_neighbor
-        except ValueError:
-            return None
-        if neighbor is not None:
+        from magicquant.quant.schemes import IMATRIX_DEPENDENT_SCHEME_NAMES
+
+        seen = {scheme}
+        current = scheme
+        while True:
+            try:
+                neighbor = getattr(get_scheme_by_name(current), attr)
+            except ValueError:
+                return None
+            if neighbor is None or neighbor in seen:
+                return None
             try:
                 if get_scheme_by_name(neighbor).requires_imatrix:
                     return None
             except ValueError:
-                pass
-        return neighbor
+                return neighbor
+            if (not self.has_imatrix
+                    and neighbor in IMATRIX_DEPENDENT_SCHEME_NAMES):
+                seen.add(neighbor)
+                current = neighbor          # step over, keep the same direction
+                continue
+            return neighbor
 
-    @staticmethod
-    def _downgrade(scheme: str) -> Optional[str]:
-        """Return the next-smaller scheme, or None if at the bottom.
+    def _upgrade(self, scheme: str) -> Optional[str]:
+        """Return the next-better usable scheme, or None if at the top."""
+        return self._walk(scheme, "upgrade_neighbor")
 
-        See _upgrade's docstring: a requires_imatrix neighbor is treated as
-        end-of-chain so mutation can never produce a config the writer would
-        reject for lack of an imatrix.
-        """
-        try:
-            neighbor = get_scheme_by_name(scheme).downgrade_neighbor
-        except ValueError:
-            return None
-        if neighbor is not None:
-            try:
-                if get_scheme_by_name(neighbor).requires_imatrix:
-                    return None
-            except ValueError:
-                pass
-        return neighbor
+    def _downgrade(self, scheme: str) -> Optional[str]:
+        """Return the next-smaller usable scheme, or None if at the bottom."""
+        return self._walk(scheme, "downgrade_neighbor")
 
     # Groups that are sensitive to quantization ("brain" layers)
     _HIGH_SENSITIVITY = {'E', 'H', 'O', 'R'}
@@ -124,6 +128,7 @@ class EvolutionarySurvivor:
         epsilon: float = 0.2,
         enable_rocmfpx: bool = False,
         enable_iq: bool = False,
+        has_imatrix: bool = False,
         head_aggressive: bool = False,
         stream_aware: bool = False,
         objective_weights: Optional[Tuple[float, float, float]] = None,
@@ -145,6 +150,13 @@ class EvolutionarySurvivor:
         # unchanged. Schemes with requires_imatrix=True are ALWAYS excluded
         # regardless of this flag (the search threads no imatrix).
         self.enable_iq = enable_iq
+        # Whether this search actually has an importance matrix to encode with.
+        # Gates IMATRIX_DEPENDENT_SCHEME_NAMES (IQ4_NL): those encode fine
+        # without one but consistently lose, so they are only worth sampling
+        # when the calibration they are designed around is present. Defaults
+        # False, which is the honest default -- the search threads no imatrix
+        # unless the caller says otherwise.
+        self.has_imatrix = has_imatrix
         # When True, random-config sampling for the 'H' (output.weight /
         # LM head) group ONLY is reweighted toward the smaller K-quants
         # (Q6_K/Q5_K/Q8_0) and away from BF16 -- output.weight streams in
@@ -358,8 +370,14 @@ class EvolutionarySurvivor:
         mxfp4_max['H'] = "BF16"
         population.append({'config': mxfp4_max})
 
-        # Seed 3: MXFP4 FFN with IQ4_NL attention
-        mxfp4_iq4 = {g: "IQ4_NL" for g in groups}
+        # Seed 3: MXFP4 FFN with aggressively-quantized attention.
+        # Uses IQ4_NL only when an imatrix is available; otherwise Q4_K_M,
+        # which is the same 4.5 bpw and the best-measuring 4-bit scheme
+        # uncalibrated (see IMATRIX_DEPENDENT_SCHEME_NAMES). Substituting
+        # rather than dropping keeps the seed's purpose -- a cheap-attention
+        # reference point -- instead of leaving that region unseeded.
+        attn_cheap = "IQ4_NL" if self.has_imatrix else "Q4_K_M"
+        mxfp4_iq4 = {g: attn_cheap for g in groups}
         mxfp4_iq4['E'] = "BF16"
         mxfp4_iq4['H'] = "BF16"
         mxfp4_iq4['U'] = "MXFP4_MOE"
@@ -375,8 +393,15 @@ class EvolutionarySurvivor:
         high_contrast['D'] = "MXFP4_MOE"
         population.append({'config': high_contrast})
 
-        # Seed 5: Uniform schemes for reference
-        for scheme in ["Q6_K", "Q5_K", "IQ4_NL", "MXFP4_MOE"]:
+        # Seed 5: Uniform schemes for reference. A uniform IQ4_NL reference is
+        # pointless when IQ4_NL is excluded from the pool, so it is dropped
+        # rather than substituted -- Q4_K_M's uniform point is already covered
+        # by the sampler's floor for robust groups.
+        _uniform = ["Q6_K", "Q5_K", "IQ4_NL", "MXFP4_MOE"]
+        if not self.has_imatrix:
+            _uniform = [s for s in _uniform
+                        if s not in IMATRIX_DEPENDENT_SCHEME_NAMES]
+        for scheme in _uniform:
             population.append({'config': {g: scheme for g in groups}})
 
         # Seed 5b (opt-in): ROCmFPX-native seeds so the AMD family starts near
@@ -519,7 +544,7 @@ class EvolutionarySurvivor:
         """
         from magicquant.quant.schemes import (
             get_all_schemes, ROCMFPX_SCHEME_NAMES, IQ_SCHEME_NAMES,
-            LEGACY_Q4_SCHEME_NAMES,
+            LEGACY_Q4_SCHEME_NAMES, IMATRIX_DEPENDENT_SCHEME_NAMES,
         )
 
         config: Dict[str, str] = {}
@@ -541,6 +566,15 @@ class EvolutionarySurvivor:
         # search threads no imatrix, so encoding one would hard-error the
         # writer. This applies regardless of enable_iq.
         all_schemes = [s for s in all_schemes if not s.requires_imatrix]
+        if not self.has_imatrix:
+            # Imatrix-DEPENDENT schemes (IQ4_NL) encode fine unweighted but
+            # measured 3-20x worse than same-bpw alternatives across 11
+            # candidates on two models -- see IMATRIX_DEPENDENT_SCHEME_NAMES.
+            # Sampling them without calibration only burns measurements.
+            all_schemes = [
+                s for s in all_schemes
+                if s.name not in IMATRIX_DEPENDENT_SCHEME_NAMES
+            ]
 
         for g in groups:
             if self.stream_aware and g in self._STREAM_AWARE_GROUPS:
