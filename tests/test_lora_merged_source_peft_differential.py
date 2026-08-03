@@ -39,8 +39,14 @@ import struct
 
 import numpy as np
 import pytest
-import torch
-from torch import nn
+
+# torch comes from the heavy [qat] extra, which CI does not install. A bare
+# `import torch` here raised at COLLECTION time, and a collection error aborts
+# the entire pytest run rather than skipping one module -- so this single line
+# failed the whole suite on every Python version the moment CI could actually
+# parse its workflow file. Guard it the way test_qat_train.py already does.
+torch = pytest.importorskip("torch")
+nn = torch.nn
 
 peft = pytest.importorskip("peft")
 from peft import LoraConfig, get_peft_model  # noqa: E402
