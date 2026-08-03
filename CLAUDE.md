@@ -156,6 +156,33 @@ containing these types load only on the fork, not stock llama.cpp.
 
 ## Critical Invariants
 
+- **A tier is a SIZE BAND, not a recipe.** A "Q5" is whatever mix of schemes
+  landed in the Q5 band with the lowest measured loss; it may contain zero
+  Q5_K tensors. Bands come from `quant/tiers.py` (`classify_tier`,
+  `TIER_BOUNDARIES`) as a ratio to the BF16 baseline. Never grade a build by
+  which schemes it contains — size and measured quality are the only criteria.
+  Four published models once shipped a uniform Q6_K labelled "Q5" because the
+  v1 Q5 band ran to ratio 0.45; `tools/reselect_tiers.py` re-derives a finished
+  run's ladder from stored measurements to catch this.
+- **Three distinct imatrix relationships**, and conflating them breaks things:
+  `requires_imatrix` (cannot encode without one — IQ1/IQ2 family, never
+  sampled), `uses_imatrix` (consumes one if offered — true of every K-quant,
+  all fine without), and `IMATRIX_DEPENDENT_SCHEME_NAMES` (encodes fine but only
+  COMPETITIVE with one). IQ4_NL is the third case: without calibration it lost
+  all 11 measured comparisons across two 27B models, 3-20x worse than same-bpw
+  MXFP4/Q4_K_M, despite *better* isolated weight-reconstruction error (0.051 vs
+  MXFP4's 0.101 relative RMS) — its lookup table places levels to minimise
+  UNWEIGHTED error, optimising a metric perplexity does not care about.
+  Filtering on `uses_imatrix` would wrongly drop Q4_K_M/Q5_K/Q6_K too.
+- **The neighbour walk SKIPS imatrix-dependent schemes, it does not stop at
+  them.** IQ4_NL sits mid-chain (Q5_K <-> IQ4_NL <-> MXFP4_MOE), so the
+  end-of-chain treatment used for `requires_imatrix` would strand Q5_K with no
+  downgrade and MXFP4_MOE with no upgrade.
+- **The calibration corpus must never be the perplexity eval corpus.**
+  Calibrating on the text a run is scored against makes every measured loss
+  optimistic with nothing in the output showing it. `enable_imatrix` refuses
+  when both resolve to the same file; `tools/build_calib_corpus.py` asserts
+  disjointness when rebuilding (currently 0.00000% shared 8-grams).
 - **MXFP4 is ggml type 39** — native llama.cpp support. Never use a custom type ID.
 - **converters.py is the single encoder source** — writer.py must not contain quantization logic.
 - **Shapes are stored row-major** in ModelSource (same as GGUFReader convention). The writer reverses to ggml on-disk order. SafetensorsSource must NOT pre-reverse.

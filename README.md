@@ -19,7 +19,7 @@ The core insight from the original research: the vast majority of parameters in 
 BF16 Source Model
      |
      v
-[1. Sensitivity Probing] — Quantize one group at a time, measure PPL impact
+[1. Sensitivity Probing] — Quantize one group at a time, measure KL divergence
      |
      v
 [2. Evolutionary Search] — Discover optimal hybrid configs per compression tier
@@ -32,6 +32,21 @@ BF16 Source Model
   Q5: E:BF16 H:BF16 Q:Q8 K:BF16 O:BF16 U:MXFP4 D:MXFP4 (29 GB from 60 GB)
   Q6: E:BF16 H:BF16 Q:Q6K K:Q8 O:BF16 U:BF16 D:Q8       (44 GB from 60 GB)
 ```
+
+**A tier name is a size band, not a recipe.** Note above that the "Q4" config
+contains no Q4 tensors at all, and the "Q6" contains BF16 and Q8. A tier is
+whatever mix of schemes landed in that size band with the lowest measured loss.
+Grading a build by whether it "contains N-bit tensors" is a category error;
+size and measured quality are the only criteria. Bands are defined in
+`quant/tiers.py` as ratios to the BF16 baseline, and `tools/reselect_tiers.py`
+re-derives a finished run's ladder from its stored measurements.
+
+Probes score by **KL divergence against saved reference logits**, not
+perplexity. Perplexity cannot resolve a single-group probe: the change is far
+below run-to-run noise, so probes came back undifferentiated and normalization
+then flattened them to zero — on one MoE model the expert group, 93% of all
+parameters, ended up with sensitivity weight exactly 0.000. KL measures the
+same perturbation at roughly 79 sigma instead of 0.55.
 
 ### Tensor Groups
 
@@ -248,9 +263,23 @@ make clean   # Remove build artifacts
 
 ## Known Limitations
 
-- K-quant encoders use simple min/max with RMSE optimization, not llama.cpp's full importance-matrix-weighted quantization
 - Tokenizer reading only handles BPE (tokenizer.json); SentencePiece (.model) is not supported
 - Source models must be BF16/F16/F32 — pre-quantized sources are rejected with a clear error
+- `IQ4_NL` is excluded from the search pool when no importance matrix is
+  available. Uncalibrated it lost all 11 measured comparisons across two 27B
+  models (3-20x worse than same-bpw MXFP4/Q4_K_M) despite *better* isolated
+  weight-reconstruction error, because its lookup table places levels to
+  minimise unweighted error. With an imatrix it is sampled normally.
+
+> Encoding is byte-identical to llama.cpp — MagicQuant calls libggml directly
+> rather than reimplementing the encoders, so there is no MSE quality gap.
+> Importance-matrix weighting is supported and **on by default**: the bundled
+> calibration corpus is ~1 MB spanning 18 languages plus code, math and agentic
+> prompts, capture is bounded to 200 chunks, and the result is cached per model.
+> The corpus is verified disjoint from the perplexity eval corpus, and
+> calibration is refused outright if the two ever resolve to the same file —
+> scoring a run on the text it was calibrated against would make every measured
+> loss optimistic with nothing in the output revealing it.
 
 ## License
 
