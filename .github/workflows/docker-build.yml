@@ -16,7 +16,7 @@ jobs:
   docker-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build docker/Dockerfile image (smoke test)
         run: docker build -f docker/Dockerfile -t magicquant:ci-smoke .
