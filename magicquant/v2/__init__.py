@@ -15,3 +15,4 @@ from magicquant.v2.outcome import (  # noqa: F401
     BudgetInfeasibleError,
 )
 from magicquant.v2.search import V2Config, run_budget_search  # noqa: F401
+from magicquant.v2.interchange import budget_tier_key, write_interchange_block  # noqa: F401

@@ -392,6 +392,10 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
     }
 
     _atomic_write_json(out_dir / "v2_results.json", results)
+
+    from magicquant.v2.interchange import write_interchange_block
+    write_interchange_block(out_dir / "search_results.json", results)
+
     _atomic_write_json(out_dir / "frontier.json", {
         "budget_bytes": budget_bytes,
         "kappa": kappa,
