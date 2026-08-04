@@ -147,6 +147,14 @@ scheme-by-group, hyperparams, config hash) are written to `--out`. Merge the
 adapters, then pack the exact hybrid with `magicquant generate`. In Foundry this
 is surfaced as the **QAT** pipeline stage (toggle + config + live logs).
 
+> **Budget builds interoperate here too.** `search --algo v2 --budget-gb <N>`
+> now also merges a `BUDGET-<N>GiB` pseudo-tier into `search_results.json`,
+> carrying a per-group projection alongside the exact per-tensor allocation.
+> So `--tier BUDGET-<N>GiB` works with QAT unchanged, and Foundry's ROCmFPX
+> `mq-budget` mode consumes the same block — no separate interchange format.
+> The merge is additive: an existing file's Q4/Q5/Q6 tiers are left untouched,
+> and a legacy file without a version stamp does not gain one.
+
 **Validated result.** In a confound-controlled run on Qwen2.5-0.5B base with an
 aggressive Q4_K-attention/MXFP4-FFN hybrid — bf16 PPL 16.35, plain quant 19.54
 (+3.19 damage), quant+QAT 15.13, and a bf16+identical-LoRA control 13.46 — the
