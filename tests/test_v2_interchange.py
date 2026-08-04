@@ -3,7 +3,6 @@ ROCmFPX mq-hybrid, Foundry publish) read a v2 budget build. Reader and writer
 live in different repos and never run in the same interpreter — pin the shape.
 """
 import json
-from pathlib import Path
 
 from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION
 from magicquant.v2.interchange import budget_tier_key, write_interchange_block
