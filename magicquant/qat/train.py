@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -380,6 +381,129 @@ def _save_adapters(model, out_dir: str) -> str:
     return path
 
 
+# ── checkpoint / resume ─────────────────────────────────────────────────────
+#
+# HF Trainer's default periodic checkpoint saves the model's FULL state_dict --
+# every frozen base-model weight, not just the trainable LoRA adapters. For a
+# 35B base that's tens of GB written to disk on every save, which would itself
+# risk filling the disk on an unattended overnight run (the exact failure mode
+# this feature exists to prevent). The base is fully and deterministically
+# reconstructed on every run anyway (same source model + same scheme_by_group
+# -> identical fake-quant wrapping, see run_qat below), so only the trainable
+# LoRA params need to survive a restart. `_install_lora_only_checkpoint_save`
+# patches a Trainer instance's `_save` so its checkpoints hold only those --
+# optimizer/scheduler/RNG state is untouched (already small: AdamW only
+# tracks trainable params).
+#
+# Loading a partial state dict back in is a documented HF path, not a hack:
+# `Trainer._load_from_checkpoint` calls `model.load_state_dict(state_dict,
+# False)` -- `strict=False` -- so missing base-weight keys are silently
+# tolerated (logged as "missing keys", never raised).
+
+_CHECKPOINT_DIR_RE = re.compile(r"^checkpoint-(\d+)$")
+
+# Files that mark a checkpoint dir as fully written (vs. killed mid-save).
+_CHECKPOINT_STATE_FILE = "trainer_state.json"
+_CHECKPOINT_WEIGHT_FILES = (
+    "model.safetensors",
+    "pytorch_model.bin",
+    "model.safetensors.index.json",
+    "pytorch_model.bin.index.json",
+)
+
+
+def _install_lora_only_checkpoint_save(trainer) -> None:
+    """Patch ``trainer`` so its periodic checkpoints save only trainable
+    (LoRA) params, in place, via an instance-level override of ``_save``.
+
+    An instance-level shadow (same pattern as this module's
+    ``gradient_checkpointing_enable`` test spies) rather than a Trainer
+    subclass: it works uniformly whether ``trainer`` is the real
+    ``transformers.Trainer`` or a lightweight test double, and never disturbs
+    what class ``trainer`` actually is.
+
+    No-ops (logs at debug and returns) if ``trainer`` has no ``_save`` to
+    override -- an unrecognized/minimal Trainer implementation should keep
+    whatever default checkpoint behavior it has, not crash.
+    """
+    original_save = getattr(trainer, "_save", None)
+    if not callable(original_save):
+        _log.debug(
+            "%s has no _save method to patch; periodic checkpoints (if any) "
+            "will use its own default full-state-dict save.",
+            type(trainer).__name__,
+        )
+        return
+
+    def _lora_only_save(output_dir=None, state_dict=None):
+        if state_dict is None:
+            model = trainer.model
+            trainable_names = {
+                n for n, p in model.named_parameters() if p.requires_grad
+            }
+            state_dict = {
+                k: v for k, v in model.state_dict().items() if k in trainable_names
+            }
+        original_save(output_dir, state_dict=state_dict)
+
+    trainer._save = _lora_only_save
+
+
+def _list_checkpoint_dirs(trainer_output_dir: str) -> List[str]:
+    """``checkpoint-<N>`` subdirectories of ``trainer_output_dir``, newest first.
+
+    Returns ``[]`` (never raises) if the directory doesn't exist yet -- the
+    normal state before a run's first checkpoint.
+    """
+    if not os.path.isdir(trainer_output_dir):
+        return []
+    found = []
+    for name in os.listdir(trainer_output_dir):
+        m = _CHECKPOINT_DIR_RE.match(name)
+        if not m:
+            continue
+        path = os.path.join(trainer_output_dir, name)
+        if os.path.isdir(path):
+            found.append((int(m.group(1)), path))
+    found.sort(key=lambda t: t[0], reverse=True)
+    return [path for _, path in found]
+
+
+def _is_checkpoint_complete(path: str) -> bool:
+    """Whether ``path`` has the files a resume needs (trainer state + weights).
+
+    A process killed mid-checkpoint-write (this feature's whole reason for
+    existing) can leave a ``checkpoint-N`` directory with some files but not
+    others. Resuming from that half-written state would raise inside HF's
+    loader instead of degrading gracefully, so it's treated as absent.
+    """
+    if not os.path.isfile(os.path.join(path, _CHECKPOINT_STATE_FILE)):
+        return False
+    return any(
+        os.path.isfile(os.path.join(path, w)) for w in _CHECKPOINT_WEIGHT_FILES
+    )
+
+
+def _resolve_resume_checkpoint(trainer_output_dir: str, resume: bool) -> Optional[str]:
+    """Pick the newest COMPLETE checkpoint under ``trainer_output_dir``, or
+    ``None`` to start fresh.
+
+    Never raises. ``resume=False``, no checkpoints, or every checkpoint found
+    being incomplete/corrupt all resolve to ``None`` -- an absent or bad
+    checkpoint must never fail an unattended run, it must just start over.
+    """
+    if not resume:
+        return None
+    for path in _list_checkpoint_dirs(trainer_output_dir):
+        if _is_checkpoint_complete(path):
+            return path
+        _log.warning(
+            "Skipping incomplete checkpoint %s (missing %s or a weights file); "
+            "trying an older one.", path, _CHECKPOINT_STATE_FILE,
+        )
+    return None
+
+
 def run_qat(cfg: Dict[str, Any]) -> str:
     """Run QAT-LoRA per ``cfg`` and return the output adapter directory.
 
@@ -392,6 +516,15 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     (0.03), ``weight_decay`` (0.0), ``max_grad_norm`` (1.0), ``lr_scheduler``
     ('cosine'). Set ``gradient_checkpointing`` (False) to trade compute for
     activation memory on big models.
+
+    Checkpoint/resume (all overridable): ``save_steps`` (100), ``save_total_limit``
+    (3), ``resume`` (True). Checkpoints land under ``<out>/_trainer/checkpoint-*``
+    and hold only the trainable LoRA params (see ``_install_lora_only_checkpoint_save``)
+    -- the frozen base is never checkpointed, since it's rebuilt identically from
+    ``model`` + the resolved ``scheme_by_group`` on every run. With ``resume=True``
+    (the default), a prior run's newest *complete* checkpoint in ``<out>`` is
+    resumed from automatically; a missing or corrupt checkpoint silently falls
+    back to a fresh start rather than failing the run.
     """
     from transformers import Trainer, TrainingArguments
 
@@ -411,6 +544,12 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
     lr_scheduler = str(cfg.get("lr_scheduler", "cosine"))
     gradient_checkpointing = bool(cfg.get("gradient_checkpointing", False))
+
+    # Checkpoint/resume defaults -- see the module-level "checkpoint / resume"
+    # section for why only LoRA params get written to disk.
+    save_steps = int(cfg.get("save_steps", 100))
+    save_total_limit = int(cfg.get("save_total_limit", 3))
+    resume = bool(cfg.get("resume", True))
 
     scheme_by_group = _resolve_scheme_by_group(cfg)
 
@@ -457,8 +596,33 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     use_bf16 = model_dtype == torch.bfloat16
     use_fp16 = model_dtype == torch.float16
 
+    trainer_output_dir = os.path.join(out_dir, "_trainer")
+
+    # Resolve resume BEFORE constructing TrainingArguments purely for logging
+    # order (the decision doesn't depend on args); never raises -- see
+    # _resolve_resume_checkpoint's docstring.
+    #
+    # Both _log.info AND print: this module's `_log` is a bare stdlib logger
+    # that magicquant.logging.configure_logging() never attaches a handler to
+    # (pre-existing across several modules, not new here), so on its own it is
+    # silent in every real invocation. The resume/fresh-start decision is the
+    # one thing an unattended overnight run most needs visible in its captured
+    # stdout log, so it also goes through print(..., flush=True) here.
+    resume_from_checkpoint = _resolve_resume_checkpoint(trainer_output_dir, resume)
+    if resume_from_checkpoint:
+        _resume_msg = f"Resuming QAT from checkpoint: {resume_from_checkpoint}"
+    elif resume:
+        _resume_msg = f"No usable checkpoint found in {trainer_output_dir}; starting fresh."
+    else:
+        _resume_msg = (
+            f"resume=False; starting fresh even if a checkpoint exists in "
+            f"{trainer_output_dir}."
+        )
+    _log.info(_resume_msg)
+    print(_resume_msg, flush=True)
+
     args = TrainingArguments(
-        output_dir=os.path.join(out_dir, "_trainer"),
+        output_dir=trainer_output_dir,
         per_device_train_batch_size=1,
         num_train_epochs=epochs,
         max_steps=max_steps,
@@ -468,7 +632,9 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         max_grad_norm=max_grad_norm,
         lr_scheduler_type=lr_scheduler,
         logging_steps=1,
-        save_strategy="no",
+        save_strategy="steps",
+        save_steps=save_steps,
+        save_total_limit=save_total_limit,
         report_to=[],
         use_cpu=not torch.cuda.is_available(),
         bf16=use_bf16,
@@ -482,7 +648,8 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         train_dataset=train_examples,
         data_collator=collator,
     )
-    trainer.train()
+    _install_lora_only_checkpoint_save(trainer)
+    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     # ── save adapters + metadata ──
     adapter_path = _save_adapters(model, out_dir)
@@ -502,6 +669,10 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         "max_grad_norm": max_grad_norm,
         "lr_scheduler": lr_scheduler,
         "gradient_checkpointing": gradient_checkpointing,
+        "save_steps": save_steps,
+        "save_total_limit": save_total_limit,
+        "resume": resume,
+        "resumed_from_checkpoint": resume_from_checkpoint,
         "trainable_params": n_trainable,
         "adapter_file": os.path.basename(adapter_path),
     }

@@ -488,6 +488,8 @@ def cmd_qat(args: argparse.Namespace) -> None:
         "max_steps": args.max_steps,
         "lr": args.lr,
         "max_seq_len": args.max_seq_len,
+        "save_steps": args.save_steps,
+        "resume": args.resume,
     }
     if args.config:
         cfg["config"] = args.config
@@ -503,6 +505,8 @@ def cmd_qat(args: argparse.Namespace) -> None:
         tier=args.tier,
         dataset=args.dataset,
         out=out_dir,
+        save_steps=args.save_steps,
+        resume=args.resume,
     )
 
     result = run_qat(cfg)
@@ -1033,6 +1037,18 @@ def main() -> None:
                             help="Learning rate (default: 2e-4)")
     qat_parser.add_argument("--max-seq-len", dest="max_seq_len", type=int,
                             default=512, help="Max sequence length (default: 512)")
+    qat_parser.add_argument(
+        "--save-steps", dest="save_steps", type=int, default=100,
+        help="Checkpoint every N training steps, LoRA params only (default: 100)",
+    )
+    qat_parser.add_argument(
+        "--resume", dest="resume", action="store_true", default=True,
+        help="Resume from the newest checkpoint in --out if one exists (default: on)",
+    )
+    qat_parser.add_argument(
+        "--no-resume", dest="resume", action="store_false",
+        help="Ignore any existing checkpoint in --out and start fresh",
+    )
     qat_parser.set_defaults(func=cmd_qat)
 
     # ── card ──────────────────────────────────────────────────────────────────

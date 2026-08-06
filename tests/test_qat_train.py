@@ -29,10 +29,16 @@ def _write_ds(tmp_path):
 
 
 class _RecordingTrainer:
-    """Stand-in for transformers.Trainer that records args and no-ops train()."""
+    """Stand-in for transformers.Trainer that records args and no-ops train().
+
+    Deliberately has no ``_save`` method: ``_install_lora_only_checkpoint_save``
+    must no-op (not crash) against a Trainer double that doesn't expose one, so
+    these production-wiring tests also double as coverage for that guard.
+    """
 
     last_args = None
     last_model = None
+    last_resume_from_checkpoint = "NOT_CALLED"
 
     def __init__(self, model=None, args=None, train_dataset=None, data_collator=None):
         type(self).last_args = args
@@ -40,7 +46,8 @@ class _RecordingTrainer:
         self.model = model
         self.args = args
 
-    def train(self):
+    def train(self, resume_from_checkpoint=None):
+        type(self).last_resume_from_checkpoint = resume_from_checkpoint
         return None
 
 
@@ -59,6 +66,7 @@ def patched_trainer(monkeypatch):
 
     _RecordingTrainer.last_args = None
     _RecordingTrainer.last_model = None
+    _RecordingTrainer.last_resume_from_checkpoint = "NOT_CALLED"
     monkeypatch.setattr(trainer_mod, "Trainer", _RecordingTrainer, raising=False)
     monkeypatch.setattr(transformers, "Trainer", _RecordingTrainer, raising=False)
     return _RecordingTrainer
@@ -111,6 +119,93 @@ def test_run_qat_backward_compat_existing_keys_only(tmp_path, patched_trainer):
     assert meta["warmup_ratio"] == pytest.approx(0.03)
     assert meta["lr_scheduler"] == "cosine"
     assert out == cfg["out"]
+
+
+# ── checkpoint / resume wiring ──────────────────────────────────────────────────
+
+def test_checkpoint_defaults_wired_into_training_args(tmp_path, patched_trainer):
+    """Unchanged cfg -> save_strategy='steps' with the documented defaults, not
+    the old save_strategy='no' (this is the behavior-visible half of the
+    default-safe contract: checkpoints now get written even with no new keys)."""
+    train_mod.run_qat(_base_cfg(tmp_path))
+    args = patched_trainer.last_args
+    assert str(args.save_strategy) == "steps" or args.save_strategy == "steps"
+    assert args.save_steps == 100
+    assert args.save_total_limit == 3
+
+
+def test_checkpoint_save_steps_and_limit_overridable(tmp_path, patched_trainer):
+    cfg = _base_cfg(tmp_path)
+    cfg.update(save_steps=5, save_total_limit=2)
+    train_mod.run_qat(cfg)
+    args = patched_trainer.last_args
+    assert args.save_steps == 5
+    assert args.save_total_limit == 2
+
+
+def test_resume_defaults_to_true_with_no_checkpoint_present(tmp_path, patched_trainer):
+    """Default-safe: with nothing under --out, a fresh tmp_path has no checkpoint
+    to find, so resume_from_checkpoint must be None (fresh start) even though
+    resume=True by default -- absence of a checkpoint is not an error."""
+    train_mod.run_qat(_base_cfg(tmp_path))
+    assert patched_trainer.last_resume_from_checkpoint is None
+
+
+def test_resume_picks_up_newest_complete_checkpoint(tmp_path, patched_trainer):
+    """A prior (killed) run's checkpoint under <out>/_trainer is detected and
+    handed to trainer.train(resume_from_checkpoint=...) without a real Trainer
+    ever running -- this isolates the *detection* wiring from the actual HF
+    resume machinery (covered separately by the real end-to-end smoke)."""
+    cfg = _base_cfg(tmp_path)
+    trainer_dir = tmp_path / "adapters" / "_trainer"
+    older = trainer_dir / "checkpoint-2"
+    newer = trainer_dir / "checkpoint-8"
+    for d in (older, newer):
+        d.mkdir(parents=True)
+        (d / "trainer_state.json").write_text("{}")
+        (d / "model.safetensors").write_bytes(b"\x00")
+    train_mod.run_qat(cfg)
+    assert patched_trainer.last_resume_from_checkpoint == str(newer)
+
+
+def test_resume_false_ignores_existing_checkpoint(tmp_path, patched_trainer):
+    cfg = _base_cfg(tmp_path)
+    cfg["resume"] = False
+    trainer_dir = tmp_path / "adapters" / "_trainer"
+    ck = trainer_dir / "checkpoint-8"
+    ck.mkdir(parents=True)
+    (ck / "trainer_state.json").write_text("{}")
+    (ck / "model.safetensors").write_bytes(b"\x00")
+    train_mod.run_qat(cfg)
+    assert patched_trainer.last_resume_from_checkpoint is None
+
+
+def test_resume_skips_incomplete_newest_checkpoint(tmp_path, patched_trainer):
+    """A checkpoint dir missing its weights file (killed mid-write) is treated
+    as absent, falling back to the next older COMPLETE one instead of handing
+    HF's loader a half-written directory."""
+    cfg = _base_cfg(tmp_path)
+    trainer_dir = tmp_path / "adapters" / "_trainer"
+    complete = trainer_dir / "checkpoint-4"
+    complete.mkdir(parents=True)
+    (complete / "trainer_state.json").write_text("{}")
+    (complete / "model.safetensors").write_bytes(b"\x00")
+    incomplete = trainer_dir / "checkpoint-9"
+    incomplete.mkdir(parents=True)
+    (incomplete / "trainer_state.json").write_text("{}")
+    # no weights file -- simulates a kill mid-checkpoint-write
+    train_mod.run_qat(cfg)
+    assert patched_trainer.last_resume_from_checkpoint == str(complete)
+
+
+def test_checkpoint_meta_records_resume_fields(tmp_path, patched_trainer):
+    cfg = _base_cfg(tmp_path)
+    train_mod.run_qat(cfg)
+    meta = json.loads((tmp_path / "adapters" / "qat_meta.json").read_text())
+    assert meta["save_steps"] == 100
+    assert meta["save_total_limit"] == 3
+    assert meta["resume"] is True
+    assert meta["resumed_from_checkpoint"] is None
 
 
 # ── gradient checkpointing ─────────────────────────────────────────────────────
