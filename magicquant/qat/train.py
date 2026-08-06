@@ -411,8 +411,60 @@ _CHECKPOINT_WEIGHT_FILES = (
     "pytorch_model.bin.index.json",
 )
 
+# Records which (model, scheme_by_group) a checkpoint was written under -- see
+# _check_config_identity below.
+_CONFIG_HASH_FILENAME = "qat_config_hash.txt"
 
-def _install_lora_only_checkpoint_save(trainer) -> None:
+
+def _write_config_hash(checkpoint_dir: str, config_hash: str) -> None:
+    """Best-effort: record which cfg/scheme produced ``checkpoint_dir``.
+
+    Called from the periodic-save path (see ``_install_lora_only_checkpoint_save``),
+    so it inherits the same warn-and-continue contract: a write failure here
+    (e.g. disk full, same failure mode the save itself just hit) must not take
+    down an otherwise-successful checkpoint write, let alone the whole run.
+    """
+    try:
+        with open(
+            os.path.join(checkpoint_dir, _CONFIG_HASH_FILENAME), "w", encoding="utf-8"
+        ) as f:
+            f.write(config_hash)
+    except Exception as exc:  # best-effort -- see docstring
+        _log.warning("Could not write config-identity hash to %s: %s", checkpoint_dir, exc)
+
+
+def _check_config_identity(checkpoint_dir: str, config_hash: str) -> None:
+    """Refuse to resume from ``checkpoint_dir`` if it was written under a
+    DIFFERENT (model, scheme_by_group) than the current run.
+
+    A checkpoint with no hash file predates this guard (or its best-effort
+    write previously failed) -- resuming from it is unchanged prior behavior,
+    not a new risk, so it's allowed through silently. A checkpoint WITH a
+    hash file that disagrees means the model id or per-group quant scheme
+    changed since it was written: resuming those LoRA adapters would train
+    them against a frozen base / fake-quant config that no longer matches
+    what this run is compensating for, silently corrupting the result. That
+    must stop the run outright rather than degrade to a fresh start -- the
+    safe fallback is explicit, named in the error: ``--no-resume``.
+    """
+    hash_path = os.path.join(checkpoint_dir, _CONFIG_HASH_FILENAME)
+    if not os.path.isfile(hash_path):
+        return
+    with open(hash_path, encoding="utf-8") as f:
+        saved_hash = f.read().strip()
+    if saved_hash and saved_hash != config_hash:
+        raise RuntimeError(
+            f"Refusing to resume from {checkpoint_dir!r}: its config_hash "
+            f"({saved_hash}) does not match the current run's config_hash "
+            f"({config_hash}) -- the model or scheme_by_group changed since "
+            f"this checkpoint was written. Resuming LoRA adapters trained "
+            f"against a different frozen base/quant config would silently "
+            f"corrupt the run. Start fresh with --no-resume (or resume=False) "
+            f"if this is intentional."
+        )
+
+
+def _install_lora_only_checkpoint_save(trainer, config_hash: Optional[str] = None) -> None:
     """Patch ``trainer`` so its periodic checkpoints save only trainable
     (LoRA) params, in place, via an instance-level override of ``_save``.
 
@@ -425,6 +477,17 @@ def _install_lora_only_checkpoint_save(trainer) -> None:
     No-ops (logs at debug and returns) if ``trainer`` has no ``_save`` to
     override -- an unrecognized/minimal Trainer implementation should keep
     whatever default checkpoint behavior it has, not crash.
+
+    The periodic save itself is best-effort: an exception here (disk full,
+    permissions, anything) is logged as a WARNING and swallowed rather than
+    propagated, so it can never abort a multi-hour unattended run over one
+    checkpoint write. This does NOT apply to the run's FINAL adapter save
+    (``_save_adapters``, called once after ``trainer.train()`` returns) --
+    that one still raises on failure, since losing the actual trained result
+    at the end of the run is not something to shrug off.
+
+    If ``config_hash`` is given, it's written into the checkpoint dir after
+    a successful save (see ``_write_config_hash`` / ``_check_config_identity``).
     """
     original_save = getattr(trainer, "_save", None)
     if not callable(original_save):
@@ -436,15 +499,26 @@ def _install_lora_only_checkpoint_save(trainer) -> None:
         return
 
     def _lora_only_save(output_dir=None, state_dict=None):
-        if state_dict is None:
-            model = trainer.model
-            trainable_names = {
-                n for n, p in model.named_parameters() if p.requires_grad
-            }
-            state_dict = {
-                k: v for k, v in model.state_dict().items() if k in trainable_names
-            }
-        original_save(output_dir, state_dict=state_dict)
+        try:
+            if state_dict is None:
+                model = trainer.model
+                trainable_names = {
+                    n for n, p in model.named_parameters() if p.requires_grad
+                }
+                state_dict = {
+                    k: v for k, v in model.state_dict().items() if k in trainable_names
+                }
+            original_save(output_dir, state_dict=state_dict)
+            if config_hash and output_dir:
+                _write_config_hash(output_dir, config_hash)
+        except Exception as exc:  # best-effort -- see docstring
+            msg = (
+                f"Periodic checkpoint save to {output_dir!r} failed ({exc}); "
+                "continuing training without this checkpoint. The final "
+                "adapter save at the end of the run still raises on failure."
+            )
+            _log.warning(msg)
+            print(f"WARNING: {msg}", flush=True)
 
     trainer._save = _lora_only_save
 
@@ -552,6 +626,9 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     resume = bool(cfg.get("resume", True))
 
     scheme_by_group = _resolve_scheme_by_group(cfg)
+    # Computed once, reused for both the checkpoint config-identity guard
+    # (below) and qat_meta.json -- see _check_config_identity's docstring.
+    config_hash = _config_hash(cfg["model"], scheme_by_group)
 
     model, tokenizer, loaded_from = _load_model_and_tokenizer(
         cfg["model"], dtype=cfg.get("dtype")
@@ -610,6 +687,12 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     # stdout log, so it also goes through print(..., flush=True) here.
     resume_from_checkpoint = _resolve_resume_checkpoint(trainer_output_dir, resume)
     if resume_from_checkpoint:
+        # Config-identity guard: an incomplete/corrupt checkpoint degrades
+        # silently to a fresh start (see _resolve_resume_checkpoint above),
+        # but a checkpoint that's fully valid yet belongs to a DIFFERENT
+        # (model, scheme_by_group) is a distinct, intentional refusal -- see
+        # _check_config_identity's docstring. This raises, not warns.
+        _check_config_identity(resume_from_checkpoint, config_hash)
         _resume_msg = f"Resuming QAT from checkpoint: {resume_from_checkpoint}"
     elif resume:
         _resume_msg = f"No usable checkpoint found in {trainer_output_dir}; starting fresh."
@@ -648,7 +731,7 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         train_dataset=train_examples,
         data_collator=collator,
     )
-    _install_lora_only_checkpoint_save(trainer)
+    _install_lora_only_checkpoint_save(trainer, config_hash=config_hash)
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     # ── save adapters + metadata ──
@@ -657,7 +740,7 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         "model": cfg["model"],
         "loaded_from": loaded_from,
         "scheme_by_group": scheme_by_group,
-        "config_hash": _config_hash(cfg["model"], scheme_by_group),
+        "config_hash": config_hash,
         "lora_r": lora_r,
         "lora_alpha": lora_alpha,
         "epochs": epochs,

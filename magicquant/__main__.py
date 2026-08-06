@@ -513,6 +513,20 @@ def cmd_qat(args: argparse.Namespace) -> None:
     print(f"\nQAT adapters written to: {result}")
 
 
+def cmd_qat_merge(args: argparse.Namespace) -> None:
+    """Merge QAT-LoRA adapters into the base model's safetensors, streamed
+    shard-by-shard to disk (never materializes the full model in memory)."""
+    from magicquant.qat.merge import merge_qat_adapters
+
+    log = get_logger("qat-merge")
+    log.info(
+        "Starting QAT adapter merge", base_model=args.base_model,
+        adapters=args.adapter_dir, out=args.out_dir,
+    )
+    result = merge_qat_adapters(args.base_model, args.adapter_dir, args.out_dir)
+    print(f"\nMerged model written to: {result}")
+
+
 def cmd_card(args: argparse.Namespace) -> None:
     """Generate a HuggingFace model card from search_results.json (local-only)."""
     from magicquant.utils.model_card import generate_model_card
@@ -1050,6 +1064,28 @@ def main() -> None:
         help="Ignore any existing checkpoint in --out and start fresh",
     )
     qat_parser.set_defaults(func=cmd_qat)
+
+    # ── qat-merge ─────────────────────────────────────────────────────────────
+    qat_merge_parser = subparsers.add_parser(
+        "qat-merge",
+        help="Merge QAT-LoRA adapters into the base model's safetensors "
+             "(streaming, low memory)",
+    )
+    qat_merge_parser.add_argument(
+        "base_model",
+        help="HF model id or local path to the base model whose safetensors "
+             "get merged (the same model QAT was run against)",
+    )
+    qat_merge_parser.add_argument(
+        "--adapters", required=True, dest="adapter_dir",
+        help="Adapter directory written by `magicquant qat` "
+             "(needs adapter_model.safetensors + qat_meta.json)",
+    )
+    qat_merge_parser.add_argument(
+        "--out", required=True, dest="out_dir",
+        help="Output directory for the merged safetensors model",
+    )
+    qat_merge_parser.set_defaults(func=cmd_qat_merge)
 
     # ── card ──────────────────────────────────────────────────────────────────
     card_parser = subparsers.add_parser(
