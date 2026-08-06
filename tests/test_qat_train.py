@@ -121,6 +121,42 @@ def test_run_qat_backward_compat_existing_keys_only(tmp_path, patched_trainer):
     assert out == cfg["out"]
 
 
+# ── fused 3-D MoE expert knobs ────────────────────────────────────────────────
+
+def test_meta_always_records_the_expert_scale_the_merge_reads(tmp_path, patched_trainer):
+    """``magicquant.qat.merge`` computes its 3-D expert scale from
+    ``expert_lora_r``/``expert_lora_alpha`` in qat_meta.json. They are written
+    on EVERY run -- including this one, whose tiny offline llama has no fused
+    experts at all -- so the merge never has to infer which fallback applied.
+    """
+    cfg = _base_cfg(tmp_path)
+    train_mod.run_qat(cfg)
+    meta = json.loads((tmp_path / "adapters" / "qat_meta.json").read_text())
+    assert meta["expert_lora_r"] == 4
+    assert meta["expert_lora_alpha"] == pytest.approx(8.0)
+    assert meta["expert_quant_mode"] == "live"
+    assert meta["wrap_experts"] is True
+    assert meta["n_expert_tensors"] == 0        # a dense llama has none
+    assert meta["expert_adapters"] == []
+    assert meta["expert_adapter_params"] == 0
+
+
+def test_expert_knobs_flow_from_cfg_into_meta(tmp_path, patched_trainer):
+    cfg = dict(_base_cfg(tmp_path), expert_lora_r=8, expert_lora_alpha=24.0,
+               expert_quant_mode="frozen")
+    train_mod.run_qat(cfg)
+    meta = json.loads((tmp_path / "adapters" / "qat_meta.json").read_text())
+    assert meta["expert_lora_r"] == 8
+    assert meta["expert_lora_alpha"] == pytest.approx(24.0)
+    assert meta["expert_quant_mode"] == "frozen"
+
+
+def test_unknown_expert_quant_mode_is_refused(tmp_path, patched_trainer):
+    cfg = dict(_base_cfg(tmp_path), expert_quant_mode="occasionally")
+    with pytest.raises(ValueError, match="expert_quant_mode"):
+        train_mod.run_qat(cfg)
+
+
 # ── checkpoint / resume wiring ──────────────────────────────────────────────────
 
 def test_checkpoint_defaults_wired_into_training_args(tmp_path, patched_trainer):

@@ -94,6 +94,10 @@ def _run_cmd_qat_capturing_cfg(monkeypatch, tmp_path, **arg_overrides):
         max_seq_len=512,
         save_steps=100,
         resume=True,
+        expert_lora_r=4,
+        expert_lora_alpha=None,
+        expert_quant_mode="live",
+        wrap_experts=True,
     )
     defaults.update(arg_overrides)
     args = argparse.Namespace(**defaults)
@@ -114,3 +118,48 @@ def test_cmd_qat_passes_resume_true_into_cfg(monkeypatch, tmp_path):
 def test_cmd_qat_passes_resume_false_into_cfg(monkeypatch, tmp_path):
     cfg = _run_cmd_qat_capturing_cfg(monkeypatch, tmp_path, resume=False)
     assert cfg["resume"] is False
+
+
+# ── fused 3-D MoE expert knobs ────────────────────────────────────────────────
+
+def test_expert_qat_defaults(monkeypatch):
+    args = _parse_qat_args(monkeypatch, [])
+    assert args.expert_lora_r == 4
+    assert args.expert_lora_alpha is None  # -> 2 x rank, resolved in cmd_qat
+    assert args.expert_quant_mode == "live"
+    assert args.wrap_experts is True
+
+
+def test_expert_qat_flags_parse(monkeypatch):
+    args = _parse_qat_args(monkeypatch, [
+        "--expert-lora-r", "8", "--expert-lora-alpha", "32",
+        "--expert-quant-mode", "frozen", "--no-expert-qat",
+    ])
+    assert args.expert_lora_r == 8
+    assert args.expert_lora_alpha == 32.0
+    assert args.expert_quant_mode == "frozen"
+    assert args.wrap_experts is False
+
+
+def test_expert_quant_mode_rejects_unknown_values(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse_qat_args(monkeypatch, ["--expert-quant-mode", "sometimes"])
+
+
+def test_cmd_qat_defaults_expert_alpha_to_twice_the_rank(monkeypatch, tmp_path):
+    cfg = _run_cmd_qat_capturing_cfg(
+        monkeypatch, tmp_path, expert_lora_r=8, expert_lora_alpha=None
+    )
+    assert cfg["expert_lora_r"] == 8
+    assert cfg["expert_lora_alpha"] == 16.0
+
+
+def test_cmd_qat_passes_explicit_expert_knobs_into_cfg(monkeypatch, tmp_path):
+    cfg = _run_cmd_qat_capturing_cfg(
+        monkeypatch, tmp_path, expert_lora_r=2, expert_lora_alpha=9.0,
+        expert_quant_mode="frozen", wrap_experts=False,
+    )
+    assert cfg["expert_lora_r"] == 2
+    assert cfg["expert_lora_alpha"] == 9.0
+    assert cfg["expert_quant_mode"] == "frozen"
+    assert cfg["wrap_experts"] is False

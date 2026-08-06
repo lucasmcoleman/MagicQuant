@@ -26,7 +26,15 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from magicquant.qat.config import load_hybrid_config
+from magicquant.qat.config import load_hybrid_config, load_tensor_config
+from magicquant.qat.expert_wrap import (
+    EXPERT_QUANT_MODES,
+    MODE_LIVE,
+    estimate_expert_qat_cost,
+    fused_expert_adapter_meta,
+    fused_expert_adapter_state,
+    iter_expert_parametrizations,
+)
 from magicquant.qat.wrap import QATLinear, wrap_model
 from magicquant.gguf.tensor_groups import TensorGroupClassifier
 
@@ -311,16 +319,63 @@ def _resolve_scheme_by_group(cfg: Dict[str, Any]) -> Dict[str, str]:
     )
 
 
-def _config_hash(model_id: str, scheme_by_group: Dict[str, str]) -> str:
-    payload = json.dumps(
-        {"model": model_id, "scheme_by_group": scheme_by_group},
-        sort_keys=True,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+def _resolve_scheme_by_tensor(cfg: Dict[str, Any]) -> Dict[str, str]:
+    """Get the optional {gguf_tensor_name: ggml_type_name} map from cfg.
+
+    Empty dict when the run has no per-tensor map (the ladder search path) --
+    routing then falls back entirely to ``scheme_by_group``, which is what
+    happened before budget builds existed.
+    """
+    if cfg.get("scheme_by_tensor"):
+        return dict(cfg["scheme_by_tensor"])
+    config_path = cfg.get("config")
+    tier = cfg.get("tier")
+    if config_path and tier:
+        try:
+            return load_tensor_config(config_path, tier)
+        except (KeyError, OSError, ValueError) as exc:
+            _log.warning(
+                "Could not load a per-tensor config from %r/%r (%s); "
+                "falling back to the per-group map only.", config_path, tier, exc,
+            )
+    return {}
+
+
+def _config_hash(
+    model_id: str,
+    scheme_by_group: Dict[str, str],
+    scheme_by_tensor: Optional[Dict[str, str]] = None,
+    expert_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Identity of everything a resumed checkpoint's adapters were trained against.
+
+    ``scheme_by_tensor`` and ``expert_config`` are folded in only when non-empty,
+    so a run with neither hashes exactly as it did before they existed (an old
+    Linear-only checkpoint stays resumable). They must be *in* the hash when
+    present: adapters trained against a per-tensor Q2_K expert layout, or at a
+    different expert rank/quant mode, are as wrong to resume into a changed
+    config as adapters trained against a different scheme_by_group -- which is
+    the exact failure ``_check_config_identity`` exists to stop.
+    """
+    payload: Dict[str, Any] = {
+        "model": model_id,
+        "scheme_by_group": scheme_by_group,
+    }
+    if scheme_by_tensor:
+        payload["scheme_by_tensor"] = scheme_by_tensor
+    if expert_config:
+        payload["expert_config"] = expert_config
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
 
 
 def _freeze_to_lora_only(model) -> int:
-    """Freeze everything except QATLinear LoRA params. Returns trainable count."""
+    """Freeze everything except LoRA params. Returns trainable element count.
+
+    Covers both adapter families: ``QATLinear``'s 2-D ``lora_A``/``lora_B`` and
+    the fused 3-D expert parametrizations' ``lora_expert_A``/``lora_expert_B``.
+    """
     for p in model.parameters():
         p.requires_grad = False
     n_trainable = 0
@@ -329,6 +384,12 @@ def _freeze_to_lora_only(model) -> int:
             module.lora_A.requires_grad = True
             module.lora_B.requires_grad = True
             n_trainable += module.lora_A.numel() + module.lora_B.numel()
+    for p in iter_expert_parametrizations(model):
+        if p.lora_r <= 0:
+            continue
+        p.lora_expert_A.requires_grad = True
+        p.lora_expert_B.requires_grad = True
+        n_trainable += p.lora_expert_A.numel() + p.lora_expert_B.numel()
     return n_trainable
 
 
@@ -368,7 +429,28 @@ def _enable_gradient_checkpointing(model) -> bool:
 
 
 def _save_adapters(model, out_dir: str) -> str:
-    """Save all QATLinear LoRA params to ``adapter_model.safetensors``."""
+    """Save every LoRA adapter to ``adapter_model.safetensors``.
+
+    Two key families, both consumed by ``magicquant.qat.merge``:
+
+    2-D (``QATLinear``):
+        ``"<module_path>.lora_A"`` ``(r, in_features)`` and
+        ``"<module_path>.lora_B"`` ``(out_features, r)``. ``module_path`` is the
+        ``named_modules()`` path; the merge appends ``.weight`` to find the base
+        tensor. Merge: ``W += scale * (B @ A)``.
+
+    3-D (fused MoE experts, ``expert_wrap.FusedExpertQAT``):
+        ``"<base_tensor_key>.lora_expert_A"`` ``(E, W.shape[1], r)`` and
+        ``"<base_tensor_key>.lora_expert_B"`` ``(E, r, W.shape[2])``.
+        ``base_tensor_key`` is the fused parameter's exact safetensors key (a raw
+        ``nn.Parameter``, so NO ``.weight`` suffix), e.g.
+        ``model.language_model.layers.3.mlp.experts.gate_up_proj``. Merge:
+        ``W[e] += expert_scale * (A[e] @ B[e])`` with
+        ``expert_scale = expert_lora_alpha / expert_lora_r`` from
+        ``qat_meta.json``.
+
+    All tensors are written fp32 on CPU.
+    """
     from safetensors.torch import save_file
 
     state: Dict[str, torch.Tensor] = {}
@@ -376,6 +458,7 @@ def _save_adapters(model, out_dir: str) -> str:
         if isinstance(module, QATLinear):
             state[f"{name}.lora_A"] = module.lora_A.detach().to(torch.float32).cpu()
             state[f"{name}.lora_B"] = module.lora_B.detach().to(torch.float32).cpu()
+    state.update(fused_expert_adapter_state(model))
     path = os.path.join(out_dir, "adapter_model.safetensors")
     save_file(state, path)
     return path
@@ -586,6 +669,19 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     Optional: ``lora_r`` (8), ``lora_alpha`` (16), ``epochs`` (1), ``max_steps``
     (-1 = full), ``lr`` (2e-4), ``max_seq_len`` (512).
 
+    Fused 3-D MoE experts (``mlp.experts.gate_up_proj`` & co) get their own
+    adapters and their own knobs, because 256 experts x 40 layers multiplies a
+    rank by ~10k: ``expert_lora_r`` (4), ``expert_lora_alpha`` (8),
+    ``expert_quant_mode`` (``"live"``), ``wrap_experts`` (True). See
+    ``magicquant.qat.expert_wrap`` for what ``live`` vs ``frozen`` costs and
+    means; ``run_qat`` logs the measured per-forward fake-quant estimate for the
+    wrapped experts before training starts, so an infeasible configuration is
+    visible in the first seconds of a run rather than at dawn.
+
+    When the config source carries a per-tensor map (``tensor_config``, written
+    by budget builds), it takes precedence over the per-group map for both
+    Linears and experts.
+
     Training schedule (sensible defaults, all overridable): ``warmup_ratio``
     (0.03), ``weight_decay`` (0.0), ``max_grad_norm`` (1.0), ``lr_scheduler``
     ('cosine'). Set ``gradient_checkpointing`` (False) to trade compute for
@@ -625,35 +721,94 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     save_total_limit = int(cfg.get("save_total_limit", 3))
     resume = bool(cfg.get("resume", True))
 
+    expert_lora_r = int(cfg.get("expert_lora_r", 4))
+    expert_lora_alpha = float(cfg.get("expert_lora_alpha", 2 * expert_lora_r))
+    expert_quant_mode = str(cfg.get("expert_quant_mode", MODE_LIVE))
+    wrap_experts = bool(cfg.get("wrap_experts", True))
+    if expert_quant_mode not in EXPERT_QUANT_MODES:
+        raise ValueError(
+            f"expert_quant_mode must be one of {EXPERT_QUANT_MODES}, "
+            f"got {expert_quant_mode!r}"
+        )
+
     scheme_by_group = _resolve_scheme_by_group(cfg)
+    scheme_by_tensor = _resolve_scheme_by_tensor(cfg)
+    expert_config = {
+        "wrap_experts": wrap_experts,
+        "expert_lora_r": expert_lora_r,
+        "expert_lora_alpha": expert_lora_alpha,
+        "expert_quant_mode": expert_quant_mode,
+    } if wrap_experts else None
     # Computed once, reused for both the checkpoint config-identity guard
     # (below) and qat_meta.json -- see _check_config_identity's docstring.
-    config_hash = _config_hash(cfg["model"], scheme_by_group)
+    config_hash = _config_hash(
+        cfg["model"], scheme_by_group, scheme_by_tensor, expert_config
+    )
 
     model, tokenizer, loaded_from = _load_model_and_tokenizer(
         cfg["model"], dtype=cfg.get("dtype")
     )
 
-    # Wrap routed Linears with per-group fake-quant QATLinears, then freeze.
+    # Wrap routed Linears as fake-quant QATLinears and fused 3-D MoE expert
+    # parameters as FusedExpertQAT parametrizations, then freeze.
     wrap_model(
         model,
         scheme_by_group,
         TensorGroupClassifier(),
         lora_r=lora_r,
         lora_alpha=lora_alpha,
+        scheme_by_tensor=scheme_by_tensor,
+        wrap_experts=wrap_experts,
+        expert_lora_r=expert_lora_r,
+        expert_lora_alpha=expert_lora_alpha,
+        expert_quant_mode=expert_quant_mode,
     )
     n_qat = sum(1 for m in model.modules() if isinstance(m, QATLinear))
+    expert_params = list(iter_expert_parametrizations(model))
     n_trainable = _freeze_to_lora_only(model)
+    expert_cost = estimate_expert_qat_cost(expert_params)
     _log.info(
-        "Wrapped %d Linear modules as QATLinear (%d trainable LoRA params).",
-        n_qat, n_trainable,
+        "Wrapped %d Linear modules as QATLinear and %d fused 3-D expert "
+        "parameters (%d trainable LoRA params).",
+        n_qat, len(expert_params), n_trainable,
     )
-    if n_qat == 0:
+    if n_qat == 0 and not expert_params:
         _log.warning(
-            "No QATLinear layers were created (scheme_by_group matched no routable "
-            "Linear names — check the model's text-decoder naming vs hf_to_ggml_name); "
-            "training has no trainable parameters."
+            "No QAT layers were created (the scheme config matched no routable "
+            "Linear or fused-expert names — check the model's text-decoder naming "
+            "vs hf_to_ggml_name); training has no trainable parameters."
         )
+
+    if expert_params:
+        # Both _log.info and print, for the same reason the resume message below
+        # does: this module's logger has no handler in a real invocation, and
+        # this is the number that decides whether the run can finish at all.
+        _expert_msg = (
+            f"Fused 3-D expert QAT: {expert_cost['n_expert_tensors']} tensors, "
+            f"{expert_cost['base_elements'] / 1e9:.1f}e9 base elements covered, "
+            f"r={expert_lora_r} alpha={expert_lora_alpha} "
+            f"mode={expert_quant_mode!r}; adapters "
+            f"{expert_cost['lora_params'] / 1e6:.1f}M params "
+            f"(~{expert_cost['train_gib']:.2f} GiB incl. grads + AdamW moments)"
+        )
+        if expert_cost["live_forward_seconds"] > 0:
+            _expert_msg += (
+                f"; estimated live fake-quant cost "
+                f"~{expert_cost['live_forward_seconds']:.0f} s per forward pass"
+            )
+        _log.info(_expert_msg)
+        print(_expert_msg, flush=True)
+        if expert_cost["live_forward_seconds"] > 60:
+            _slow = (
+                f"WARNING: live expert fake-quant is estimated at "
+                f"~{expert_cost['live_forward_seconds'] / 60:.0f} min per forward "
+                f"pass on this model -- a training step costs at least that much. "
+                f"Set expert_quant_mode='frozen' (fake-quantize the expert base "
+                f"once at wrap time) to make the run finish, accepting that the "
+                f"adapter delta is then not re-quantized during training."
+            )
+            _log.warning(_slow)
+            print(_slow, flush=True)
 
     if gradient_checkpointing:
         _enable_gradient_checkpointing(model)
@@ -758,7 +913,26 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         "resumed_from_checkpoint": resume_from_checkpoint,
         "trainable_params": n_trainable,
         "adapter_file": os.path.basename(adapter_path),
+        # Fused 3-D MoE experts. expert_lora_r/expert_lora_alpha are READ BY
+        # THE MERGE (magicquant.qat.merge computes its 3-D scale from them and
+        # falls back to lora_r/lora_alpha when absent), so they are written
+        # unconditionally -- even when no expert was wrapped -- rather than only
+        # when they differ from the Linear values.
+        "expert_lora_r": expert_lora_r,
+        "expert_lora_alpha": expert_lora_alpha,
+        "expert_quant_mode": expert_quant_mode,
+        "wrap_experts": wrap_experts,
+        "n_expert_tensors": len(expert_params),
+        "expert_adapter_params": expert_cost["lora_params"],
+        "expert_adapters": fused_expert_adapter_meta(model),
     }
+    if scheme_by_tensor:
+        # The per-tensor map is what actually routed the run; record its size
+        # and a hash rather than 750 entries inline.
+        meta["scheme_by_tensor_count"] = len(scheme_by_tensor)
+        meta["scheme_by_tensor_hash"] = hashlib.sha256(
+            json.dumps(scheme_by_tensor, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
     with open(os.path.join(out_dir, "qat_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 

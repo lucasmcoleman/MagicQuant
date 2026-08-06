@@ -86,6 +86,44 @@ def load_hybrid_config(search_results_path: PathLike, tier: str) -> Dict[str, st
     return {group: _to_ggml_type_name(scheme) for group, scheme in config.items()}
 
 
+def load_tensor_config(search_results_path: PathLike, tier: str) -> Dict[str, str]:
+    """Load the PER-TENSOR ggml_type_name map for ``tier``, if the run has one.
+
+    MagicQuant v2's budget-constrained search stores an exact per-tensor map
+    (``tensor_config``: ``{gguf_tensor_name: scheme_name}``) alongside the
+    per-group projection, and the two genuinely differ: the Qwen3.6-35B-A3B
+    13.5 GiB build's group map says ``X: Q3_K`` while 54 of its 123 expert
+    tensors are actually Q2_K. Routing QAT by group alone would fake-quant
+    those a full bit above what ships.
+
+    Returns ``{gguf_tensor_name: ggml_type_name}``, or ``{}`` when the tier has
+    no per-tensor map (the ladder search path) -- callers fall back to the
+    per-group map, which is the only thing that existed before.
+
+    Raises the same ``KeyError``s as :func:`load_hybrid_config` for a missing
+    ``tiered`` block or tier.
+    """
+    with open(search_results_path, encoding="utf-8") as f:
+        results = json.load(f)
+
+    tiered = results.get("tiered")
+    if not tiered:
+        raise KeyError(
+            f"search_results has no 'tiered' configs "
+            f"(top-level keys: {sorted(results.keys())})"
+        )
+    if tier not in tiered:
+        raise KeyError(
+            f"tier {tier!r} not in search results; available tiers: "
+            f"{sorted(tiered.keys())}"
+        )
+
+    tensor_config = tiered[tier].get("tensor_config") or {}
+    return {
+        name: _to_ggml_type_name(scheme) for name, scheme in tensor_config.items()
+    }
+
+
 def _to_ggml_type_name(scheme_name: str) -> str:
     """Resolve a MagicQuant scheme name to its ggml block type name.
 

@@ -7,11 +7,12 @@ QAT run (35B MoE, multi-hour, unattended):
     (_save_adapters, called once training finishes) is untouched and still
     raises on failure.
   - a config-identity guard: each checkpoint records a hash of
-    (model, scheme_by_group). Resuming from a checkpoint whose hash disagrees
-    with the CURRENT run's cfg is refused with a clear error naming
-    --no-resume, rather than silently training LoRA adapters that were
-    initialized against a checkpoint from a different frozen base/quant
-    config.
+    (model, scheme_by_group, and -- since fused 3-D MoE expert QAT landed --
+    the per-tensor scheme map and the expert rank/alpha/quant-mode).
+    Resuming from a checkpoint whose hash disagrees with the CURRENT run's
+    cfg is refused with a clear error naming --no-resume, rather than
+    silently training LoRA adapters that were initialized against a
+    checkpoint from a different frozen base/quant config.
 """
 
 import json
@@ -196,9 +197,26 @@ def test_run_qat_refuses_resume_when_config_hash_mismatches(tmp_path, patched_tr
     assert patched_trainer.last_resume_from_checkpoint == "NOT_CALLED"
 
 
+# The expert config run_qat folds into the hash for a cfg that names no expert
+# knobs -- i.e. run_qat's own defaults. Kept next to the tests that need it so a
+# default change fails loudly here rather than silently un-guarding a resume.
+_DEFAULT_EXPERT_CONFIG = {
+    "wrap_experts": True,
+    "expert_lora_r": 4,
+    "expert_lora_alpha": 8.0,
+    "expert_quant_mode": "live",
+}
+
+
+def _expected_hash(cfg, expert_config=_DEFAULT_EXPERT_CONFIG):
+    return train_mod._config_hash(
+        cfg["model"], cfg["scheme_by_group"], {}, expert_config
+    )
+
+
 def test_run_qat_resumes_when_config_hash_matches(tmp_path, patched_trainer):
     cfg = _base_cfg(tmp_path)
-    matching_hash = train_mod._config_hash(cfg["model"], cfg["scheme_by_group"])
+    matching_hash = _expected_hash(cfg)
     trainer_dir = tmp_path / "adapters" / "_trainer"
     ck = trainer_dir / "checkpoint-8"
     ck.mkdir(parents=True)
@@ -228,5 +246,39 @@ def test_run_qat_meta_records_config_hash(tmp_path, patched_trainer):
     cfg = _base_cfg(tmp_path)
     train_mod.run_qat(cfg)
     meta = json.loads((tmp_path / "adapters" / "qat_meta.json").read_text())
-    expected = train_mod._config_hash(cfg["model"], cfg["scheme_by_group"])
-    assert meta["config_hash"] == expected
+    assert meta["config_hash"] == _expected_hash(cfg)
+
+
+# ── the hash covers the fused-expert config too ───────────────────────────────
+
+def test_config_hash_is_unchanged_without_expert_or_tensor_config():
+    """An old Linear-only checkpoint must stay resumable: with neither a
+    per-tensor map nor an expert config, the hash is byte-for-byte what the
+    two-argument form produced before either existed."""
+    schemes = {"U": "MXFP4", "Q": "Q6_K"}
+    assert train_mod._config_hash("m", schemes) == train_mod._config_hash(
+        "m", schemes, {}, None
+    )
+
+
+@pytest.mark.parametrize("changed", [
+    {"expert_lora_r": 8},
+    {"expert_quant_mode": "frozen"},
+    {"wrap_experts": False},
+    {"expert_lora_alpha": 16.0},
+])
+def test_config_hash_changes_when_the_expert_config_changes(changed):
+    """Adapters trained at a different expert rank/mode have different shapes
+    and different semantics; resuming across that change must be refused, which
+    only works if the hash moves."""
+    schemes = {"U": "MXFP4"}
+    baseline = train_mod._config_hash("m", schemes, {}, _DEFAULT_EXPERT_CONFIG)
+    other = dict(_DEFAULT_EXPERT_CONFIG, **changed)
+    assert train_mod._config_hash("m", schemes, {}, other) != baseline
+
+
+def test_config_hash_changes_when_the_per_tensor_map_changes():
+    schemes = {"X": "Q3_K"}
+    a = train_mod._config_hash("m", schemes, {"blk.0.ffn_gate_exps.weight": "Q2_K"})
+    b = train_mod._config_hash("m", schemes, {"blk.0.ffn_gate_exps.weight": "Q3_K"})
+    assert a != b

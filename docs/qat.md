@@ -73,6 +73,90 @@ routing never drifts), classifies it into a tensor group
 for that scheme. Groups that are BF16 (passthrough) or absent from the scheme map
 are left untouched — no quant-awareness is needed or wanted there.
 
+### Fused 3-D MoE experts (`qat/expert_wrap.py`)
+
+`wrap_model`'s `nn.Linear` walk is structurally blind to modern MoE
+architectures. Qwen3.5/Qwen3.6, Llama4, GPT-OSS and Granite-hybrid don't build one
+Linear per expert — they fuse every routed expert of a projection into **one 3-D
+`nn.Parameter`**:
+
+```
+model.language_model.layers.N.mlp.experts.gate_up_proj   [E, 2*I, H]
+model.language_model.layers.N.mlp.experts.down_proj      [E, H,   I]
+```
+
+On Qwen3.6-35B-A3B those parameters are **33.0e9 of the model's 35.9e9 elements**.
+Before this landed, QAT wrapped 2.44e9 elements — **6.8%** — and skipped the
+experts, which is exactly where low-bit quantization does its damage (that build
+puts 14.5e9 expert elements at Q2_K and 18.5e9 at Q3_K). With expert wrapping the
+covered fraction is **98.6%**.
+
+**Mechanism.** `torch.nn.utils.parametrize.register_parametrization` on the fused
+Parameter. The parametrization's `forward(W)` returns the QAT weight, so *every*
+consumer sees it and the MoE forward is never touched. Trainable state is a
+per-expert LoRA pair batched over the leading expert axis:
+
+```
+lora_expert_A  (E, W.shape[1], r)   zero-init
+lora_expert_B  (E, r, W.shape[2])   Kaiming-init
+delta = (expert_lora_alpha / expert_lora_r) * bmm(A, B)
+```
+
+Which factor is zeroed is inverted relative to `QATLinear` because the merge
+contract fixes the operand order as `W[e] += scale * (A[e] @ B[e])`
+(`qat/merge.py::_apply_3d`). The delta still starts at exactly zero.
+
+**GGUF splits what HF fuses.** `gate_up_proj` becomes *two* GGUF tensors,
+`blk.N.ffn_gate_exps.weight` and `blk.N.ffn_up_exps.weight` — contiguous halves of
+the out axis, gate first — and they can carry different schemes. `qat/names.py`
+maps a fused parameter to a list of `ExpertSegment`s, and each segment is
+fake-quantized against *its own* scheme. The concatenated-not-interleaved,
+untransposed `[E, out, in]` layout is re-checked at wrap time against the module's
+own `is_concatenated`/`is_transposed` flags (which transformers'
+`use_experts_implementation` decorator stamps); a module declaring the other
+layout is skipped with a warning rather than fake-quantized against the wrong
+slices.
+
+**Per-tensor schemes.** A budget build's `tensor_config` disagrees with its own
+group projection — the 13.5 GiB Qwen3.6 build says `X: Q3_K` while 54 of its 123
+expert tensors are Q2_K. `load_tensor_config` reads the per-tensor map and
+`wrap_model` prefers it over the group scheme, for Linears and experts alike.
+
+**Two quant modes**, because the fake-quant kernels are not free (measured on
+gfx1151: `Q2_K` ~2.7 Melem/s, `Q3_K` ~110 Melem/s):
+
+| mode | forward | cost on Qwen3.6-35B-A3B |
+|---|---|---|
+| `live` (default) | `fake_quant(W + delta)` every step — `QATLinear`'s exact semantics | **~92 min per forward pass** |
+| `frozen` | base fake-quantized once at wrap; forward is `W_q + delta` | ~5.5 s per forward pass |
+
+`live` is what you want whenever you can afford it: what trains is what ships,
+because the pack quantizes the merged weight too. It is simply not affordable at
+33e9 expert elements — `run_qat` prints the estimate at wrap time and warns when
+it exceeds a minute per forward, so an infeasible run is visible in its first
+seconds rather than at dawn. `frozen` makes a 35B run possible at the cost of a
+real caveat: the adapter's delta is never re-quantized during training, while the
+shipped weight is `quant(W_q + delta)`, so at Q2_K/Q3_K some of the compensation
+can be rounded away at pack time. Frozen-mode recovery has **not** been validated
+end to end.
+
+**Why there is a cache.** The eager MoE forward reads the fused parameter once per
+*hit expert* (`self.gate_up_proj[expert_idx]` inside the loop) — ~256 times per
+layer at a 512-token batch. Torch's own `parametrize.cached()` is unusable here
+because it caches every parametrized tensor for the whole context, ~66 GB for this
+model. `expert_wrap` keeps a **bounded** cache of 2 entries instead, which is
+exactly enough for the loop's `gate_up_proj`/`down_proj` alternation within one
+layer, keyed on the tensors' `_version` counters and the grad mode so a stale
+value can never be served.
+
+**Adapter file.** Expert adapters are written into the same
+`adapter_model.safetensors` as the Linear ones, under
+`"<base safetensors key>.lora_expert_A"` / `".lora_expert_B"` — no `.weight`
+suffix, because a fused expert stack is a raw Parameter, not an `nn.Linear`
+weight. `qat_meta.json` records `expert_lora_r` / `expert_lora_alpha` (which the
+merge reads for its 3-D scale), `expert_quant_mode`, and a per-tensor
+`expert_adapters` block with every shape and segment scheme.
+
 ### Eval and handoff
 
 - `bake_for_eval(model)` precomputes `fake_quant(merged_weight)` once and swaps each
@@ -130,11 +214,15 @@ magicquant qat ./my-model \
 | `--out` | `MAGICQUANT_OUTPUT_DIR/qat_adapters` | Output adapter directory. |
 | `--lora-r` / `--lora-alpha` | 32 / 64 | LoRA rank / scaling. |
 | `--epochs` / `--max-steps` / `--lr` / `--max-seq-len` | 1 / -1 / 2e-4 / 512 | Training schedule. |
+| `--expert-lora-r` / `--expert-lora-alpha` | 4 / 2×r | Rank / scaling for FUSED 3-D MoE expert tensors. Separate from `--lora-r` because the rank is paid **per expert per layer** (256 × 41 on Qwen3.6-35B-A3B): r=4 is 236M adapter params (~3.5 GiB with grads + AdamW moments), r=8 is double that. |
+| `--expert-quant-mode` | `live` | `live` re-quantizes base+LoRA every forward; `frozen` quantizes the expert base once at wrap time. See the mode table above — `live` is ~92 min/forward on a 35B MoE. |
+| `--no-expert-qat` | off | Skip fused 3-D experts entirely (Linear-only QAT, the pre-2026-08 behaviour). |
 
 `load_hybrid_config(search_results.json, tier)` resolves each MagicQuant scheme
 name (`"MXFP4_MOE"`, `"Q4_K_M"`, …) to its ggml block type name (`"MXFP4"`,
 `"Q4_K"`, …) — the name the fake-quant dispatcher uses — and returns
-`{group: ggml_type_name}` for `wrap_model`.
+`{group: ggml_type_name}` for `wrap_model`. `load_tensor_config` does the same for
+a run's per-tensor `tensor_config` (budget builds), which takes precedence.
 
 The dataset is tokenized with **completion-only loss**: each chat example's prompt
 (everything up to and including the final user turn's generation prompt) is masked
@@ -279,6 +367,12 @@ inflating perplexity on *every* MagicQuant pack — base 21.9→12.6 after the f
   that is LoRA domain adaptation, not quantization magic. Always cite the
   confound-controlled +3.19 → +1.67 gap, not the raw quant-vs-QAT drop, when
   attributing a number to QAT.
+- **The validated result is a dense model, Linear-only.** Every number above comes
+  from Qwen2.5-0.5B with `QATLinear` in `live` semantics. Fused 3-D MoE expert QAT
+  reuses the same fake-quant kernels and the same merged-weight discipline, but no
+  recovery figure has been measured for it — and `frozen` mode is a *weaker*
+  approximation than anything that produced these numbers (see the mode table
+  above). Do not quote 47.5% / 38.1% for an MoE expert run.
 
 ---
 
@@ -288,12 +382,16 @@ inflating perplexity on *every* MagicQuant pack — base 21.9→12.6 after the f
 magicquant/qat/
   fake_quant.py   — differentiable per-scheme fake-quant + STE (validated vs libggml)
   wrap.py         — QATLinear (fake-quants merged base+LoRA) + wrap_model + bake/merge handoff
-  names.py        — HF module path → GGUF tensor name (reuses gguf/source.py patterns)
-  config.py       — load_hybrid_config: search_results.json + tier → {group: ggml_type_name}
+  expert_wrap.py  — FusedExpertQAT: parametrization + per-expert LoRA for fused 3-D MoE experts
+  names.py        — HF module path → GGUF tensor name(s); fused_expert_segments for 3-D experts
+  config.py       — load_hybrid_config ({group: scheme}) + load_tensor_config ({tensor: scheme})
+  merge.py        — streaming on-disk base+adapter merge (2-D and 3-D expert keys)
   train.py        — run_qat: completion-only QAT-LoRA loop + adapter/meta save (offline tiny fallback)
   validate.py     — compare_perplexity: QAT hybrid vs plain hybrid via llama-perplexity
 ```
 
 Tests: `tests/test_fake_quant.py` (fidelity vs libggml), `tests/test_qat_wrap.py`,
-`tests/test_qat_handoff.py`, `tests/test_qat_config.py`, `tests/test_qat_names.py`,
+`tests/test_qat_expert_wrap.py` (fused 3-D experts, incl. interception of the real
+`Qwen3_5MoeExperts.forward`), `tests/test_qat_handoff.py`,
+`tests/test_qat_config.py`, `tests/test_qat_names.py`, `tests/test_qat_merge.py`,
 `tests/test_qat_validate.py`, `tests/test_qat_smoke.py` (end-to-end one-step run).

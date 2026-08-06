@@ -12,8 +12,15 @@ surface (``fake_quant``, ``FakeQuantSTE``, ``SCHEME_FAKE_QUANT``, ``QATLinear``,
 environment can still import the package and its pure submodules.
 """
 
-from magicquant.qat.config import load_hybrid_config  # noqa: F401  (pure)
-from magicquant.qat.names import hf_to_ggml_name  # noqa: F401  (pure)
+from magicquant.qat.config import (  # noqa: F401  (pure)
+    load_hybrid_config,
+    load_tensor_config,
+)
+from magicquant.qat.names import (  # noqa: F401  (pure)
+    ExpertSegment,
+    fused_expert_segments,
+    hf_to_ggml_name,
+)
 
 __all__ = [
     "fake_quant",
@@ -24,8 +31,16 @@ __all__ = [
     "bake_for_eval",
     "merge_qat_adapters",
     "run_qat",
+    "FusedExpertQAT",
+    "wrap_fused_experts",
+    "fused_expert_adapter_state",
+    "merge_fused_expert_adapters",
+    "estimate_expert_qat_cost",
+    "ExpertSegment",
+    "fused_expert_segments",
     "hf_to_ggml_name",
     "load_hybrid_config",
+    "load_tensor_config",
 ]
 
 # Torch-dependent names → (module, attribute), imported only on first access so
@@ -39,6 +54,17 @@ _LAZY = {
     "bake_for_eval": ("magicquant.qat.wrap", "bake_for_eval"),
     "merge_qat_adapters": ("magicquant.qat.wrap", "merge_qat_adapters"),
     "run_qat": ("magicquant.qat.train", "run_qat"),
+    "FusedExpertQAT": ("magicquant.qat.expert_wrap", "FusedExpertQAT"),
+    "wrap_fused_experts": ("magicquant.qat.expert_wrap", "wrap_fused_experts"),
+    "fused_expert_adapter_state": (
+        "magicquant.qat.expert_wrap", "fused_expert_adapter_state",
+    ),
+    "merge_fused_expert_adapters": (
+        "magicquant.qat.expert_wrap", "merge_fused_expert_adapters",
+    ),
+    "estimate_expert_qat_cost": (
+        "magicquant.qat.expert_wrap", "estimate_expert_qat_cost",
+    ),
 }
 
 

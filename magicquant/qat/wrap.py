@@ -12,6 +12,13 @@ name (``hf_to_ggml_name``), classifies it into a tensor group
 (``TensorGroupClassifier``), looks up the group's scheme, and swaps in a
 ``QATLinear`` for that scheme. Groups that are BF16 (passthrough) or absent from
 the scheme map are left untouched (no quant-awareness needed / wanted there).
+
+``wrap_model`` also covers what the Linear walk structurally cannot see: FUSED
+3-D MoE expert parameters (``mlp.experts.gate_up_proj`` and friends), which are
+raw ``nn.Parameter``s on a plain module and are ~93% of a modern MoE's weights.
+Those are handed to ``magicquant.qat.expert_wrap.wrap_fused_experts``, which
+parametrizes the Parameter itself. Set ``wrap_experts=False`` to keep the old
+Linear-only behaviour.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from magicquant.qat.expert_wrap import MODE_LIVE, wrap_fused_experts
 from magicquant.qat.fake_quant import fake_quant
 from magicquant.qat.names import hf_to_ggml_name
 
@@ -124,6 +132,13 @@ _DEFAULT_LORA_R = 32
 _DEFAULT_LORA_ALPHA = 64
 
 
+# Per-expert LoRA is a separate knob: 256 experts x 40 layers means the rank is
+# multiplied by ~10k, not by the layer count, so the Linear default would be
+# wildly out of scale. See expert_wrap.estimate_expert_qat_cost.
+_DEFAULT_EXPERT_LORA_R = 4
+_DEFAULT_EXPERT_LORA_ALPHA = 8.0
+
+
 def wrap_model(
     model: nn.Module,
     scheme_by_group: Dict[str, str],
@@ -131,15 +146,29 @@ def wrap_model(
     *,
     lora_r: int = _DEFAULT_LORA_R,
     lora_alpha: float = _DEFAULT_LORA_ALPHA,
+    scheme_by_tensor: Optional[Dict[str, str]] = None,
+    wrap_experts: bool = True,
+    expert_lora_r: int = _DEFAULT_EXPERT_LORA_R,
+    expert_lora_alpha: float = _DEFAULT_EXPERT_LORA_ALPHA,
+    expert_quant_mode: str = MODE_LIVE,
 ) -> nn.Module:
-    """Replace routed ``nn.Linear`` modules with ``QATLinear`` in place.
+    """Wrap a model's quantized weights for QAT, in place.
 
-    For each ``nn.Linear``: map its module path to a GGUF tensor name, classify it
-    into a tensor group, look up the group's ggml scheme. If the scheme is present
-    and not BF16 (passthrough), swap the module for a ``QATLinear``. Unmapped
-    names, unrouted groups, and BF16 groups are left untouched.
+    ``nn.Linear`` modules: map the module path to a GGUF tensor name, resolve its
+    ggml scheme (per-tensor map first, then the module's tensor group), and swap
+    in a ``QATLinear``. Unmapped names, unrouted groups, and BF16 schemes are
+    left untouched. Linears whose weight isn't 2-D are skipped (a fused 3-D
+    "Linear" is an expert stack, handled below, not a matrix ``QATLinear`` can
+    take apart).
 
-    ``lora_r``/``lora_alpha`` are keyword-only (uniform across wrapped layers).
+    Fused 3-D MoE expert parameters: delegated to
+    ``expert_wrap.wrap_fused_experts`` (parametrization on the Parameter, with
+    its own LoRA rank/alpha and quant mode). Disable with ``wrap_experts=False``.
+
+    ``scheme_by_tensor`` (``{gguf_tensor_name: ggml_type_name}``, from a search
+    run's ``tensor_config``) takes precedence over ``scheme_by_group`` wherever
+    it names a tensor -- a budget build's per-tensor map really does disagree
+    with its own group projection.
 
     Returns the same ``model`` (mutated in place).
     """
@@ -148,11 +177,17 @@ def wrap_model(
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
+        if getattr(module, "weight", None) is None or module.weight.ndim != 2:
+            continue
         ggml_name = hf_to_ggml_name(name)
         if ggml_name is None:
             continue
-        group = classifier.classify_tensor(ggml_name)
-        scheme = scheme_by_group.get(group)
+        scheme = None
+        if scheme_by_tensor:
+            scheme = scheme_by_tensor.get(ggml_name)
+        if scheme is None:
+            group = classifier.classify_tensor(ggml_name)
+            scheme = scheme_by_group.get(group)
         if not scheme or scheme == "BF16":
             continue
         to_replace.append((name, module, scheme))
@@ -165,6 +200,17 @@ def wrap_model(
             lora_alpha=lora_alpha,
         )
         _set_submodule(model, name, qat)
+
+    if wrap_experts:
+        wrap_fused_experts(
+            model,
+            scheme_by_group,
+            classifier,
+            scheme_by_tensor,
+            lora_r=expert_lora_r,
+            lora_alpha=expert_lora_alpha,
+            mode=expert_quant_mode,
+        )
 
     return model
 

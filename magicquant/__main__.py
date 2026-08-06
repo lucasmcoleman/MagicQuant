@@ -490,6 +490,13 @@ def cmd_qat(args: argparse.Namespace) -> None:
         "max_seq_len": args.max_seq_len,
         "save_steps": args.save_steps,
         "resume": args.resume,
+        "expert_lora_r": args.expert_lora_r,
+        "expert_lora_alpha": (
+            args.expert_lora_alpha if args.expert_lora_alpha is not None
+            else 2.0 * args.expert_lora_r
+        ),
+        "expert_quant_mode": args.expert_quant_mode,
+        "wrap_experts": args.wrap_experts,
     }
     if args.config:
         cfg["config"] = args.config
@@ -1062,6 +1069,30 @@ def main() -> None:
     qat_parser.add_argument(
         "--no-resume", dest="resume", action="store_false",
         help="Ignore any existing checkpoint in --out and start fresh",
+    )
+    qat_parser.add_argument(
+        "--expert-lora-r", dest="expert_lora_r", type=int, default=4,
+        help="LoRA rank for FUSED 3-D MoE expert tensors (default: 4). Kept "
+             "separate from --lora-r because the rank is paid per expert per "
+             "layer (256 x 40 on Qwen3.6-35B-A3B), not per layer",
+    )
+    qat_parser.add_argument(
+        "--expert-lora-alpha", dest="expert_lora_alpha", type=float, default=None,
+        help="LoRA alpha for fused 3-D expert tensors (default: 2 x --expert-lora-r)",
+    )
+    qat_parser.add_argument(
+        "--expert-quant-mode", dest="expert_quant_mode",
+        choices=("live", "frozen"), default="live",
+        help="How expert tensors are fake-quantized: 'live' re-quantizes "
+             "base+LoRA every forward (faithful, but O(all experts) per step); "
+             "'frozen' quantizes the base once at wrap time and trains a "
+             "full-precision adapter on top (feasible for 30B+ MoEs). "
+             "Default: live",
+    )
+    qat_parser.add_argument(
+        "--no-expert-qat", dest="wrap_experts", action="store_false", default=True,
+        help="Skip fused 3-D MoE expert tensors entirely (Linear-only QAT, the "
+             "pre-2026-08 behaviour)",
     )
     qat_parser.set_defaults(func=cmd_qat)
 
