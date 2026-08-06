@@ -497,6 +497,7 @@ def cmd_qat(args: argparse.Namespace) -> None:
         ),
         "expert_quant_mode": args.expert_quant_mode,
         "wrap_experts": args.wrap_experts,
+        "gradient_checkpointing": args.gradient_checkpointing,
     }
     if args.config:
         cfg["config"] = args.config
@@ -1093,6 +1094,15 @@ def main() -> None:
         "--no-expert-qat", dest="wrap_experts", action="store_false", default=True,
         help="Skip fused 3-D MoE expert tensors entirely (Linear-only QAT, the "
              "pre-2026-08 behaviour)",
+    )
+    qat_parser.add_argument(
+        "--gradient-checkpointing", dest="gradient_checkpointing",
+        action="store_true", default=False,
+        help="Recompute activations in the backward pass instead of storing "
+             "them. run_qat has always supported this; the CLI could not set it "
+             "until fused-expert QAT made it load-bearing -- a wrapped MoE "
+             "otherwise retains every layer's materialized expert weight in the "
+             "autograd graph (~66 GiB on Qwen3.6-35B-A3B, on top of the base)",
     )
     qat_parser.set_defaults(func=cmd_qat)
 

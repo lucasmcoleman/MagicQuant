@@ -217,6 +217,7 @@ magicquant qat ./my-model \
 | `--expert-lora-r` / `--expert-lora-alpha` | 4 / 2×r | Rank / scaling for FUSED 3-D MoE expert tensors. Separate from `--lora-r` because the rank is paid **per expert per layer** (256 × 41 on Qwen3.6-35B-A3B): r=4 is 236M adapter params (~3.5 GiB with grads + AdamW moments), r=8 is double that. |
 | `--expert-quant-mode` | `live` | `live` re-quantizes base+LoRA every forward; `frozen` quantizes the expert base once at wrap time. See the mode table above — `live` is ~92 min/forward on a 35B MoE. |
 | `--no-expert-qat` | off | Skip fused 3-D experts entirely (Linear-only QAT, the pre-2026-08 behaviour). |
+| `--gradient-checkpointing` | off | Recompute activations in the backward pass. **Effectively required with fused-expert QAT on a large MoE**: without it the autograd graph retains every layer's materialized expert weight (~66 GiB on Qwen3.6-35B-A3B, on top of the base). |
 
 `load_hybrid_config(search_results.json, tier)` resolves each MagicQuant scheme
 name (`"MXFP4_MOE"`, `"Q4_K_M"`, …) to its ggml block type name (`"MXFP4"`,

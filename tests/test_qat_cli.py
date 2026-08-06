@@ -98,6 +98,7 @@ def _run_cmd_qat_capturing_cfg(monkeypatch, tmp_path, **arg_overrides):
         expert_lora_alpha=None,
         expert_quant_mode="live",
         wrap_experts=True,
+        gradient_checkpointing=False,
     )
     defaults.update(arg_overrides)
     args = argparse.Namespace(**defaults)
@@ -152,6 +153,22 @@ def test_cmd_qat_defaults_expert_alpha_to_twice_the_rank(monkeypatch, tmp_path):
     )
     assert cfg["expert_lora_r"] == 8
     assert cfg["expert_lora_alpha"] == 16.0
+
+
+def test_gradient_checkpointing_defaults_off_and_is_settable(monkeypatch):
+    assert _parse_qat_args(monkeypatch, []).gradient_checkpointing is False
+    args = _parse_qat_args(monkeypatch, ["--gradient-checkpointing"])
+    assert args.gradient_checkpointing is True
+
+
+def test_cmd_qat_passes_gradient_checkpointing_into_cfg(monkeypatch, tmp_path):
+    """run_qat has always honoured this key; before fused-expert QAT the CLI
+    had no way to set it, which on a wrapped MoE is the difference between a
+    run and an OOM."""
+    cfg = _run_cmd_qat_capturing_cfg(
+        monkeypatch, tmp_path, gradient_checkpointing=True
+    )
+    assert cfg["gradient_checkpointing"] is True
 
 
 def test_cmd_qat_passes_explicit_expert_knobs_into_cfg(monkeypatch, tmp_path):
