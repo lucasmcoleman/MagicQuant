@@ -28,6 +28,7 @@ from magicquant.qat.expert_wrap import (
     ResolvedSegment,
     estimate_expert_qat_cost,
     expert_cache_disabled,
+    expert_cache_enabled,
     fused_expert_adapter_meta,
     fused_expert_adapter_state,
     iter_expert_parametrizations,
@@ -47,9 +48,18 @@ pytestmark = pytest.mark.filterwarnings("ignore:.*is not a multiple of.*")
 
 @pytest.fixture(autouse=True)
 def _clean_expert_cache():
-    """The expert-weight cache is module-global; don't let it leak across tests."""
+    """The expert-weight cache is module-global; don't let it leak across tests.
+
+    Also pins ``.enabled`` back to the real default (off, per
+    ``_cache_enabled_by_default()``) around each test -- belt-and-braces on top
+    of the ``expert_cache_enabled``/``expert_cache_disabled`` context managers'
+    own save/restore, in case a test raises before its ``with`` block restores.
+    """
+    default_enabled = expert_wrap_mod._cache_enabled_by_default()
+    expert_wrap_mod._WEIGHT_CACHE.enabled = default_enabled
     expert_wrap_mod._WEIGHT_CACHE.clear()
     yield
+    expert_wrap_mod._WEIGHT_CACHE.enabled = default_enabled
     expert_wrap_mod._WEIGHT_CACHE.clear()
 
 
@@ -619,12 +629,39 @@ def test_real_expert_row_widths_do_not_warn():
         )
 
 
-# ── the per-forward cache ─────────────────────────────────────────────────────
+# ── the per-forward cache (opt-in; OFF by default since 2026-08-06) ───────────
 #
-# The eager MoE forward reads the fused parameter once per HIT EXPERT (up to 256
-# times per layer). Without a cache that is 256 full rebuilds of a multi-GB
-# weight, which is the difference between a run that finishes and one that
-# doesn't -- so the cache's behaviour is asserted, not assumed.
+# For a genuinely eager MoE forward that reads the fused parameter once per HIT
+# EXPERT (up to 256 times per layer), a cache would avoid 256 full rebuilds of a
+# multi-GB weight per forward -- so that mechanism is still exercised here, but
+# always inside ``expert_cache_enabled()``: the real model this module ships
+# for (transformers' actual grouped-matmul MoE forward) does not loop like that,
+# and the cache measurably breaks non-reentrant gradient checkpointing on it
+# (see the module-level design note in expert_wrap.py and
+# ``test_cache_is_disabled_by_default`` below). Nothing in the default
+# (uncached) path may rely on hit/evict/invalidate behavior these tests only
+# exercise once opted in.
+
+def test_cache_is_disabled_by_default():
+    """Locks in the 2026-08-06 fix (CheckpointError incident, expert_wrap.py)."""
+    assert expert_wrap_mod._cache_enabled_by_default() is False
+    assert expert_wrap_mod._WEIGHT_CACHE.enabled is False
+    torch.manual_seed(0)
+    experts = TinyExperts()
+    p = FusedExpertQAT(
+        experts.gate_up_proj.shape, _segments("Q8_0"), lora_r=2, lora_alpha=4,
+        mode=MODE_LIVE,
+    )
+    parametrize.register_parametrization(experts, "gate_up_proj", p, unsafe=True)
+    hits_before = expert_wrap_mod._WEIGHT_CACHE.hits
+    first = experts.gate_up_proj
+    second = experts.gate_up_proj
+    # Correct either way (both are the same fake-quant computation), but NOT
+    # served from cache: no hit recorded, no entry retained.
+    assert torch.equal(first, second)
+    assert expert_wrap_mod._WEIGHT_CACHE.hits == hits_before
+    assert len(expert_wrap_mod._WEIGHT_CACHE._entries) == 0
+
 
 def test_repeated_access_within_a_forward_is_computed_once():
     torch.manual_seed(0)
@@ -633,10 +670,11 @@ def test_repeated_access_within_a_forward_is_computed_once():
         experts.gate_up_proj.shape, _segments("Q8_0"), lora_r=2, lora_alpha=4,
         mode=MODE_LIVE,
     )
-    parametrize.register_parametrization(experts, "gate_up_proj", p, unsafe=True)
-    first = experts.gate_up_proj
-    assert experts.gate_up_proj is first  # cache hit, same tensor object
-    assert expert_wrap_mod._WEIGHT_CACHE.hits >= 1
+    with expert_cache_enabled():
+        parametrize.register_parametrization(experts, "gate_up_proj", p, unsafe=True)
+        first = experts.gate_up_proj
+        assert experts.gate_up_proj is first  # cache hit, same tensor object
+        assert expert_wrap_mod._WEIGHT_CACHE.hits >= 1
 
 
 def test_cache_is_invalidated_by_an_optimizer_style_update():
@@ -646,12 +684,13 @@ def test_cache_is_invalidated_by_an_optimizer_style_update():
         experts.gate_up_proj.shape, _segments("Q8_0"), lora_r=2, lora_alpha=4,
         mode=MODE_LIVE,
     )
-    parametrize.register_parametrization(experts, "gate_up_proj", p, unsafe=True)
-    before = experts.gate_up_proj.clone()
-    with torch.no_grad():
-        p.lora_expert_A.add_(0.5)  # what optimizer.step() does, in place
-    after = experts.gate_up_proj
-    assert not torch.allclose(before, after), "stale cached weight was served"
+    with expert_cache_enabled():
+        parametrize.register_parametrization(experts, "gate_up_proj", p, unsafe=True)
+        before = experts.gate_up_proj.clone()
+        with torch.no_grad():
+            p.lora_expert_A.add_(0.5)  # what optimizer.step() does, in place
+        after = experts.gate_up_proj
+        assert not torch.allclose(before, after), "stale cached weight was served"
 
 
 def test_cache_is_invalidated_by_grad_mode():
@@ -662,13 +701,14 @@ def test_cache_is_invalidated_by_grad_mode():
         experts.gate_up_proj.shape, _segments("Q8_0"), lora_r=2, lora_alpha=4,
         mode=MODE_LIVE,
     )
-    parametrize.register_parametrization(experts, "gate_up_proj", p, unsafe=True)
-    with torch.no_grad():
-        no_grad_w = experts.gate_up_proj
-    assert no_grad_w.grad_fn is None
-    with_grad_w = experts.gate_up_proj
-    assert with_grad_w is not no_grad_w
-    assert with_grad_w.grad_fn is not None
+    with expert_cache_enabled():
+        parametrize.register_parametrization(experts, "gate_up_proj", p, unsafe=True)
+        with torch.no_grad():
+            no_grad_w = experts.gate_up_proj
+        assert no_grad_w.grad_fn is None
+        with_grad_w = experts.gate_up_proj
+        assert with_grad_w is not no_grad_w
+        assert with_grad_w.grad_fn is not None
 
 
 def test_cache_is_bounded_and_evicts():
@@ -677,20 +717,21 @@ def test_cache_is_bounded_and_evicts():
     torch.manual_seed(0)
     models = [TinyExperts() for _ in range(3)]
     ps = []
-    for m in models:
-        p = FusedExpertQAT(
-            m.gate_up_proj.shape, _segments("Q8_0"), lora_r=2, lora_alpha=4,
-            mode=MODE_LIVE,
-        )
-        parametrize.register_parametrization(m, "gate_up_proj", p, unsafe=True)
-        ps.append(p)
+    with expert_cache_enabled():
+        for m in models:
+            p = FusedExpertQAT(
+                m.gate_up_proj.shape, _segments("Q8_0"), lora_r=2, lora_alpha=4,
+                mode=MODE_LIVE,
+            )
+            parametrize.register_parametrization(m, "gate_up_proj", p, unsafe=True)
+            ps.append(p)
 
-    first = models[0].gate_up_proj
-    _second = models[1].gate_up_proj
-    assert models[0].gate_up_proj is first  # still cached (2 entries)
-    _third = models[2].gate_up_proj         # evicts the oldest
-    assert models[0].gate_up_proj is not first
-    assert len(expert_wrap_mod._WEIGHT_CACHE._entries) <= 2
+        first = models[0].gate_up_proj
+        _second = models[1].gate_up_proj
+        assert models[0].gate_up_proj is first  # still cached (2 entries)
+        _third = models[2].gate_up_proj         # evicts the oldest
+        assert models[0].gate_up_proj is not first
+        assert len(expert_wrap_mod._WEIGHT_CACHE._entries) <= 2
 
 
 def test_cached_and_uncached_results_agree():
@@ -703,7 +744,8 @@ def test_cached_and_uncached_results_agree():
     parametrize.register_parametrization(experts, "gate_up_proj", p, unsafe=True)
     with torch.no_grad():
         p.lora_expert_A.normal_(0, 0.1)
-    cached = experts.gate_up_proj.detach().clone()
+    with expert_cache_enabled():
+        cached = experts.gate_up_proj.detach().clone()
     with expert_cache_disabled():
         uncached = experts.gate_up_proj.detach().clone()
     assert torch.equal(cached, uncached)
@@ -717,13 +759,14 @@ def test_gradients_still_flow_through_a_cached_weight():
         experts.gate_up_proj.shape, _segments("Q8_0"), lora_r=2, lora_alpha=4,
         mode=MODE_LIVE,
     )
-    parametrize.register_parametrization(experts, "gate_up_proj", p, unsafe=True)
-    experts.parametrizations["gate_up_proj"].original.requires_grad = False
-    x = torch.randn(3, 6)
-    (experts(x, 0).sum() + experts(x, 2).sum()).backward()
-    assert p.lora_expert_A.grad[0].abs().sum() > 0
-    assert p.lora_expert_A.grad[2].abs().sum() > 0
-    assert p.lora_expert_A.grad[1].abs().sum() == 0  # expert 1 was never used
+    with expert_cache_enabled():
+        parametrize.register_parametrization(experts, "gate_up_proj", p, unsafe=True)
+        experts.parametrizations["gate_up_proj"].original.requires_grad = False
+        x = torch.randn(3, 6)
+        (experts(x, 0).sum() + experts(x, 2).sum()).backward()
+        assert p.lora_expert_A.grad[0].abs().sum() > 0
+        assert p.lora_expert_A.grad[2].abs().sum() > 0
+        assert p.lora_expert_A.grad[1].abs().sum() == 0  # expert 1 was never used
 
 
 # ── the real transformers MoE forward ─────────────────────────────────────────
@@ -791,6 +834,75 @@ def test_intercepts_the_real_qwen3_5_moe_experts_forward():
         dim=1,
     )
     assert torch.allclose(experts.gate_up_proj[2], expected[2], atol=1e-6)
+
+
+# ── regression: cache OFF must not break non-reentrant grad checkpointing ────
+#
+# 2026-08-06 INCIDENT: with the expert-weight cache enabled (its old default),
+# a real backward through a checkpointed (use_reentrant=False)
+# ``Qwen3_5MoeForCausalLM`` with wrapped experts raised
+# ``torch.utils.checkpoint.CheckpointError`` at the FIRST backward -- the
+# recompute pass got served a stale cache hit instead of a fresh
+# recomputation, so the number of tensors saved during forward vs.
+# recomputation disagreed. Reproduced in both live and frozen expert-quant
+# mode. This test exercises the exact failing scenario end to end (real
+# model, real gradient checkpointing, real backward) and asserts it now
+# succeeds with the cache at its new default (off).
+
+@pytest.mark.parametrize("mode", [MODE_LIVE, MODE_FROZEN])
+def test_wrapped_experts_survive_a_real_checkpointed_backward(mode):
+    """The exact crash scenario: wrap_experts=True + non-reentrant grad
+    checkpointing on a real Qwen3_5MoeForCausalLM, then a real backward."""
+    modeling = pytest.importorskip(
+        "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe"
+    )
+    configuration = pytest.importorskip(
+        "transformers.models.qwen3_5_moe.configuration_qwen3_5_moe"
+    )
+    assert expert_wrap_mod._WEIGHT_CACHE.enabled is False, (
+        "this test must run with the cache at its real default -- it's the "
+        "thing being regression-tested"
+    )
+
+    torch.manual_seed(0)
+    cfg = configuration.Qwen3_5MoeTextConfig(
+        hidden_size=32, moe_intermediate_size=16, num_experts=4,
+        num_experts_per_tok=2, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, vocab_size=64, head_dim=8,
+        linear_key_head_dim=8, linear_value_head_dim=8,
+        linear_num_key_heads=2, linear_num_value_heads=4,
+        # One full-attention + one linear-attention layer: the real model is
+        # this same hybrid mix (10 of 40 layers full_attention), and grad
+        # checkpointing must survive both layer types.
+        layer_types=["full_attention", "linear_attention"],
+    )
+    model = modeling.Qwen3_5MoeForCausalLM(cfg)
+
+    wrap_fused_experts(
+        model, {"X": "Q8_0"}, TensorGroupClassifier(),
+        lora_r=2, lora_alpha=4, mode=mode,
+    )
+    params = list(iter_expert_parametrizations(model))
+    assert len(params) == 4  # gate_up_proj + down_proj x 2 layers
+
+    # Mirrors magicquant.qat.train._enable_gradient_checkpointing exactly.
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.enable_input_require_grads()
+    model.train()
+
+    input_ids = torch.randint(0, cfg.vocab_size, (2, 6))
+    out = model(input_ids=input_ids, labels=input_ids.clone(), use_cache=False)
+    assert torch.isfinite(out.loss)
+
+    # Before this fix: CheckpointError here ("A different number of tensors
+    # was saved during the original forward and recomputation").
+    out.loss.backward()
+
+    for p in params:
+        assert p.lora_expert_A.grad is not None, f"{p.param_name}: no grad at all"
+        assert p.lora_expert_A.grad.abs().sum() > 0, (
+            f"{p.param_name}: expert LoRA A grad is all-zero"
+        )
 
 
 def test_kaiming_init_is_finite_and_nonzero():

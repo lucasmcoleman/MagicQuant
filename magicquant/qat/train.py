@@ -27,6 +27,11 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from magicquant.qat.config import load_hybrid_config, load_tensor_config
+from magicquant.qat.diskmap import (
+    QATKeyReconciliationError,
+    reconcile_key_to_disk,
+    resolve_adapter_targets,
+)
 from magicquant.qat.expert_wrap import (
     EXPERT_QUANT_MODES,
     MODE_LIVE,
@@ -42,6 +47,14 @@ _log = logging.getLogger("magicquant.qat.train")
 
 # Label id that the loss ignores (HF convention).
 IGNORE_INDEX = -100
+
+# ``loaded_from`` value when the requested model couldn't be loaded and
+# ``_build_offline_tiny_model`` filled in instead (see
+# ``_load_model_and_tokenizer``). No real on-disk checkpoint backs this model,
+# so adapter-key disk reconciliation (``_try_load_base_weight_map``) is a
+# guaranteed no-op for it -- checked by identity against this constant rather
+# than re-deriving "is this a real model" some other way.
+_OFFLINE_TINY_MODEL_SENTINEL = "offline-tiny-llama"
 
 
 # ── completion-only collator ──────────────────────────────────────────────────
@@ -268,7 +281,7 @@ def _build_offline_tiny_model():
         eos_token_id=tokenizer.eos_token_id,
     )
     model = LlamaForCausalLM(config).to(torch.float32)
-    return model, tokenizer, "offline-tiny-llama"
+    return model, tokenizer, _OFFLINE_TINY_MODEL_SENTINEL
 
 
 def _build_byte_tokenizer():
@@ -339,6 +352,55 @@ def _resolve_scheme_by_tensor(cfg: Dict[str, Any]) -> Dict[str, str]:
                 "falling back to the per-group map only.", config_path, tier, exc,
             )
     return {}
+
+
+def _try_load_base_weight_map(
+    model_id: str, loaded_from: str
+) -> Optional[Dict[str, str]]:
+    """Best-effort: the base checkpoint's on-disk ``{tensor_name: shard}`` map.
+
+    Feeds both halves of the 2026-08-05 adapter-key fix (see
+    ``magicquant.qat.diskmap``): ``run_qat``'s pre-flight key check and
+    ``_save_adapters``'s save-time reconciliation both need the SAME map, so
+    it's loaded exactly once here and threaded through.
+
+    Reuses ``magicquant.qat.merge``'s own resolver/loader (not a second
+    implementation) specifically so the map used to reconcile adapter keys at
+    train time is IDENTICAL to the one ``magicquant qat-merge`` will look
+    tensors up in later -- any drift between the two would defeat the whole
+    point.
+
+    Returns ``None`` (never raises) when there's nothing real to check
+    against:
+      * ``loaded_from`` is the offline-tiny-model sentinel (see
+        ``_load_model_and_tokenizer`` / ``_build_offline_tiny_model``) -- no
+        on-disk checkpoint backs that model at all, so there's nothing to
+        resolve keys against and no point spending a network round-trip
+        finding that out.
+      * any other resolution failure (bad path, no safetensors found, a Hub
+        lookup error) -- a model that loaded some other way but has no
+        derivable weight map means reconciliation simply can't run, not that
+        the run itself is broken. Logged as a WARNING either way, so a
+        silently skipped preflight is still visible in the run's log.
+    """
+    if loaded_from == _OFFLINE_TINY_MODEL_SENTINEL:
+        return None
+    from magicquant.qat.merge import _load_weight_map, _resolve_base_model_dir
+
+    try:
+        model_dir = _resolve_base_model_dir(model_id)
+        weight_map, _meta = _load_weight_map(model_dir)
+        return weight_map
+    except Exception as exc:  # best-effort -- see docstring
+        _log.warning(
+            "Could not load a base-checkpoint weight map for %r (%s); "
+            "adapter target keys will NOT be reconciled against on-disk "
+            "names or preflight-checked this run. If the loaded model's "
+            "module names differ from its own checkpoint's safetensors "
+            "names (the 2026-08-05 'language_model' nesting incident), that "
+            "will only surface later, at merge time.", model_id, exc,
+        )
+        return None
 
 
 def _config_hash(
@@ -428,7 +490,9 @@ def _enable_gradient_checkpointing(model) -> bool:
     return True
 
 
-def _save_adapters(model, out_dir: str) -> str:
+def _save_adapters(
+    model, out_dir: str, weight_map: Optional[Dict[str, str]] = None
+) -> str:
     """Save every LoRA adapter to ``adapter_model.safetensors``.
 
     Two key families, both consumed by ``magicquant.qat.merge``:
@@ -450,15 +514,53 @@ def _save_adapters(model, out_dir: str) -> str:
         ``qat_meta.json``.
 
     All tensors are written fp32 on CPU.
+
+    SAVE-TIME key reconciliation (2026-08-05 fix -- see
+    ``magicquant.qat.diskmap``): ``module_path``/``base_tensor_key`` above are
+    the loaded model's OWN module-graph names, which can differ from what the
+    base checkpoint's safetensors actually call the same tensor (Qwen3.6:
+    ``model.layers...`` in the module graph vs. ``model.language_model.layers...``
+    on disk). If ``weight_map`` is given (the base checkpoint's
+    ``model.safetensors.index.json`` weight map, normally loaded once by
+    ``run_qat`` and threaded through here), every 2-D key is reconciled
+    against it before being written, and the SAME map is passed to
+    ``fused_expert_adapter_state`` for the 3-D keys -- so what actually lands
+    in ``adapter_model.safetensors`` is always the DISK key, never a name the
+    merge step would refuse. ``weight_map=None`` (the default) preserves the
+    pre-fix behavior for callers with no real checkpoint to reconcile against.
+
+    Raises:
+        QATKeyReconciliationError: ``weight_map`` was given and one or more
+            ``QATLinear`` target keys didn't resolve against it (listed all
+            at once), or (propagated from ``fused_expert_adapter_state``) one
+            or more fused-expert target keys didn't. ``run_qat``'s preflight
+            should already have caught this before training started; this is
+            the save-time backstop.
     """
     from safetensors.torch import save_file
 
+    weight_map_keys = frozenset(weight_map.keys()) if weight_map is not None else None
     state: Dict[str, torch.Tensor] = {}
+    unresolved: List[str] = []
     for name, module in model.named_modules():
-        if isinstance(module, QATLinear):
-            state[f"{name}.lora_A"] = module.lora_A.detach().to(torch.float32).cpu()
-            state[f"{name}.lora_B"] = module.lora_B.detach().to(torch.float32).cpu()
-    state.update(fused_expert_adapter_state(model))
+        if not isinstance(module, QATLinear):
+            continue
+        disk_module_path = name
+        if weight_map_keys is not None:
+            resolved = reconcile_key_to_disk(f"{name}.weight", weight_map_keys)
+            if resolved is None:
+                unresolved.append(f"{name}.weight")
+                continue
+            disk_module_path = resolved[: -len(".weight")]
+        state[f"{disk_module_path}.lora_A"] = module.lora_A.detach().to(torch.float32).cpu()
+        state[f"{disk_module_path}.lora_B"] = module.lora_B.detach().to(torch.float32).cpu()
+    if unresolved:
+        raise QATKeyReconciliationError(
+            f"{len(unresolved)} QATLinear adapter target key(s) could not be "
+            f"resolved against the base checkpoint's on-disk weight map at "
+            f"save time: {sorted(unresolved)}"
+        )
+    state.update(fused_expert_adapter_state(model, weight_map))
     path = os.path.join(out_dir, "adapter_model.safetensors")
     save_file(state, path)
     return path
@@ -779,6 +881,34 @@ def run_qat(cfg: Dict[str, Any]) -> str:
             "vs hf_to_ggml_name); training has no trainable parameters."
         )
 
+    # ── PRE-FLIGHT: adapter target keys vs. the base checkpoint's real disk
+    # keys (2026-08-05 fix, blocker #2 -- see magicquant.qat.diskmap). Every
+    # key an adapter will eventually target is checked against the base
+    # checkpoint's own model.safetensors.index.json weight map RIGHT NOW,
+    # before a single training step runs. Without this, a module-graph vs.
+    # on-disk naming mismatch (Qwen3.6: `model.layers...` in the loaded
+    # model vs. `model.language_model.layers...` on disk) surfaces only when
+    # `magicquant qat-merge` refuses the finished adapters -- 390 of 391 keys,
+    # after an entire overnight run, on the actual incident this closes.
+    base_weight_map = _try_load_base_weight_map(cfg["model"], loaded_from)
+    if base_weight_map is not None:
+        linear_names = [
+            name for name, m in model.named_modules() if isinstance(m, QATLinear)
+        ]
+        expert_names = [
+            p.param_name for p in expert_params if p.lora_r > 0 and p.param_name
+        ]
+        # Raises QATKeyReconciliationError (with the full unmapped list) if
+        # anything fails to resolve -- deliberately NOT caught here. An
+        # unattended overnight run should fail loudly in its first minutes,
+        # not silently proceed toward a merge that will refuse its adapters.
+        resolve_adapter_targets(linear_names, expert_names, base_weight_map)
+        _log.info(
+            "Adapter target key preflight OK: %d Linear + %d expert key(s) "
+            "resolve against the base checkpoint's on-disk weight map.",
+            len(linear_names), len(expert_names),
+        )
+
     if expert_params:
         # Both _log.info and print, for the same reason the resume message below
         # does: this module's logger has no handler in a real invocation, and
@@ -890,10 +1020,15 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
     # ── save adapters + metadata ──
-    adapter_path = _save_adapters(model, out_dir)
+    # weight_map is the SAME map the preflight above already validated every
+    # key against (loaded once; see _try_load_base_weight_map) -- reused here
+    # so every saved key is the base checkpoint's real DISK key, not the
+    # loaded model's module-graph name. See _save_adapters's docstring.
+    adapter_path = _save_adapters(model, out_dir, weight_map=base_weight_map)
     meta = {
         "model": cfg["model"],
         "loaded_from": loaded_from,
+        "adapter_keys_reconciled_to_disk": base_weight_map is not None,
         "scheme_by_group": scheme_by_group,
         "config_hash": config_hash,
         "lora_r": lora_r,

@@ -16,6 +16,11 @@ from magicquant.qat.config import (  # noqa: F401  (pure)
     load_hybrid_config,
     load_tensor_config,
 )
+from magicquant.qat.diskmap import (  # noqa: F401  (pure)
+    QATKeyReconciliationError,
+    reconcile_key_to_disk,
+    resolve_adapter_targets,
+)
 from magicquant.qat.names import (  # noqa: F401  (pure)
     ExpertSegment,
     fused_expert_segments,
@@ -41,6 +46,9 @@ __all__ = [
     "hf_to_ggml_name",
     "load_hybrid_config",
     "load_tensor_config",
+    "QATKeyReconciliationError",
+    "reconcile_key_to_disk",
+    "resolve_adapter_targets",
 ]
 
 # Torch-dependent names → (module, attribute), imported only on first access so

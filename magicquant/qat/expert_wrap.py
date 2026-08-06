@@ -32,11 +32,15 @@ property that matters. See ``_save_adapters`` in ``train.py`` for the key names.
 
 Quantization modes
 ------------------
-A fused expert parameter is enormous, and the fake-quant kernels are not cheap:
-measured on this box's gfx1151 GPU, ``Q2_K`` runs at ~2.7 Melem/s and ``Q3_K``
-at ~110 Melem/s. Qwen3.6-35B-A3B has ~33e9 expert elements, so re-quantizing
-them all on every forward is ~90 minutes **per training step** -- not a tuning
-problem, an infeasibility. Hence two modes:
+A fused expert parameter is enormous, and the fake-quant kernels are not cheap.
+An isolated microbenchmark on this box's gfx1151 GPU put ``Q2_K`` at ~2.7
+Melem/s and ``Q3_K`` at ~110 Melem/s; a REAL end-to-end live-mode forward
+through this model's chunked, multi-segment path measured 6-12x slower than
+that (see ``MEASURED_FAKE_QUANT_ELEMS_PER_S``'s comment below for the
+recalibration). Even at the ORIGINAL, too-optimistic numbers, Qwen3.6-35B-A3B's
+~33e9 expert elements put re-quantizing them all on every forward at ~90
+minutes **per training step** -- not a tuning problem, an infeasibility, and
+the real (recalibrated) number is worse. Hence two modes:
 
 ``"live"`` (default)
     ``fake_quant(W + delta)`` every forward, exactly ``QATLinear``'s semantics:
@@ -62,6 +66,7 @@ whether the fake-quant happens per forward or once at wrap.
 from __future__ import annotations
 
 import math
+import os
 import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -70,6 +75,7 @@ import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
 
+from magicquant.qat.diskmap import QATKeyReconciliationError, reconcile_key_to_disk
 from magicquant.qat.fake_quant import fake_quant
 from magicquant.qat.names import ExpertSegment, fused_expert_segments
 
@@ -98,44 +104,82 @@ class ResolvedSegment:
     ggml_type_name: str
 
 
-# ── per-forward result cache ──────────────────────────────────────────────────
+# ── per-forward result cache (OFF BY DEFAULT -- see below) ────────────────────
 #
-# The eager MoE forward reads the fused parameter ONCE PER HIT EXPERT:
+# ORIGINAL PREMISE (why this cache was written): an EAGER per-expert MoE forward
+# reads the fused parameter ONCE PER HIT EXPERT:
 #
 #     for expert_idx in expert_hit:
 #         ... nn.functional.linear(current_state, self.gate_up_proj[expert_idx])
 #
-# With 256 experts and a 512-token batch essentially every expert is hit, so a
-# parametrization with no cache is evaluated ~256 times per layer per forward --
-# each evaluation rebuilding the whole [E, d1, d2] weight. That turns a 1-second
-# bmm into a 4-minute one, and a live fake-quant into something that never
-# finishes.
+# With 256 experts and a 512-token batch essentially every expert is hit, so on
+# an architecture that loops like this, a parametrization with no cache would be
+# evaluated ~256 times per layer per forward -- each evaluation rebuilding the
+# whole [E, d1, d2] weight. torch's own ``parametrize.cached()`` is the
+# documented remedy but is unusable here (it holds every parametrized tensor for
+# the whole context -- ~66 GB at once for this model's expert weights), so this
+# module grew a local, BOUNDED cache instead.
 #
-# torch's own ``parametrize.cached()`` is the documented remedy but is unusable
-# here: it caches every parametrized tensor for the whole context, which for
-# this model is ~66 GB of materialized expert weights held at once. So the cache
-# is local and BOUNDED instead. Size 2 is enough because the loop alternates
-# gate_up_proj / down_proj within one layer and never revisits a previous
-# layer's experts; moving to the next layer evicts naturally.
+# MEASURED, NOT TRUE (2026-08-06): on the actual model this was built for
+# (``transformers.Qwen3_5MoeExperts``, real forward, wrap_experts=True), the
+# real forward does NOT loop per expert -- it reads each fused parameter
+# (``gate_up_proj`` / ``down_proj``) via a batched/grouped matmul, i.e. ONCE per
+# forward. Measured 0 cache hits / 8 misses across a real forward+backward. The
+# premise above simply does not hold for this model class -- the cache buys
+# nothing here.
 #
-# Validity is keyed on the tensors' ``_version`` counters (bumped by any in-place
-# write, which is what ``optimizer.step()`` does) plus the grad mode, so a cached
-# value can never outlive the state it was computed from. This also means a
-# gradient-checkpoint recompute in the backward pass gets a correct value --
-# either a fresh recomputation (normal, since the entry was evicted long before)
-# or an entry whose versions still match.
+# AND IT ACTIVELY BREAKS NON-REENTRANT GRADIENT CHECKPOINTING (the actual
+# incident, reproduced on the real Qwen3_5MoeForCausalLM in both live and
+# frozen expert-quant mode): ``torch.utils.checkpoint`` with
+# ``use_reentrant=False`` discards forward activations and RECOMPUTES the
+# forward during backward, then compares what got saved during that recompute
+# against what was saved the first time. The cache's signature (tensor
+# ``_version`` counters + grad mode) is unchanged between the original forward
+# and the checkpoint recompute, so the recompute gets served a CACHE HIT -- the
+# exact same tensor object produced (and already consumed) during the original
+# forward -- instead of a freshly recomputed one. That breaks the checkpoint
+# machinery's bookkeeping and raises ``CheckpointError`` at the first backward.
+# Gradient checkpointing is not optional for this model (see CLAUDE.md / the
+# QAT report on why an unwrapped autograd graph is ~66 GiB), so this is a hard
+# launch blocker, not a performance nit.
 #
-# Not thread-safe; training here is single-process, single-threaded.
+# CONCLUSION: the cache is now OFF BY DEFAULT. It stays in the module, opt-in
+# (env var ``MAGICQUANT_QAT_EXPERT_WEIGHT_CACHE=1``, or the
+# ``expert_cache_enabled()`` context manager below), for a genuinely
+# eager-per-expert-loop architecture that does NOT use gradient checkpointing --
+# the one scenario the cache was actually designed for. Anyone flipping it on
+# for a checkpointed run will hit the same CheckpointError this note describes.
+#
+# When enabled, validity is still keyed on the tensors' ``_version`` counters
+# (bumped by any in-place write, e.g. ``optimizer.step()``) plus the grad mode,
+# so a cached value can never outlive the state it was computed from -- that
+# part of the design was never wrong, it just doesn't help this model and
+# actively hurts it under checkpointing.
+#
+# Bounded at size 2 (enough for one layer's gate_up_proj + down_proj
+# alternation; moving to the next layer evicts naturally). Not thread-safe;
+# training here is single-process, single-threaded.
 
+_CACHE_ENV_VAR = "MAGICQUANT_QAT_EXPERT_WEIGHT_CACHE"
 _CACHE_MAXSIZE = 2
 
 
-class _ExpertWeightCache:
-    """Tiny bounded cache of computed expert weights, keyed by parametrization."""
+def _cache_enabled_by_default() -> bool:
+    """Resolve the cache's startup state from the opt-in env var. OFF unless set."""
+    return os.environ.get(_CACHE_ENV_VAR, "").strip().lower() in ("1", "true", "yes", "on")
 
-    def __init__(self, maxsize: int = _CACHE_MAXSIZE):
+
+class _ExpertWeightCache:
+    """Tiny bounded cache of computed expert weights, keyed by parametrization.
+
+    ``enabled`` defaults to whatever ``_cache_enabled_by_default()`` resolves at
+    construction time (env-var opt-in, OFF unless set) -- see the module-level
+    design note above for why the default flipped from on to off.
+    """
+
+    def __init__(self, maxsize: int = _CACHE_MAXSIZE, enabled: Optional[bool] = None):
         self.maxsize = maxsize
-        self.enabled = True
+        self.enabled = _cache_enabled_by_default() if enabled is None else enabled
         # owner id -> (owner, signature, tensor); insertion-ordered = LRU order.
         self._entries: "Dict[int, Tuple[Any, Tuple, torch.Tensor]]" = {}
         self.hits = 0
@@ -168,11 +212,39 @@ _WEIGHT_CACHE = _ExpertWeightCache()
 
 
 class expert_cache_disabled:
-    """Context manager turning the expert-weight cache off (tests/debugging)."""
+    """Context manager turning the expert-weight cache off (tests/debugging).
+
+    A no-op in terms of *behavior* now that the cache is off by default --
+    kept because callers/tests that explicitly want "definitely off, regardless
+    of the env var or a surrounding ``expert_cache_enabled()``" still need a
+    way to say so.
+    """
 
     def __enter__(self):
         self._prev = _WEIGHT_CACHE.enabled
         _WEIGHT_CACHE.enabled = False
+        _WEIGHT_CACHE.clear()
+        return self
+
+    def __exit__(self, *exc):
+        _WEIGHT_CACHE.enabled = self._prev
+        _WEIGHT_CACHE.clear()
+        return False
+
+
+class expert_cache_enabled:
+    """Context manager turning the expert-weight cache ON (opt-in).
+
+    For a genuinely eager per-expert-loop MoE architecture that does NOT use
+    gradient checkpointing -- the one scenario this cache was designed for and
+    still helps. See the module-level design note above before using this on
+    anything that also sets ``gradient_checkpointing=True``: the combination is
+    the exact ``CheckpointError`` this cache's default flipped to avoid.
+    """
+
+    def __enter__(self):
+        self._prev = _WEIGHT_CACHE.enabled
+        _WEIGHT_CACHE.enabled = True
         _WEIGHT_CACHE.clear()
         return self
 
@@ -578,7 +650,9 @@ def iter_expert_parametrizations(model: nn.Module) -> Iterable[FusedExpertQAT]:
             yield module
 
 
-def fused_expert_adapter_state(model: nn.Module) -> Dict[str, torch.Tensor]:
+def fused_expert_adapter_state(
+    model: nn.Module, weight_map: Optional[Dict[str, str]] = None
+) -> Dict[str, torch.Tensor]:
     """Adapter tensors for every wrapped fused expert, keyed for the merge lane.
 
     Keys are ``"<base safetensors key>.lora_expert_A"`` / ``".lora_expert_B"``
@@ -588,16 +662,51 @@ def fused_expert_adapter_state(model: nn.Module) -> Dict[str, torch.Tensor]:
     Parameters, so no ``.weight`` suffix. Shapes are ``(E, W.shape[1], r)`` and
     ``(E, r, W.shape[2])``; the merge is ``W[e] += scale * (A[e] @ B[e])``.
     Matches ``magicquant.qat.merge._apply_3d`` exactly.
+
+    SAVE-TIME key reconciliation (2026-08-05 fix, one half of the launch
+    blocker -- see ``magicquant.qat.diskmap``): if ``weight_map`` is given
+    (the base checkpoint's ``model.safetensors.index.json`` weight map), each
+    parameter's ``named_parameters()`` path is reconciled against it
+    (``diskmap.reconcile_key_to_disk``) and the SAVED key is the resolved
+    DISK key, never the raw module-graph name -- so a run whose loaded model
+    nests differently than its own checkpoint on disk (``model.layers...`` vs
+    ``model.language_model.layers...``) writes an adapter file
+    ``magicquant.qat.merge`` can actually apply. ``weight_map=None`` (the
+    default) keeps the pre-fix behavior unchanged -- callers with no real
+    on-disk checkpoint to check against (tests, the offline smoke path) still
+    get the raw names.
+
+    Raises:
+        QATKeyReconciliationError: ``weight_map`` was given and one or more
+            wrapped experts' target key didn't resolve against it -- listed
+            all at once, never one at a time. ``run_qat``'s preflight (see
+            ``diskmap.resolve_adapter_targets``) should already have caught
+            this before training started; this is the save-time backstop.
     """
     state: Dict[str, torch.Tensor] = {}
+    weight_map_keys = frozenset(weight_map.keys()) if weight_map is not None else None
+    unresolved: List[str] = []
     for p in iter_expert_parametrizations(model):
         if p.lora_r <= 0 or not p.param_name:
             continue
-        state[f"{p.param_name}.lora_expert_A"] = (
+        disk_name = p.param_name
+        if weight_map_keys is not None:
+            resolved = reconcile_key_to_disk(p.param_name, weight_map_keys)
+            if resolved is None:
+                unresolved.append(p.param_name)
+                continue
+            disk_name = resolved
+        state[f"{disk_name}.lora_expert_A"] = (
             p.lora_expert_A.detach().to(torch.float32).cpu()
         )
-        state[f"{p.param_name}.lora_expert_B"] = (
+        state[f"{disk_name}.lora_expert_B"] = (
             p.lora_expert_B.detach().to(torch.float32).cpu()
+        )
+    if unresolved:
+        raise QATKeyReconciliationError(
+            f"{len(unresolved)} fused-expert adapter target key(s) could not "
+            f"be resolved against the base checkpoint's on-disk weight map "
+            f"at save time: {sorted(unresolved)}"
         )
     return state
 
@@ -664,21 +773,42 @@ def merge_fused_expert_adapters(model: nn.Module) -> nn.Module:
 
 # ── cost / memory accounting ──────────────────────────────────────────────────
 
-# Measured on this box (gfx1151, torch 2.11 ROCm, fp32, 4M-element tensors) --
-# elements per second for one fake_quant call. Used only to turn "how big are
-# the experts" into an honest wall-clock estimate in the wrap-time log; being
-# off by 2x doesn't change any decision these numbers inform.
+# Elements per second for one fake_quant call, used ONLY to turn "how big are
+# the experts" into an honest wall-clock estimate in the wrap-time log
+# (estimate_expert_qat_cost -> run_qat's live-mode WARNING). Not load-bearing
+# for correctness anywhere -- this is advisory, not a gate.
+#
+# RECALIBRATED 2026-08-06 (launch-blocker review, HIGH-2): the ORIGINAL
+# numbers here (2026-08-05) came from an ISOLATED microbenchmark -- a single
+# standalone 4M-element fake_quant() call in a tight loop, no chunking
+# overhead, no segment concatenation, no autograd graph, on a freshly-warm
+# GPU. Measured for real -- i.e. an actual live-mode forward through the
+# wrapped model's chunked, multi-segment FusedExpertQAT._compute path, the
+# thing this estimate is supposed to describe -- real throughput came in
+# 6-12x SLOWER than the isolated numbers predicted (chunk-loop dispatch
+# overhead, the per-chunk .float() cast + torch.cat, real memory traffic
+# under load: none of that is visible to a single big isolated call).
+# Every entry below is the old isolated-benchmark number divided by 10 (the
+# middle of that measured 6-12x range) -- a real-world correction, not a
+# second independent per-scheme measurement (the review measured the
+# aggregate gap, not a fresh number for all eight schemes individually).
+# Cross-checked against frozen mode's OWN cost model, which is NOT table-
+# derived and needed no change: frozen mode's real end-to-end per-forward
+# cost re-measured at 5.7 s (this model, all 41 layers, bf16 base, r=4),
+# consistent with the original 5.5 s figure -- confirming the frozen-mode
+# path (bmm + add, no fake_quant call at all after wrap time) was never
+# subject to this gap, only the live-mode table was.
 MEASURED_FAKE_QUANT_ELEMS_PER_S = {
-    "Q2_K": 2.7e6,
-    "Q3_K": 1.1e8,
-    "Q4_K": 2.4e7,
-    "Q5_K": 2.4e7,
-    "Q6_K": 5.0e7,
-    "MXFP4": 5.8e7,
-    "IQ4_NL": 1.0e7,
-    "Q8_0": 1.0e8,
+    "Q2_K": 2.7e5,
+    "Q3_K": 1.1e7,
+    "Q4_K": 2.4e6,
+    "Q5_K": 2.4e6,
+    "Q6_K": 5.0e6,
+    "MXFP4": 5.8e6,
+    "IQ4_NL": 1.0e6,
+    "Q8_0": 1.0e7,
 }
-_DEFAULT_ELEMS_PER_S = 2.5e7
+_DEFAULT_ELEMS_PER_S = 2.5e6
 
 
 def estimate_expert_qat_cost(
