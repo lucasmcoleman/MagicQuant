@@ -152,7 +152,11 @@ quant-only* (+0.12) even while its confound-controlled recovery was +13%,
 because the LoRA's chat-domain drift outweighed the compensation on raw prose.
 That signature fully reproduces the Qwen3.6-35B-A3B frozen-QAT "negative"
 (−6.1% raw): the measurement was honest, but raw-delta-on-wikitext is the wrong
-instrument for a frozen run trained on a chat blend.
+instrument for a frozen run trained on a chat blend. **Confirmed at full scale
+the next day:** on a held-out in-domain sample (297 fresh conversations, 0%
+overlap with training rows, same chat template), the 35B frozen-QAT build
+measured **2.6529 vs 2.7127 pre-QAT (−2.20%)** — better in-domain, worse on
+wikitext, exactly as the control experiment predicted.
 
 **Why there is a cache.** The eager MoE forward reads the fused parameter once per
 *hit expert* (`self.gate_up_proj[expert_idx]` inside the loop) — ~256 times per
