@@ -217,8 +217,14 @@ class MagicQuantOrchestrator:
             "clamped readings, or every group's sensitivity was <=0. "
             "Proceeding would rank the evolutionary search's candidates on "
             "uniform/noise-floor weights while still shipping tiers as if "
-            "this were a healthy measured search. Check the llama.cpp "
-            "build, corpus, and baseline measurement, or set "
+            "this were a healthy measured search. On DENSE models this is "
+            "the expected outcome of raw-PPL probe scoring: PPL's reported "
+            "error is the spread over chunk means (~2% of baseline), while "
+            "a dense group's whole-group probe delta is sub-percent, so no "
+            "probe can resolve -- enable KL probe scoring (enable_kl=True), "
+            "whose per-token error is fine enough to resolve them. "
+            "Otherwise check the llama.cpp build, corpus, and baseline "
+            "measurement, or set "
             f"{self._ALLOW_DEGENERATE_PROBING_ENV}=1 to proceed anyway."
         )
 
