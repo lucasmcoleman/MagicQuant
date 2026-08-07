@@ -239,6 +239,101 @@ def test_measured_search_save_base_logits_failure_falls_back_to_standalone_basel
         assert "kl" not in info
 
 
+# ── probe_kl vs enable_kl split (KL probe-scoring vs KL candidate objective,
+# ── independent knobs since probe_kl defaults True) ─────────────────────────
+
+
+def test_probe_kl_default_wires_kl_base_logits_to_prober_without_objective_blend(
+    tmp_path, monkeypatch
+):
+    """probe_kl defaults True: base-logits capture succeeds and reaches the
+    sensitivity prober (Step 2), but the candidate OBJECTIVE stays PPL-only
+    because enable_kl was never passed -- self._kl_weight stays 0.0. The two
+    knobs must not leak into each other."""
+    import magicquant.orchestrator as orch_mod
+
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+
+    captured_prober_kwargs = {}
+    real_prober_cls = orch_mod.SensitivityProber
+
+    class _SpyProber(real_prober_cls):
+        def __init__(self, **kwargs):
+            captured_prober_kwargs.update(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(orch_mod, "SensitivityProber", _SpyProber)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+    )
+
+    # Capture happened (probe_kl's default request) and produced a real path...
+    assert orch._kl_base_logits_path is not None
+    assert orch._kl_capture_requested is True
+    assert orch._kl_capture_failed is False
+    # ... which reached the prober ...
+    assert captured_prober_kwargs.get("kl_base_logits_path") == orch._kl_base_logits_path
+    # ... but the candidate objective never blended KL: enable_kl was off.
+    assert orch._kl_weight == 0.0
+    for info in orch._measured.values():
+        assert "kl" not in info, "per-candidate KL objective measurement must not run"
+
+
+def test_enable_kl_still_blends_objective_alongside_default_probe_kl(tmp_path, monkeypatch):
+    """enable_kl=True keeps blending kl_weight into the candidate objective
+    exactly as before, unaffected by probe_kl now defaulting on alongside
+    it -- the two knobs share one capture pass but stay functionally
+    independent."""
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+        enable_kl=True, kl_weight=0.3,
+    )
+
+    assert orch._kl_weight == 0.3
+    assert orch._measured
+    for info in orch._measured.values():
+        assert info["kl"] == {"mean_kl": 0.01}, (
+            "enable_kl's per-candidate KL objective measurement must still run"
+        )
+
+
+def test_probe_kl_only_capture_failure_warns_and_falls_back_to_ppl_probes(
+    tmp_path, monkeypatch, capsys
+):
+    """probe_kl is requested (the default) but base-logits capture is
+    impossible (no calibration corpus resolved) -- must log a warning
+    naming probe_kl and complete the search via raw-PPL probe scoring, NOT
+    raise. This is the historical "enable_kl requested but no calibration
+    corpus resolved" warning's sibling for the now-default probe_kl path;
+    unlike an explicit enable_kl=True capture failure, nothing here claims
+    an objective blend that then silently fails to happen."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    monkeypatch.setattr(fake_tools, "_resolve_data_file", lambda *a, **k: None)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+    )  # must not raise
+
+    assert orch._kl_base_logits_path is None
+    assert orch._kl_capture_requested is True
+    assert orch._kl_capture_failed is True
+    assert orch._kl_weight == 0.0
+    assert orch._measured, "search must still complete via raw-PPL probe fallback"
+
+    out = capsys.readouterr().out
+    assert "probe_kl" in out
+    assert "fall back" in out.lower()
+
+
 # ── Feature 3: one-ahead build/measure overlap ──────────────────────────────
 
 
@@ -304,6 +399,9 @@ def test_measured_search_overlaps_build_with_measurement(tmp_path, monkeypatch):
         search_generations=2, population_size=8,
         measurement_rounds=1, candidates_per_round=3, verbose=False,
         seed_incumbents=False,
+        # _FakeLlamaToolsOverlap has no save_base_logits -- probe_kl's
+        # now-default capture attempt would hit it; unrelated to this test.
+        probe_kl=False,
     )
 
     assert len(orch._measured) >= 2, "need at least 2 real candidates to observe overlap"
@@ -658,6 +756,11 @@ def test_measured_search_raises_when_every_perplexity_measurement_fails(tmp_path
         orch.run_measured_search(
             search_generations=2, population_size=8,
             measurement_rounds=1, candidates_per_round=2, verbose=False,
+            # probe_kl's now-default base-logits fusion would otherwise
+            # obtain the baseline via save_base_logits (always 5.0 in this
+            # fixture) instead of this test's own flaky_perplexity, shifting
+            # which call is "call 1" and defeating the fixture below.
+            probe_kl=False,
         )
 
 

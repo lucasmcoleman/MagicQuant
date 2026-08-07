@@ -104,6 +104,27 @@ class LlamaCppTools:
             flags += ["-t", str(threads)]
         return flags
 
+    @staticmethod
+    def _perplexity_batch_flags() -> List[str]:
+        """``--batch-size``/``--ubatch-size`` flags shared by every
+        llama-perplexity invocation whose reading must be comparable to
+        ``calculate_perplexity``'s.
+
+        MINOR fix (F4): ``save_base_logits`` used to omit these while
+        ``calculate_perplexity`` passed them, so a measured search's fused
+        baseline (``run_measured_search``'s Step 1b, which takes the
+        baseline PPL from THIS pass instead of a separate
+        ``calculate_perplexity`` call -- see ``save_base_logits``'s
+        docstring) was measured under different batching than every
+        candidate. Batch size can shift llama.cpp's internal numerics
+        slightly (different accumulation order), so "same corpus, same
+        ctx_size, different batching" is still a real apples-to-oranges
+        comparison, not just a performance knob. Extracted to one place so
+        ``calculate_perplexity`` and ``save_base_logits`` cannot drift back
+        out of parity with each other.
+        """
+        return ["--batch-size", "512", "--ubatch-size", "128"]
+
     def _find_llamacpp(self) -> str:
         """Auto-detect llama.cpp installation."""
         common_paths = [
@@ -388,9 +409,7 @@ class LlamaCppTools:
             "-m", model_path,
             "-f", resolved_data_file,
             "--ctx-size", str(effective_ctx),
-            "--batch-size", "512",
-            "--ubatch-size", "128",
-        ] + self._gpu_flags()
+        ] + self._perplexity_batch_flags() + self._gpu_flags()
         ppl_chunks = getattr(self, "ppl_chunks", None)
         if ppl_chunks is not None:
             cmd += ["--chunks", str(ppl_chunks)]
@@ -518,6 +537,11 @@ class LlamaCppTools:
         measured-search baseline) can get it from THIS single invocation
         instead of running a separate ``calculate_perplexity`` pass over the
         same model/corpus (see ``run_measured_search``'s baseline+KL fusion).
+        Passes the same ``--batch-size``/``--ubatch-size`` flags as
+        ``calculate_perplexity`` (via ``_perplexity_batch_flags``) so that
+        fused baseline is measured under identical batching to every
+        candidate it's compared against (MINOR fix, F4: this used to omit
+        them).
 
         Args:
             base_model_path: Path to the (typically un-quantized/BF16 or
@@ -542,7 +566,7 @@ class LlamaCppTools:
             "--kl-divergence-base", out_logits_path,
             "--ctx-size", str(ctx_size),
             "--chunks", str(chunks if chunks != -1 else (getattr(self, "ppl_chunks", None) or -1)),
-        ] + self._gpu_flags()
+        ] + self._perplexity_batch_flags() + self._gpu_flags()
 
         try:
             result = self._run_perplexity_subprocess(cmd, timeout=timeout)
@@ -618,7 +642,7 @@ class LlamaCppTools:
             "--kl-divergence-base", base_logits_path,
             "--ctx-size", str(ctx_size),
             "--chunks", str(chunks if chunks != -1 else (getattr(self, "ppl_chunks", None) or -1)),
-        ] + self._gpu_flags()
+        ] + self._perplexity_batch_flags() + self._gpu_flags()
 
         try:
             result = self._run_perplexity_subprocess(cmd, timeout=timeout)

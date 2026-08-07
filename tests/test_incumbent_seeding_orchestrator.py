@@ -103,6 +103,7 @@ def test_default_seed_incumbents_force_measures_all_three_tiers(tmp_path, monkey
     orch.run_measured_search(
         search_generations=2, population_size=8,
         measurement_rounds=1, candidates_per_round=1, verbose=False,
+        probe_kl=False,  # _FakeLlamaTools has no save_base_logits
     )
 
     incumbent_tags = {
@@ -135,6 +136,7 @@ def test_seed_incumbents_false_disables_seeding_and_measurement(tmp_path, monkey
         search_generations=2, population_size=8,
         measurement_rounds=1, candidates_per_round=2, verbose=False,
         seed_incumbents=False,
+        probe_kl=False,  # _FakeLlamaTools has no save_base_logits
     )
 
     assert not any("incumbent" in info for info in orch._measured.values())
@@ -146,6 +148,7 @@ def test_incumbent_not_remeasured_if_already_measured_in_a_later_round(tmp_path,
     orch.run_measured_search(
         search_generations=2, population_size=8,
         measurement_rounds=2, candidates_per_round=1, verbose=False,
+        probe_kl=False,  # _FakeLlamaTools has no save_base_logits
     )
 
     # Every incumbent config_key must be measured exactly once across all

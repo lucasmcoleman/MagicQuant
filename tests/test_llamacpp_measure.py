@@ -514,6 +514,91 @@ def test_save_base_logits_cmd_includes_flags_when_set(tmp_path):
     assert cmd[cmd.index("-t") + 1] == "16"
 
 
+# ── F4: save_base_logits must be measured under the SAME batching as
+# ── calculate_perplexity, or the fused baseline and every candidate it's
+# ── compared against are apples-to-oranges. ─────────────────────────────────
+
+
+def test_save_base_logits_cmd_includes_batch_flags(tmp_path):
+    """save_base_logits used to omit --batch-size/--ubatch-size entirely
+    while calculate_perplexity passed them -- the fused baseline (see
+    run_measured_search's Step 1b) was then measured under different
+    batching than every candidate's calculate_perplexity/calculate_kl_
+    divergence pass."""
+    import subprocess
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("hello world\n")
+    out_logits = tmp_path / "base.kld"
+
+    tools = _bare_tools()
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    def _fake_run(cmd, timeout):
+        out_logits.write_bytes(b"fake-logits" * 1000)
+        return fake
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_fake_run) as run:
+        tools.save_base_logits("/base/model.gguf", str(corpus), str(out_logits))
+    cmd = run.call_args[0][0]
+    assert cmd[cmd.index("--batch-size") + 1] == "512"
+    assert cmd[cmd.index("--ubatch-size") + 1] == "128"
+
+
+def test_all_three_measurement_paths_batch_flags_match(tmp_path):
+    """Three-way invocation-parity check: calculate_perplexity,
+    save_base_logits AND calculate_kl_divergence must pass identical
+    batch/ubatch values. All three feed one measured_loss computation --
+    baseline PPL comes from the fused save_base_logits pass while every
+    candidate's PPL comes from calculate_kl_divergence's own 'Mean PPL(Q)'
+    (or, KL off, from calculate_perplexity) -- so a batching mismatch on ANY
+    pair silently measures baseline and candidates under different
+    conditions. Pinned via the shared _perplexity_batch_flags() helper
+    rather than independently hand-maintained literal lists."""
+    import subprocess
+
+    data_file = tmp_path / "corpus.txt"
+    data_file.write_text("hello world\n")
+    out_logits = tmp_path / "base.kld"
+    out_logits.write_bytes(b"fake-logits")
+
+    tools = _bare_tools(data_file=str(data_file))
+    ppl_fake = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="", stderr="Final estimate: PPL = 5.0 +/- 0.1"
+    )
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=ppl_fake) as run:
+        tools.calculate_perplexity("/some/model.gguf")
+    ppl_cmd = run.call_args[0][0]
+
+    def _fake_run(cmd, timeout):
+        out_logits.write_bytes(b"fake-logits" * 1000)
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_fake_run) as run:
+        tools.save_base_logits("/base/model.gguf", str(data_file), str(out_logits))
+    base_logits_cmd = run.call_args[0][0]
+
+    kl_fake = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout=_KL_STDOUT, stderr=""
+    )
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=kl_fake) as run:
+        tools.calculate_kl_divergence(
+            "/quant/model.gguf", str(out_logits), str(data_file)
+        )
+    kl_cmd = run.call_args[0][0]
+
+    def _batch_kv(cmd):
+        return {
+            cmd[i]: cmd[i + 1]
+            for i in range(len(cmd))
+            if cmd[i] in ("--batch-size", "--ubatch-size")
+        }
+
+    assert _batch_kv(ppl_cmd), "expected explicit batch flags on the PPL path"
+    assert _batch_kv(ppl_cmd) == _batch_kv(base_logits_cmd)
+    assert _batch_kv(ppl_cmd) == _batch_kv(kl_cmd)
+
+
 def test_calculate_kl_divergence_cmd_unchanged_when_unset(tmp_path):
     import subprocess
 

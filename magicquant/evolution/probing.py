@@ -443,9 +443,12 @@ class SensitivityProber:
                     " These probes were scored by PERPLEXITY, whose reported "
                     "error is the spread over chunk means -- too coarse to "
                     "resolve a single-group probe at all. Re-run with "
-                    "enable_kl=True to score them by KL divergence instead "
-                    "(~144x the resolution on a measured probe, for one "
-                    "extra base-logits pass)."
+                    "probe_kl=True (MagicQuantOrchestrator.run_measured_"
+                    "search's default) so probes score by KL divergence "
+                    "instead (~144x the resolution on a measured probe, for "
+                    "one extra base-logits pass) -- if this run already had "
+                    "probe_kl=True, KL base-logits capture itself failed; "
+                    "check the calibration corpus and llama.cpp build."
                 ),
             )
             if verbose:

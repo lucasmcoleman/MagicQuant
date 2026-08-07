@@ -92,6 +92,59 @@ def test_override_env_var_absent_still_raises(monkeypatch):
         orch._enforce_probing_signal_gate()
 
 
+# ── The gate's message must say whether KL probe capture was attempted
+# ── (and failed) or never attempted, so the operator knows which knob (if
+# ── any) to look at -- see probe_kl / enable_kl in run_measured_search.
+# ───────────────────────────────────────────────────────────────────────
+
+
+def test_gate_message_reports_kl_capture_never_attempted():
+    orch = _bare_orchestrator("suspect", False)
+    orch._kl_base_logits_path = None
+    orch._kl_capture_requested = False
+    orch._kl_capture_failed = False
+    with pytest.raises(RuntimeError, match="NEVER ATTEMPTED"):
+        orch._enforce_probing_signal_gate()
+
+
+def test_gate_message_reports_kl_capture_attempted_and_failed():
+    """MINOR fix (F3): match="ATTEMPTED" is a substring of BOTH this
+    branch's "was ATTEMPTED for this run" and the never-attempted branch's
+    "was NEVER ATTEMPTED for this run" -- it would pass even if the gate
+    wrongly reported the never-attempted phrasing here. Match a
+    branch-unique substring and explicitly assert the never-attempted
+    phrasing is absent.
+    """
+    orch = _bare_orchestrator("suspect", False)
+    orch._kl_base_logits_path = None
+    orch._kl_capture_requested = True
+    orch._kl_capture_failed = True
+    with pytest.raises(RuntimeError, match="was ATTEMPTED for this run") as exc_info:
+        orch._enforce_probing_signal_gate()
+    assert "NEVER ATTEMPTED" not in str(exc_info.value), (
+        "attempted-and-failed message must not also contain the "
+        "never-attempted phrasing"
+    )
+
+
+def test_gate_message_reports_kl_probe_scoring_was_active():
+    orch = _bare_orchestrator("suspect", False)
+    orch._kl_base_logits_path = "/tmp/fake_base.kld"
+    orch._kl_capture_requested = True
+    orch._kl_capture_failed = False
+    with pytest.raises(RuntimeError, match="WAS active"):
+        orch._enforce_probing_signal_gate()
+
+
+def test_gate_message_defaults_to_never_attempted_without_kl_attrs_set():
+    """Orchestrators built via __new__ without ever running
+    run_measured_search (as _bare_orchestrator does) carry none of the KL
+    tracking attributes -- the gate must not crash looking for them."""
+    orch = _bare_orchestrator("suspect", False)
+    with pytest.raises(RuntimeError, match="NEVER ATTEMPTED"):
+        orch._enforce_probing_signal_gate()
+
+
 # ── Checkpoint round-trip: weights_degenerate must survive resume too ────
 
 

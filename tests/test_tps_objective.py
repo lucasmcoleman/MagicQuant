@@ -385,6 +385,10 @@ def test_run_measured_search_forwards_speed_knobs_to_survivor(tmp_path, monkeypa
         search_generations=2, population_size=8,
         measurement_rounds=1, candidates_per_round=2, verbose=False,
         speed_weight=0.4, use_bytes_tps=True,
+        # Unrelated to this test's speed-objective forwarding; the fake
+        # llama_tools here has no save_base_logits -- probe_kl's now-default
+        # capture attempt would hit it. See probe_kl's docstring.
+        probe_kl=False,
     )
 
     assert _CapturingSurvivor.captured, "survivor was never constructed"
@@ -400,6 +404,7 @@ def test_run_measured_search_default_forwards_none_and_false(tmp_path, monkeypat
     orch.run_measured_search(
         search_generations=2, population_size=8,
         measurement_rounds=1, candidates_per_round=2, verbose=False,
+        probe_kl=False,  # see comment above; unrelated to this test
     )
 
     kwargs = _CapturingSurvivor.captured[0]

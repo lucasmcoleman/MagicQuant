@@ -261,6 +261,9 @@ def test_run_measured_search_threads_speed_aware_params(tmp_path, monkeypatch):
         search_generations=1, population_size=4, measurement_rounds=1,
         candidates_per_round=1, verbose=False, seed_incumbents=False,
         speed_aware=True, speed_metric="bench", speed_epsilon=0.02,
+        # _FakeLlamaTools here has no save_base_logits -- probe_kl's
+        # now-default capture attempt would hit it; unrelated to this test.
+        probe_kl=False,
     )
     assert orch._speed_aware is True
     assert orch._speed_epsilon == 0.02
@@ -277,6 +280,7 @@ def test_run_measured_search_defaults_speed_aware_on(tmp_path, monkeypatch):
     orch.run_measured_search(
         search_generations=1, population_size=4, measurement_rounds=1,
         candidates_per_round=1, verbose=False, seed_incumbents=False,
+        probe_kl=False,  # see comment above; unrelated to this test
     )
     assert orch._speed_aware is True
     assert orch._speed_epsilon is None
@@ -296,6 +300,7 @@ def test_run_measured_search_speed_aware_end_to_end_prefers_faster_tied_candidat
         search_generations=2, population_size=8, measurement_rounds=1,
         candidates_per_round=3, verbose=False, seed=1, seed_incumbents=False,
         enable_speed_bench=True, speed_aware=True, speed_metric="bench",
+        probe_kl=False,  # _FakeLlamaTools has no save_base_logits
     )
 
     assert orch._measured, "expected at least one measured candidate"
@@ -318,6 +323,7 @@ def test_run_measured_search_speed_aware_false_keeps_plain_tiebreak(tmp_path, mo
         search_generations=2, population_size=8, measurement_rounds=1,
         candidates_per_round=3, verbose=False, seed=1, seed_incumbents=False,
         enable_speed_bench=True, speed_aware=False,
+        probe_kl=False,  # _FakeLlamaTools has no save_base_logits
     )
 
     assert orch._measured

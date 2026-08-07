@@ -6,6 +6,7 @@ the I/O boundary (model source, llama.cpp tools, candidate GGUF building) is
 faked.
 """
 import json
+from pathlib import Path
 
 import pytest
 
@@ -503,3 +504,232 @@ def test_measurement_invalid_and_corpus_path_survive_checkpoint_round_trip(tmp_p
         "a candidate flagged measurement_invalid before a kill must still "
         "be excluded from tier selection after a checkpoint resume"
     )
+
+
+# ── BLOCKER (F1): the KL base-logits file (_kl_base_logits.kld) is huge --
+# ── roughly chunks * ctx_size * vocab_size * 2 bytes, verified 69 GB for a
+# ── 27B model at 100 chunks -- and with probe_kl defaulting True, every
+# ── measured run now creates one. It must be deleted once the run
+# ── completes successfully, but kept when a run fails/is killed (so a
+# ── resume doesn't have to pay the ~18-min recapture again), and kept
+# ── regardless of outcome when the caller explicitly opts to retain it.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_kl_base_logits_deleted_on_successful_completion(tmp_path, monkeypatch):
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+    )
+
+    # Precondition: probe_kl defaults True and the fake tools implement
+    # save_base_logits, so a real capture must have happened -- otherwise
+    # this test would trivially pass with nothing ever created.
+    assert orch._kl_base_logits_path is not None
+    assert not Path(orch._kl_base_logits_path).exists(), (
+        "the KL base-logits file must be deleted after a successful run"
+    )
+
+
+def test_keep_kl_base_logits_flag_retains_file_after_success(tmp_path, monkeypatch):
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+        keep_kl_base_logits=True,
+    )
+
+    assert orch._kl_base_logits_path is not None
+    assert Path(orch._kl_base_logits_path).exists(), (
+        "keep_kl_base_logits=True must retain the file even after success"
+    )
+
+
+def test_keep_kl_logits_env_var_retains_file_after_success(tmp_path, monkeypatch):
+    monkeypatch.setenv("MAGICQUANT_KEEP_KL_LOGITS", "1")
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+    )
+
+    assert orch._kl_base_logits_path is not None
+    assert Path(orch._kl_base_logits_path).exists(), (
+        "MAGICQUANT_KEEP_KL_LOGITS=1 must retain the file even after success"
+    )
+
+
+def test_kl_base_logits_retained_when_run_fails_mid_measurement(tmp_path, monkeypatch):
+    """A killed/failed run must leave the KL base-logits file in place --
+    it's the exact thing a resume needs to skip the expensive recapture."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools._kill_after = 1
+
+    with pytest.raises(RuntimeError, match="simulated kill"):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=5, verbose=False,
+            seed_incumbents=False, seed=42,
+        )
+
+    assert orch._kl_base_logits_path is not None
+    assert Path(orch._kl_base_logits_path).exists(), (
+        "a failed/killed run must retain the KL base-logits file for resume"
+    )
+
+
+# ── BLOCKER (F2): a checkpoint recorded under a PPL-only objective must not
+# ── silently half-resume into a KL-blended run, but a checkpoint written
+# ── before enable_kl/kl_weight existed as conditions must still resume a
+# ── same-objective (PPL-only) run -- every pre-fix checkpoint was PPL-only.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+_BASE_CONDITIONS = {"chunks": None, "ctx_size": 512, "corpus": "/fake/corpus.txt"}
+
+
+def test_conditions_match_old_checkpoint_ppl_only_config_resumes():
+    """Combination 1: old checkpoint (no enable_kl/kl_weight keys at all --
+    the pre-fix shape) + a fresh enable_kl=False config -- must resume."""
+    stored = dict(_BASE_CONDITIONS)
+    current = {**_BASE_CONDITIONS, "enable_kl": False, "kl_weight": 0.0}
+    assert MagicQuantOrchestrator._measurement_conditions_match(stored, current)
+
+
+def test_conditions_match_old_checkpoint_kl_blended_config_rejected():
+    """Combination 2: the same old (pre-fix) checkpoint + a fresh
+    enable_kl=True config -- must be rejected. This is the actual bug F2
+    fixes: without this, the checkpoint above would ALSO have resumed here,
+    silently mixing PPL-only measurements into a run everything else
+    believes is KL-blended."""
+    stored = dict(_BASE_CONDITIONS)
+    current = {**_BASE_CONDITIONS, "enable_kl": True, "kl_weight": 0.1}
+    assert not MagicQuantOrchestrator._measurement_conditions_match(stored, current)
+
+
+def test_conditions_match_new_checkpoint_same_ppl_only_objective_resumes():
+    """Combination 3: a post-fix checkpoint recorded with enable_kl=False +
+    a fresh enable_kl=False config (same objective) -- must resume."""
+    stored = {**_BASE_CONDITIONS, "enable_kl": False, "kl_weight": 0.0}
+    current = dict(stored)
+    assert MagicQuantOrchestrator._measurement_conditions_match(stored, current)
+
+
+def test_conditions_match_new_checkpoint_same_kl_blended_objective_resumes():
+    """Combination 4: a post-fix checkpoint recorded with enable_kl=True +
+    a fresh run with the SAME enable_kl=True/kl_weight (same objective) --
+    must resume."""
+    stored = {**_BASE_CONDITIONS, "enable_kl": True, "kl_weight": 0.3}
+    current = dict(stored)
+    assert MagicQuantOrchestrator._measurement_conditions_match(stored, current)
+
+
+def test_conditions_match_kl_weight_change_with_kl_off_is_ignored():
+    """kl_weight only participates in the comparison when the CURRENT run
+    has enable_kl on -- a stored weight that differs while blending is off
+    changes nothing real (run_measured_search forces kl_weight to 0.0
+    whenever enable_kl is False) and must not force an unnecessary
+    re-measurement."""
+    stored = {**_BASE_CONDITIONS, "enable_kl": False, "kl_weight": 0.5}
+    current = {**_BASE_CONDITIONS, "enable_kl": False, "kl_weight": 0.0}
+    assert MagicQuantOrchestrator._measurement_conditions_match(stored, current)
+
+
+def test_conditions_match_kl_weight_change_with_kl_on_is_rejected():
+    """A genuine kl_weight change while blending is ON for both sides IS a
+    real objective change (it alters _select_final_survivors' ranking) and
+    must be rejected."""
+    stored = {**_BASE_CONDITIONS, "enable_kl": True, "kl_weight": 0.5}
+    current = {**_BASE_CONDITIONS, "enable_kl": True, "kl_weight": 0.1}
+    assert not MagicQuantOrchestrator._measurement_conditions_match(stored, current)
+
+
+def test_old_style_checkpoint_without_kl_keys_resumes_under_ppl_only_run(
+    tmp_path, monkeypatch
+):
+    """Integration-level check for combination 1: a checkpoint dict shaped
+    like one written before this fix (no enable_kl/kl_weight keys in
+    measurement_conditions at all) must still resume a fresh enable_kl=False
+    (default) run -- not force a re-measurement from scratch."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools._kill_after = 2
+
+    with pytest.raises(RuntimeError, match="simulated kill"):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=5, verbose=False,
+            seed_incumbents=False, seed=42,
+        )
+
+    # Strip the new keys from the checkpoint the run above actually wrote,
+    # simulating the pre-fix shape.
+    ckpt_path = _checkpoint_path(orch)
+    checkpoint = json.loads(ckpt_path.read_text())
+    checkpoint["measurement_conditions"].pop("enable_kl", None)
+    checkpoint["measurement_conditions"].pop("kl_weight", None)
+    ckpt_path.write_text(json.dumps(checkpoint))
+
+    orch2, fake_tools2 = _make_orchestrator(tmp_path, monkeypatch)
+    orch2.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=5, verbose=False,
+        seed_incumbents=False, seed=42,
+    )
+
+    assert fake_tools2.baseline_calls == 0, (
+        "an old-shaped PPL-only checkpoint must still resume a PPL-only run"
+    )
+
+
+def test_old_style_checkpoint_without_kl_keys_rejected_under_kl_blended_run(
+    tmp_path, monkeypatch
+):
+    """Integration-level check for combination 2: the same pre-fix
+    checkpoint shape must be REJECTED when the new run wants enable_kl=True
+    -- resuming would silently mix PPL-only measurements into a run
+    everything else believes is KL-blended."""
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False, seed=7,
+    )
+    # Successful run deleted its own checkpoint -- rebuild one shaped like a
+    # pre-fix (no enable_kl/kl_weight keys) checkpoint.
+    conditions = orch._current_measurement_conditions()
+    conditions.pop("enable_kl", None)
+    conditions.pop("kl_weight", None)
+    fake_checkpoint = {
+        "version": 2,
+        "seed": 7,
+        "source_model": orch._source_identity(),
+        "measurement_conditions": conditions,
+        "baseline_ppl": 1.23,
+        "baseline_provenance": "measured",
+        "sensitivity_weights": {"E": 1.0},
+        "probing_provenance": "measured",
+        "kl": {"enabled": False, "base_logits_path": None, "corpus_path": None},
+        "imatrix": {"active": False, "n_tensors": None},
+        "measured": {"fake:key": {"config": {"E": "BF16"}, "ppl": 1.0}},
+    }
+    _checkpoint_path(orch).write_text(json.dumps(fake_checkpoint))
+
+    orch2, _ = _make_orchestrator(tmp_path, monkeypatch)
+    orch2.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False, seed=7,
+        enable_kl=True,
+    )
+
+    # Rejected -- fresh baseline was measured for real, the fake
+    # checkpoint's bogus measurement was never restored.
+    assert orch2.baseline_ppl == 5.0
+    assert "fake:key" not in orch2._measured

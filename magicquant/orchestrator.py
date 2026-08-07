@@ -114,17 +114,46 @@ class MagicQuantOrchestrator:
         # capture failure just leaves this None.
         self._imatrix: Optional[Dict[str, Any]] = None
         # Path to base-model logits saved via llama-perplexity
-        # --kl-divergence-base, when enable_kl=True in run_measured_search.
-        # None means KL-divergence scoring is inactive.
+        # --kl-divergence-base, captured whenever run_measured_search's
+        # probe_kl (default True) or enable_kl (default False) requested it
+        # and capture succeeded. None means neither the sensitivity probes
+        # (Step 2) nor the candidate objective have KL data available --
+        # probes fall back to raw PPL and enable_kl's blend is a no-op.
+        # HUGE on disk -- roughly chunks * ctx_size * vocab_size * 2 bytes
+        # (fp16 per-token logits over the full vocabulary), verified 69 GB
+        # for a 27B model at 100 chunks. run_measured_search deletes this
+        # file on successful completion unless keep_kl_base_logits=True or
+        # MAGICQUANT_KEEP_KL_LOGITS=1 is set; a failed/killed run always
+        # leaves it in place so resume can reuse it. See
+        # run_measured_search's keep_kl_base_logits docstring.
         self._kl_base_logits_path: Optional[str] = None
         # Corpus the base logits above were captured over -- every candidate's
         # KL calculation during the measured-search loop must reuse this
         # exact corpus to be comparable.
         self._kl_corpus_path: Optional[str] = None
+        # Whether run_measured_search's enable_kl (candidate objective
+        # blend) was requested for the LAST search this orchestrator ran.
+        # False before any measured search has run. Recorded (alongside
+        # _kl_weight below) so _current_measurement_conditions can tell a
+        # PPL-only checkpoint from a KL-blended one -- see F2 /
+        # _measurement_conditions_match.
+        self._enable_kl: bool = False
         # Weight applied to |mean_kl| when blending KL into final-survivor
         # selection (see _select_final_survivors). Only has any effect when
-        # a candidate actually has a "kl" measurement recorded.
+        # a candidate actually has a "kl" measurement recorded. Set from
+        # run_measured_search's enable_kl/kl_weight ONLY -- probe_kl never
+        # touches this: probe-KL scoring and the candidate objective blend
+        # are independent knobs (see run_measured_search's docstring).
         self._kl_weight: float = 0.0
+        # Set at the top of run_measured_search's KL step: whether base-logits
+        # capture was requested at all (probe_kl or enable_kl) and, if so,
+        # whether the attempt failed (no corpus / capture pass failed / build
+        # lacks --kl-divergence-base). Both False before any measured search
+        # has run, or when neither knob requested capture. Read by
+        # _enforce_probing_signal_gate to tell an operator whether KL probe
+        # capture was attempted-and-failed vs never attempted.
+        self._kl_capture_requested: bool = False
+        self._kl_capture_failed: bool = False
         # When True, _select_final_survivors re-ranks WITHIN a tier's
         # near-tied candidates (raw measured_loss within self._speed_epsilon
         # relative of the tier's best) by size_gb (default "bytes" metric) or
@@ -168,6 +197,57 @@ class MagicQuantOrchestrator:
             pass
 
     _ALLOW_DEGENERATE_PROBING_ENV = "MAGICQUANT_ALLOW_DEGENERATE_PROBING"
+    # BLOCKER fix: the KL base-logits file (self._kl_base_logits_path) is
+    # enormous -- roughly chunks * ctx_size * vocab_size * 2 bytes (fp16
+    # per-token logits over the full vocabulary), verified at 69 GB for a
+    # 27B model at 100 chunks -- and, with probe_kl defaulting True, every
+    # measured run now creates one. Setting this env var to exactly "1"
+    # keeps the file after a successful run instead of deleting it (same
+    # override style as _ALLOW_DEGENERATE_PROBING_ENV above). See
+    # run_measured_search's keep_kl_base_logits parameter.
+    _KEEP_KL_LOGITS_ENV = "MAGICQUANT_KEEP_KL_LOGITS"
+
+    def _kl_probe_capture_note(self) -> str:
+        """Build the "how does KL probe scoring stand for this run" clause
+        used by ``_enforce_probing_signal_gate``'s message -- distinguishes
+        "KL was active and still couldn't resolve a signal" from "KL was
+        attempted but capture failed" from "KL was never attempted", so an
+        operator reading the failure knows which knob (if any) to look at
+        instead of always being pointed at ``enable_kl`` regardless of what
+        actually happened. Uses ``getattr`` throughout: called on orchestrator
+        instances built via ``__new__`` in tests, which never ran
+        ``__init__`` or ``run_measured_search`` and so carry none of these
+        attributes.
+        """
+        if getattr(self, "_kl_base_logits_path", None):
+            return (
+                "KL probe scoring WAS active for this run's sensitivity "
+                "probes (base logits were captured) and still could not "
+                "resolve a signal -- check the llama.cpp build, corpus, and "
+                "baseline measurement rather than probe_kl/enable_kl."
+            )
+        if getattr(self, "_kl_capture_requested", False) and getattr(
+            self, "_kl_capture_failed", False
+        ):
+            return (
+                "KL probe capture was ATTEMPTED for this run (probe_kl "
+                "and/or enable_kl) but FAILED -- see the 'kl' warning logged "
+                "earlier in this run. Fix the calibration corpus or "
+                "llama.cpp build (needs --kl-divergence-base support) so "
+                "probes can use KL scoring, whose per-token error is fine "
+                "enough to resolve a dense group's sub-percent probe delta "
+                "that raw PPL's ~2% chunk-mean error cannot."
+            )
+        return (
+            "KL probe scoring was NEVER ATTEMPTED for this run (probe_kl "
+            "and enable_kl were both off) -- on DENSE models this is the "
+            "expected outcome of raw-PPL probe scoring: PPL's reported "
+            "error is the spread over chunk means (~2% of baseline), while "
+            "a dense group's whole-group probe delta is sub-percent, so no "
+            "probe can resolve. Pass probe_kl=True (the default) to "
+            "``run_measured_search`` so probes use KL-divergence scoring "
+            "instead."
+        )
 
     def _enforce_probing_signal_gate(self) -> None:
         """MAJOR 4: refuse to proceed on a search whose sensitivity probing
@@ -217,12 +297,8 @@ class MagicQuantOrchestrator:
             "clamped readings, or every group's sensitivity was <=0. "
             "Proceeding would rank the evolutionary search's candidates on "
             "uniform/noise-floor weights while still shipping tiers as if "
-            "this were a healthy measured search. On DENSE models this is "
-            "the expected outcome of raw-PPL probe scoring: PPL's reported "
-            "error is the spread over chunk means (~2% of baseline), while "
-            "a dense group's whole-group probe delta is sub-percent, so no "
-            "probe can resolve -- enable KL probe scoring (enable_kl=True), "
-            "whose per-token error is fine enough to resolve them. "
+            "this were a healthy measured search. "
+            f"{self._kl_probe_capture_note()} "
             "Otherwise check the llama.cpp build, corpus, and baseline "
             "measurement, or set "
             f"{self._ALLOW_DEGENERATE_PROBING_ENV}=1 to proceed anyway."
@@ -363,8 +439,10 @@ class MagicQuantOrchestrator:
         seed: Optional[int] = None,
         use_imatrix: bool = False,
         imatrix_corpus: Optional[str] = None,
+        probe_kl: bool = True,
         enable_kl: bool = False,
         kl_weight: float = 0.1,
+        keep_kl_base_logits: bool = False,
         enable_speed_bench: bool = False,
         speed_aware: bool = True,
         speed_epsilon: Optional[float] = None,
@@ -394,12 +472,60 @@ class MagicQuantOrchestrator:
                 behavior).
             imatrix_corpus: calibration corpus for imatrix capture; None uses
                 the bundled default (magicquant/data/calib_corpus.txt).
+            probe_kl: capture base-model reference logits (via
+                llama-perplexity's --kl-divergence-base) and use them to
+                score Step 2's per-group SENSITIVITY PROBES by KL-divergence
+                instead of raw PPL. On by default. This is the fix for dense
+                models: PPL's reported error is the spread over chunk means
+                (~2% of baseline), while a dense group's whole-group probe
+                delta is sub-percent, so raw-PPL probes can't resolve it and
+                ``_enforce_probing_signal_gate`` kills the run. KL's per-token
+                error is fine enough to resolve them (measured on one real
+                probe: 79 sigma vs 0.55 sigma). Independent of ``enable_kl``:
+                probe_kl affects ONLY how probes are scored in Step 2, never
+                the evolutionary search's candidate objective -- turning
+                probe_kl off does not disable ``enable_kl``'s blend, and
+                turning probe_kl on (the default) does not, by itself, blend
+                KL into candidate selection. Base-logits capture is attempted
+                whenever ``probe_kl or enable_kl`` -- the two knobs share one
+                capture pass so a run wanting both never pays for it twice.
+                A capture failure while ONLY probe_kl requested it (no
+                calibration corpus, a llama.cpp build without
+                --kl-divergence-base, or the capture pass itself failing)
+                logs a warning and falls back to raw-PPL probe scoring --
+                ``_enforce_probing_signal_gate`` remains the backstop against
+                a run that then can't resolve anything. A capture failure
+                while ``enable_kl=True`` was explicitly requested keeps the
+                historical warn-and-skip behavior (KL scoring disabled for
+                the whole run, no exception) -- see ``enable_kl`` below.
             enable_kl: also measure real KL-divergence-to-base for each
                 candidate (via llama-perplexity's built-in --kl-divergence)
-                and blend it into final-survivor selection. Off by default.
+                and blend it into final-survivor selection (candidate
+                OBJECTIVE, not probe scoring -- see ``probe_kl`` above). Off
+                by default. Setting this True also implies ``probe_kl``'s
+                base-logits capture (they share the one capture pass) even
+                if ``probe_kl=False`` was passed explicitly.
             kl_weight: weight applied to |mean_kl| when blending into
                 selection (see _select_final_survivors); only meaningful
-                when enable_kl=True.
+                when enable_kl=True. Never affects probe scoring.
+            keep_kl_base_logits: keep the captured KL base-logits file
+                (``<output_dir>/_kl_base_logits.kld``) on disk after a
+                SUCCESSFUL run instead of deleting it. This file is
+                enormous -- roughly ``chunks * ctx_size * vocab_size * 2``
+                bytes (fp16 per-token logits over the full vocabulary),
+                verified at 69 GB for a 27B model at 100 chunks -- and with
+                ``probe_kl`` defaulting True, every measured run now
+                creates one. False (the default) deletes it once the run
+                completes successfully (results saved, checkpoint deleted --
+                nothing left that could resume from it). A run that fails
+                or is killed always leaves the file in place regardless of
+                this flag, since a resume needs it to skip the ~18-min
+                recapture (see ``resume``'s KL base-logits reuse). Also
+                honored via the ``MAGICQUANT_KEEP_KL_LOGITS=1`` env var
+                (exact string ``"1"``, same convention as
+                ``MAGICQUANT_ALLOW_DEGENERATE_PROBING``) for callers that
+                can't easily thread a new kwarg through (e.g. a CLI/UI
+                wrapper) -- either one keeps the file.
             enable_speed_bench: also measure real tokens/sec per candidate
                 via llama-bench (informational; recorded in search_results
                 .json, not fed into per-generation prediction scoring --
@@ -537,6 +663,10 @@ class MagicQuantOrchestrator:
             to the best *measured* config for that tier.
         """
         self._apply_seed(seed)
+        # Recorded (in addition to self._kl_weight) so
+        # _current_measurement_conditions can distinguish "blending off" from
+        # "blending on with weight 0" -- see F2's _measurement_conditions_match.
+        self._enable_kl = enable_kl
         self._kl_weight = kl_weight if enable_kl else 0.0
         self._speed_aware = speed_aware
         self._speed_epsilon = speed_epsilon
@@ -576,7 +706,8 @@ class MagicQuantOrchestrator:
         # --kl-divergence, prints this same model's own "Final estimate:
         # PPL" -- see LlamaCppTools.save_base_logits). This turns "baseline
         # pass + KL-base-logits pass" into ONE llama-perplexity invocation
-        # whenever enable_kl succeeds, instead of two.
+        # whenever ``probe_kl`` (the default) or ``enable_kl`` succeeds,
+        # instead of two.
         baseline_needs_standalone_measurement = True
         if checkpoint is not None:
             self.baseline_ppl = checkpoint["baseline_ppl"]
@@ -611,8 +742,9 @@ class MagicQuantOrchestrator:
         # ── Step 1b: optional imatrix + KL base logits (fuses in the ──
         # ── baseline measurement on a fresh run, see above) ──
         # Both are best-effort: a failure here degrades to the historical
-        # behavior (unweighted quant / no KL score) rather than aborting a
-        # real measured search over a secondary quality signal.
+        # behavior (unweighted quant / raw-PPL probe scoring / no KL
+        # objective blend) rather than aborting a real measured search over
+        # a secondary quality signal.
         if use_imatrix:
             # enable_imatrix -> ensure_imatrix already caches capture to disk
             # and reuses it on a hit, so re-calling this on resume is cheap
@@ -620,7 +752,24 @@ class MagicQuantOrchestrator:
             # -- no separate resume bookkeeping needed for imatrix itself.
             self.enable_imatrix(imatrix_corpus)
 
-        if enable_kl:
+        # Base-logits capture is attempted whenever EITHER knob wants it --
+        # probe_kl (Step 2's per-group sensitivity probes, on by default) or
+        # enable_kl (the candidate objective blend, off by default). They
+        # share this one capture pass; which knob(s) requested it only
+        # changes how a capture FAILURE is handled below, not whether the
+        # attempt happens. Recorded on self so _enforce_probing_signal_gate
+        # can later report whether KL probe capture was attempted-and-failed
+        # vs never attempted at all.
+        self._kl_capture_requested = bool(probe_kl or enable_kl)
+        self._kl_capture_failed = False
+        # Reset per run: without this, a second run on the same orchestrator
+        # instance whose own capture failed would inherit the previous run's
+        # pointer (probes scored against a stale baseline), and a
+        # probe_kl=False + enable_kl=False run would skip the capture block
+        # entirely and leave the attribute at whatever it was.
+        self._kl_base_logits_path = None
+        self._kl_corpus_path = None
+        if self._kl_capture_requested:
             # On resume, reuse the checkpoint's KL base-logits file if it's
             # still on disk -- regenerating it is one llama-perplexity pass
             # over the whole corpus, exactly the kind of work resume exists
@@ -645,10 +794,24 @@ class MagicQuantOrchestrator:
                 # compared over identical text.
                 corpus = self.llama_tools._resolve_data_file(None)
                 if corpus is None:
-                    log.warning(
-                        "enable_kl requested but no calibration corpus resolved "
-                        "-- skipping KL-divergence scoring", stage="kl",
-                    )
+                    self._kl_capture_failed = True
+                    if enable_kl:
+                        # Historical behavior, unchanged: enable_kl's own
+                        # capture failure just disables the objective blend
+                        # for this run rather than aborting a real measured
+                        # search over a secondary quality signal.
+                        log.warning(
+                            "enable_kl requested but no calibration corpus resolved "
+                            "-- skipping KL-divergence scoring", stage="kl",
+                        )
+                    else:
+                        log.warning(
+                            "probe_kl requested KL-scored sensitivity probing "
+                            "but no calibration corpus resolved -- probes will "
+                            "fall back to raw-PPL scoring for this run "
+                            "(dense-model sensitivity may not resolve; see "
+                            "_enforce_probing_signal_gate)", stage="kl",
+                        )
                 else:
                     base_logits_path = str(self.output_dir / "_kl_base_logits.kld")
                     saved_ppl = self.llama_tools.save_base_logits(
@@ -673,16 +836,28 @@ class MagicQuantOrchestrator:
                                     stage="baseline", ppl=round(saved_ppl, 4),
                                 )
                     else:
-                        log.warning(
-                            "Could not save base logits -- disabling KL-divergence "
-                            "scoring for this run", stage="kl",
-                        )
+                        self._kl_capture_failed = True
+                        if enable_kl:
+                            # Historical behavior, unchanged (see above).
+                            log.warning(
+                                "Could not save base logits -- disabling KL-divergence "
+                                "scoring for this run", stage="kl",
+                            )
+                        else:
+                            log.warning(
+                                "probe_kl requested KL-scored sensitivity probing "
+                                "but the base-logits capture pass failed (check "
+                                "the llama.cpp build supports --kl-divergence-base) "
+                                "-- probes will fall back to raw-PPL scoring for "
+                                "this run", stage="kl",
+                            )
 
         # ── Step 1c: standalone baseline measurement ──
         # Skipped when the checkpoint already restored it, or Step 1b fused
         # it in above. This is the historical baseline pass, unchanged --
-        # taken whenever enable_kl is off, or its fused attempt didn't pan
-        # out (no corpus / save failure), matching the pre-fusion behavior.
+        # taken whenever probe_kl and enable_kl are both off, or their fused
+        # attempt didn't pan out (no corpus / save failure), matching the
+        # pre-fusion behavior.
         if baseline_needs_standalone_measurement:
             if verbose:
                 log.info("Baseline perplexity", stage="baseline")
@@ -1228,6 +1403,47 @@ class MagicQuantOrchestrator:
         # Run completed successfully -- the checkpoint's job is done.
         checkpoint_path.unlink(missing_ok=True)
 
+        # BLOCKER fix: the KL base-logits file is huge (see
+        # keep_kl_base_logits's docstring above -- ~chunks * ctx_size *
+        # vocab_size * 2 bytes, verified 69 GB for a 27B at 100 chunks) and
+        # was never deleted. Only reached on a SUCCESSFUL completion (every
+        # earlier failure path above -- baseline measurement failure, zero
+        # valid measurements -- raises before this point), so a killed or
+        # failed run always leaves the file in place for a later resume to
+        # reuse without paying the capture cost again.
+        # Two targets: the file this run adopted, plus any orphan at the
+        # canonical path this run never adopted (a prior killed KL run's
+        # capture followed by this run completing with KL off entirely --
+        # without the orphan sweep that ~69 GB would outlive every
+        # successful run).
+        _kl_cleanup_targets = {
+            p for p in (
+                self._kl_base_logits_path,
+                str(self.output_dir / "_kl_base_logits.kld"),
+            ) if p
+        }
+        if not keep_kl_base_logits and not (
+            os.environ.get(self._KEEP_KL_LOGITS_ENV) == "1"
+        ):
+            for _kl_path in _kl_cleanup_targets:
+                try:
+                    _kl_file = Path(_kl_path)
+                    if not _kl_file.exists():
+                        continue
+                    _kl_file.unlink()
+                    if verbose:
+                        log.info(
+                            "Deleted KL base logits file",
+                            stage="kl", path=_kl_path,
+                        )
+                except OSError as exc:
+                    log.warning(
+                        "Failed to delete KL base logits file -- it will be "
+                        "left on disk",
+                        stage="kl", path=_kl_path,
+                        error=str(exc),
+                    )
+
         if verbose:
             for tier, info in tiered.items():
                 c = info["config"]
@@ -1582,7 +1798,16 @@ class MagicQuantOrchestrator:
             "corpus": corpus,
             "imatrix_active": imatrix is not None,
             "imatrix_n_tensors": len(imatrix) if imatrix else None,
+            # True whenever base-logits capture succeeded, whether it was
+            # requested by probe_kl (Step 2 sensitivity probes, default on)
+            # or enable_kl (candidate objective blend, default off) or both
+            # -- they share one capture pass. Does NOT by itself mean the
+            # candidate objective blends KL; see kl_objective_blend_active.
             "kl_enabled": bool(getattr(self, "_kl_base_logits_path", None)),
+            # True only when enable_kl actually blended KL into candidate
+            # selection this run (self._kl_weight is 0.0 whenever enable_kl
+            # was off, regardless of probe_kl / kl_enabled above).
+            "kl_objective_blend_active": bool(getattr(self, "_kl_weight", 0.0)),
             "kl_weight": getattr(self, "_kl_weight", 0.0),
             "probing_provenance": probing_provenance,
             # True when SensitivityProber.get_normalized_weights() had to
@@ -2287,16 +2512,78 @@ class MagicQuantOrchestrator:
     def _current_measurement_conditions(self) -> Dict[str, Any]:
         """The subset of measurement conditions that must match between a
         checkpoint and the run attempting to resume it: the chunk cap, ctx
-        size, and calibration corpus. (Fuller run metadata -- imatrix/KL
-        state, probing provenance -- is recorded in the checkpoint too, but
-        those are RESULTS of a run, not inputs to compare for eligibility.)
+        size, calibration corpus, and whether/how KL blends into the
+        candidate OBJECTIVE (``enable_kl``/``kl_weight`` -- NOT ``probe_kl``,
+        which only affects Step 2 sensitivity-probe scoring, a RESULT of a
+        run rather than an input the resumed run's candidate ranking depends
+        on). (Fuller run metadata -- imatrix/KL state, probing provenance --
+        is recorded in the checkpoint too, but those are also RESULTS of a
+        run, not inputs to compare for eligibility.)
+
+        BLOCKER fix (F2): without ``enable_kl``/``kl_weight`` here, a
+        checkpoint recorded under a PPL-only objective (``enable_kl=False``)
+        could silently half-resume into a KL-blended run (``enable_kl=True``)
+        -- every already-measured candidate's ``measured_loss`` would be
+        reused unchanged, but nothing would ever backfill the ``"kl"``
+        measurement those candidates never took, so they'd permanently
+        compete on PPL-only scores inside a run everything else believes is
+        KL-blended. See ``_measurement_conditions_match`` for the
+        backward-compatible comparison this enables (a checkpoint written
+        before this fix simply lacks these two keys).
         """
         llama = getattr(self, "_llama_tools", None)
         return {
             "chunks": getattr(llama, "ppl_chunks", None),
             "ctx_size": getattr(llama, "ctx_size", None),
             "corpus": self._safe_resolve_corpus(),
+            "enable_kl": bool(getattr(self, "_enable_kl", False)),
+            "kl_weight": getattr(self, "_kl_weight", 0.0),
         }
+
+    @staticmethod
+    def _measurement_conditions_match(
+        stored: Dict[str, Any], current: Dict[str, Any]
+    ) -> bool:
+        """Compare a checkpoint's stored measurement conditions against the
+        current run's, with backward-compatible defaults for the KL fields
+        (F2).
+
+        ``chunks``/``ctx_size``/``corpus`` must match exactly, as before.
+
+        ``enable_kl`` is compared with a MISSING stored key treated as
+        ``False`` -- every checkpoint written before this fix predates the
+        key entirely and was, without exception, produced by a PPL-only
+        objective (``enable_kl`` didn't exist as a checkpoint condition
+        until now), so "key absent" and "key present and False" mean the
+        same thing here. Concretely: an old checkpoint + a fresh
+        ``enable_kl=False`` config still resumes (``False == False``); an
+        old checkpoint + a fresh ``enable_kl=True`` config is rejected
+        (``False != True``), which is exactly the "changed objective" case
+        this fix exists to catch; a new checkpoint resumes normally against
+        a same-objective new run either way.
+
+        ``kl_weight`` only participates in the comparison when the CURRENT
+        run has ``enable_kl`` on -- a weight difference while blending is
+        OFF changes nothing real about how candidates were ranked (
+        ``run_measured_search`` forces ``self._kl_weight = 0.0`` whenever
+        ``enable_kl`` is False), so it must not force an unnecessary
+        re-measurement.
+        """
+        for key in ("chunks", "ctx_size", "corpus"):
+            if stored.get(key) != current.get(key):
+                return False
+
+        stored_enable_kl = bool(stored.get("enable_kl", False))
+        current_enable_kl = bool(current.get("enable_kl", False))
+        if stored_enable_kl != current_enable_kl:
+            return False
+
+        if current_enable_kl and stored.get("kl_weight", 0.0) != current.get(
+            "kl_weight", 0.0
+        ):
+            return False
+
+        return True
 
     def _load_matching_checkpoint(
         self, path: Path, verbose: bool
@@ -2327,7 +2614,8 @@ class MagicQuantOrchestrator:
         if checkpoint.get("source_model") != current_source:
             reasons.append("source model identity changed")
         current_conditions = self._current_measurement_conditions()
-        if checkpoint.get("measurement_conditions") != current_conditions:
+        stored_conditions = checkpoint.get("measurement_conditions") or {}
+        if not self._measurement_conditions_match(stored_conditions, current_conditions):
             reasons.append("measurement conditions changed")
 
         if reasons:

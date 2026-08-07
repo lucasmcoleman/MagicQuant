@@ -395,6 +395,7 @@ def test_run_measured_search_forwards_calibration_source(tmp_path, monkeypatch):
         search_generations=2, population_size=8,
         measurement_rounds=1, candidates_per_round=2, verbose=False,
         calibration_source=str(calib_path),
+        probe_kl=False,  # _FakeLlamaTools has no save_base_logits
     )
 
     assert _CapturingPredictiveScorer.captured
@@ -408,6 +409,7 @@ def test_run_measured_search_default_calibration_source_is_empty_string(tmp_path
     orch.run_measured_search(
         search_generations=2, population_size=8,
         measurement_rounds=1, candidates_per_round=2, verbose=False,
+        probe_kl=False,  # _FakeLlamaTools has no save_base_logits
     )
 
     assert _CapturingPredictiveScorer.captured[0]["calibration_source"] == ""
@@ -436,6 +438,7 @@ def test_run_measured_search_default_does_not_write_calibration(tmp_path, monkey
     orch.run_measured_search(
         search_generations=2, population_size=8,
         measurement_rounds=1, candidates_per_round=2, verbose=False,
+        probe_kl=False,  # _FakeLlamaTools has no save_base_logits
     )
 
     assert not (orch.output_dir / "noise_calibration.json").exists()
@@ -448,6 +451,7 @@ def test_run_measured_search_write_calibration_true_writes_file(tmp_path, monkey
         search_generations=2, population_size=8,
         measurement_rounds=1, candidates_per_round=2, verbose=False,
         write_calibration=True,
+        probe_kl=False,  # _FakeLlamaTools has no save_base_logits
     )
 
     calib_path = orch.output_dir / "noise_calibration.json"

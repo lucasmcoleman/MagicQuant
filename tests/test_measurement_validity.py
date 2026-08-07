@@ -113,6 +113,10 @@ def test_impossible_candidate_measurement_is_flagged_invalid(tmp_path, monkeypat
         search_generations=2, population_size=8,
         measurement_rounds=1, candidates_per_round=2, verbose=False,
         seed_incumbents=False,
+        # Unrelated to measurement-validity; _ControlledLlamaTools has no
+        # save_base_logits -- probe_kl's now-default capture attempt would
+        # hit it. See run_measured_search's probe_kl docstring.
+        probe_kl=False,
     )
 
     assert orch._measured, "candidates must still have been recorded (flagged, not dropped)"
@@ -245,6 +249,7 @@ def test_all_invalid_measurements_raises_instead_of_completing_with_zero_tiers(
             search_generations=2, population_size=8,
             measurement_rounds=1, candidates_per_round=2, verbose=False,
             seed_incumbents=False,
+            probe_kl=False,
         )
 
     # Confirm the precondition this test exercises: measurements were
@@ -261,6 +266,10 @@ def test_measured_candidates_record_their_own_corpus_path(tmp_path, monkeypatch)
         search_generations=2, population_size=8,
         measurement_rounds=1, candidates_per_round=2, verbose=False,
         seed_incumbents=False,
+        # Unrelated to measurement-validity; _ControlledLlamaTools has no
+        # save_base_logits -- probe_kl's now-default capture attempt would
+        # hit it. See run_measured_search's probe_kl docstring.
+        probe_kl=False,
     )
 
     assert orch._measured
