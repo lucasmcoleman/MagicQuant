@@ -137,8 +137,22 @@ it exceeds a minute per forward, so an infeasible run is visible in its first
 seconds rather than at dawn. `frozen` makes a 35B run possible at the cost of a
 real caveat: the adapter's delta is never re-quantized during training, while the
 shipped weight is `quant(W_q + delta)`, so at Q2_K/Q3_K some of the compensation
-can be rounded away at pack time. Frozen-mode recovery has **not** been validated
-end to end.
+can be rounded away at pack time.
+
+Frozen-mode recovery **has now been measured in a controlled 4-arm experiment**
+([experiments/qat-frozen-mode-2026-08.md](experiments/qat-frozen-mode-2026-08.md)):
+at identical scale, dataset, hyperparameters and step count, frozen recovers
+**+13.0%** of the quantization damage vs live's **+21.8%** — a bit over half.
+Merging the delta onto `fq(W)` instead of `W` moved it only −1.4 pt, so the
+train/ship merge-target mismatch is *not* the dominant cost; the mode itself is.
+Two practical consequences: budget frozen runs at roughly half of live's
+expected recovery, and **never judge a frozen run by its raw out-of-domain PPL
+delta** — in the experiment, frozen's raw wikitext PPL came out *worse than
+quant-only* (+0.12) even while its confound-controlled recovery was +13%,
+because the LoRA's chat-domain drift outweighed the compensation on raw prose.
+That signature fully reproduces the Qwen3.6-35B-A3B frozen-QAT "negative"
+(−6.1% raw): the measurement was honest, but raw-delta-on-wikitext is the wrong
+instrument for a frozen run trained on a chat blend.
 
 **Why there is a cache.** The eager MoE forward reads the fused parameter once per
 *hit expert* (`self.gate_up_proj[expert_idx]` inside the loop) — ~256 times per
@@ -371,9 +385,18 @@ inflating perplexity on *every* MagicQuant pack — base 21.9→12.6 after the f
 - **The validated result is a dense model, Linear-only.** Every number above comes
   from Qwen2.5-0.5B with `QATLinear` in `live` semantics. Fused 3-D MoE expert QAT
   reuses the same fake-quant kernels and the same merged-weight discipline, but no
-  recovery figure has been measured for it — and `frozen` mode is a *weaker*
-  approximation than anything that produced these numbers (see the mode table
-  above). Do not quote 47.5% / 38.1% for an MoE expert run.
+  recovery figure has been measured for it on an actual MoE. `frozen` semantics
+  *have* been measured in isolation (dense reimplementation, controlled 4-arm,
+  [experiments/qat-frozen-mode-2026-08.md](experiments/qat-frozen-mode-2026-08.md)):
+  ~55% of live's recovery. Do not quote 47.5% / 38.1% for an MoE expert run.
+- **"Q4_K-attention" on Qwen2.5-0.5B was never Q4_K in the GGUF.** The model's
+  hidden size is 896, not divisible by a K-quant's 256 block, so the writer's
+  block-32 fallback packed those tensors as MXFP4 — in the original validation
+  packs too. The recovery arithmetic is unaffected (every arm compared the same
+  effective pack), but the hybrid should be described as MXFP4-attention/
+  MXFP4-FFN on this model. The 4-arm experiment fake-quantizes the *effective*
+  type and asserts each pack tensor-by-tensor to keep training and shipped file
+  in agreement.
 
 ---
 
