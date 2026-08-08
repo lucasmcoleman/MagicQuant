@@ -313,13 +313,8 @@ class GGUFSource(ModelSource):
         buf = self._read_raw_bytes(
             tensor_name, byte_len, self._data_offset + info["offset"],
         )
-        if type_name == "F32":
-            return np.frombuffer(buf, dtype=np.float32).copy()
-        if type_name == "F16":
-            return np.frombuffer(buf, dtype=np.float16).astype(np.float32)
-        if type_name == "BF16":
-            raw = np.frombuffer(buf, dtype=np.uint16)
-            return (raw.astype(np.uint32) << 16).view(np.float32)
+        if type_name in _NATIVE_FLOAT_TYPES:
+            return _decode_st_bytes_to_f32(type_name, buf)
         # Quantized source tensor. Undecodable unless dequant was explicitly
         # enabled; the writer's pre-quantized guard reports the error, so just
         # signal "no data" here rather than raising.
@@ -645,10 +640,12 @@ _ST_DTYPE_NUMPY = {
 
 
 def _decode_st_bytes_to_f32(dtype: str, buf) -> Optional[np.ndarray]:
-    """Decode a raw safetensors byte buffer to a flat float32 array.
+    """Decode a raw safetensors-style byte buffer to a flat float32 array.
 
     Shared by SafetensorsSource.read_tensor_f32 (single tensor) and its
-    stacked-MoE-expert reader (one call per expert part, concatenated).
+    stacked-MoE-expert reader (one call per expert part, concatenated),
+    GGUFSource.read_tensor_f32 (gated to the three native float types --
+    see _NATIVE_FLOAT_TYPES), and LoRAMergedSource._read_adapter_tensor.
     Returns None for an unrecognized dtype.
     """
     np_dtype = _ST_DTYPE_NUMPY.get(dtype)
@@ -664,15 +661,29 @@ def _decode_st_bytes_to_f32(dtype: str, buf) -> Optional[np.ndarray]:
     return np.frombuffer(buf, dtype=np_dtype).astype(np.float32)
 
 
-def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
-    """Build GGUF-compatible metadata from a HuggingFace config.json."""
-    # For multimodal/composite models, the LLM config is nested
-    # under text_config, language_config, or llm_config.
+def _resolve_effective_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve the effective LLM config for multimodal/composite models.
+
+    For multimodal/composite models, the LLM config is nested under
+    text_config, language_config, or llm_config (checked in that order,
+    first match wins). The sub-config's keys WIN over the top-level
+    config's on conflict -- e.g. qwen3_5's "qwen3_5_text" model_type only
+    ever appears inside text_config and must override the parent's.
+    Returns ``config`` itself (same object) when no sub-config is present.
+    """
     effective = config
     for sub_key in ("text_config", "language_config", "llm_config"):
         if sub_key in config and isinstance(config[sub_key], dict):
             effective = {**config, **config[sub_key]}
             break
+    return effective
+
+
+def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Build GGUF-compatible metadata from a HuggingFace config.json."""
+    # For multimodal/composite models, the LLM config is nested
+    # under text_config, language_config, or llm_config.
+    effective = _resolve_effective_config(config)
 
     model_type = effective.get("model_type", "llama")
 
@@ -1067,7 +1078,9 @@ def _detect_tokenizer_pre(tok_json: Dict[str, Any]):
     return None
 
 
-def _build_tokenizer_metadata(model_dir: str, arch: str = "") -> Dict[str, Any]:
+def _build_tokenizer_metadata(
+    model_dir: str, arch: str = "", config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Read tokenizer data from a HuggingFace model directory and return
     GGUF-compatible tokenizer metadata.
@@ -1079,6 +1092,15 @@ def _build_tokenizer_metadata(model_dir: str, arch: str = "") -> Dict[str, Any]:
         arch: GGUF architecture string, used only to disambiguate
             ``tokenizer.ggml.pre`` for qwen35/qwen35moe (see below --
             regex matching alone can't tell it apart from qwen2).
+        config: Already-parsed config.json contents, if the caller has
+            one (e.g. SafetensorsSource._ensure_loaded, which reads
+            config.json before this is called). When given, skips this
+            function's own config.json read. Pass ``{}`` (not None) to
+            represent "config.json does not exist" -- an empty dict
+            resolves through the same effective-config/vocab_size/
+            bos_token_id lookups as a missing file and yields identical
+            metadata. Leave as ``None`` (the default) to preserve the
+            original read-from-disk behavior.
     """
     meta: Dict[str, Any] = {}
 
@@ -1152,17 +1174,19 @@ def _build_tokenizer_metadata(model_dir: str, arch: str = "") -> Dict[str, Any]:
             max_id = max(max_id, max_added_id)
 
         # If a config.json exists, use its vocab_size to pad the token
-        # list so it matches the embedding tensor dimension.
-        config_path_for_vocab = os.path.join(model_dir, "config.json")
-        if os.path.exists(config_path_for_vocab):
-            with open(config_path_for_vocab) as _f:
-                _cfg = json.load(_f)
-            # Resolve nested text_config for multimodal models
-            _eff = _cfg
-            for _sub in ("text_config", "language_config", "llm_config"):
-                if _sub in _cfg and isinstance(_cfg[_sub], dict):
-                    _eff = {**_cfg, **_cfg[_sub]}
-                    break
+        # list so it matches the embedding tensor dimension. If the caller
+        # already parsed config.json (see the ``config`` arg docstring
+        # above), use that directly instead of re-reading it from disk.
+        if config is not None:
+            _cfg = config
+        else:
+            config_path_for_vocab = os.path.join(model_dir, "config.json")
+            _cfg = None
+            if os.path.exists(config_path_for_vocab):
+                with open(config_path_for_vocab) as _f:
+                    _cfg = json.load(_f)
+        if _cfg is not None:
+            _eff = _resolve_effective_config(_cfg)
             cfg_vocab_size = _eff.get("vocab_size", 0)
             if cfg_vocab_size > max_id + 1:
                 max_id = cfg_vocab_size - 1
@@ -1387,11 +1411,7 @@ class SafetensorsSource(ModelSource):
         # resolve head counts from the (text_config-aware) effective config.
         self._qk_heads = None
         if arch in _QK_PERMUTED_ARCHS:
-            effective = config
-            for sub_key in ("text_config", "language_config", "llm_config"):
-                if sub_key in config and isinstance(config[sub_key], dict):
-                    effective = {**config, **config[sub_key]}
-                    break
+            effective = _resolve_effective_config(config)
             n_head = effective.get("num_attention_heads")
             n_kv = effective.get("num_key_value_heads", n_head)
             if n_head:
@@ -1410,11 +1430,7 @@ class SafetensorsSource(ModelSource):
         # need head counts), only for the reorder.
         self._qwen35_cfg = None
         if arch in ("qwen35", "qwen35moe"):
-            effective = config
-            for sub_key in ("text_config", "language_config", "llm_config"):
-                if sub_key in config and isinstance(config[sub_key], dict):
-                    effective = {**config, **config[sub_key]}
-                    break
+            effective = _resolve_effective_config(config)
             self._qwen35_cfg = {
                 "num_k": effective.get("linear_num_key_heads"),
                 "num_v": effective.get("linear_num_value_heads"),
@@ -1580,7 +1596,7 @@ class SafetensorsSource(ModelSource):
                 self._tensor_map["output.weight"] = ref
 
         # Load tokenizer data
-        tokenizer_meta = _build_tokenizer_metadata(self._model_dir, arch=arch)
+        tokenizer_meta = _build_tokenizer_metadata(self._model_dir, arch=arch, config=config)
         self._metadata.update(tokenizer_meta)
 
     @staticmethod
@@ -1892,13 +1908,10 @@ class LoRAMergedSource(ModelSource):
             f.seek(data_start + byte_offset)
             buf = f.read(byte_length)
         dtype = info["dtype"]
-        if dtype == "BF16":
-            raw = np.frombuffer(buf, dtype=np.uint16)
-            return (raw.astype(np.uint32) << 16).view(np.float32).reshape(info["shape"])
-        elif dtype == "F16":
-            return np.frombuffer(buf, dtype=np.float16).astype(np.float32).reshape(info["shape"])
-        else:
-            return np.frombuffer(buf, dtype=np.float32).copy().reshape(info["shape"])
+        flat = _decode_st_bytes_to_f32(dtype, buf)
+        if flat is None:
+            raise ValueError(f"Adapter tensor {key!r} has unsupported dtype {dtype!r}")
+        return flat.reshape(info["shape"])
 
     def get_metadata(self):
         return self._base.get_metadata()
