@@ -9,7 +9,7 @@ import subprocess
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -155,7 +155,15 @@ class LlamaCppTools:
             )
 
     def _find_quantize_tool(self) -> str:
-        """Find the quantize executable."""
+        """Find the quantize executable.
+
+        MagicQuant does not quantize through this binary -- encoding goes
+        through magicquant.quant.ggml_binding.ggml_encode (byte-identical to
+        llama.cpp, see tests/integration/test_encoder_parity.py). It is kept
+        as a llama.cpp-location anchor (construction fails fast if a build
+        dir is missing llama-quantize) and for cmd_dry_run's diagnostic log
+        line (self.quantize_tool), not as MagicQuant's own quantization path.
+        """
         possible_names = ["llama-quantize.exe", "llama-quantize", "quantize.exe", "quantize"]
         base = Path(self.llamacpp_path)
         search_dirs = [
@@ -299,61 +307,6 @@ class LlamaCppTools:
             "  or pass data_file=<path> to LlamaCppTools / calculate_perplexity()."
         )
         return None
-
-    def quantize_model(
-        self,
-        input_path: str,
-        output_path: str,
-        quant_type: str,
-        verbose: bool = True,
-    ) -> bool:
-        """
-        Quantize a model using llama.cpp.
-
-        Args:
-            input_path: Source model (BF16/F16)
-            output_path: Output quantized model
-            quant_type: Quantization type (Q4_K_M, Q6_K, IQ4_NL, etc.)
-            verbose: Print output
-
-        Returns:
-            True if successful
-        """
-        cmd = [
-            self.quantize_tool,
-            input_path,
-            output_path,
-            quant_type,
-        ]
-        # llama-quantize has no -ngl (quantization doesn't run inference);
-        # nthreads is a trailing positional, not a flag.
-        threads = getattr(self, "threads", None)
-        if threads is not None:
-            cmd.append(str(threads))
-
-        if verbose:
-            print(f"Running: {' '.join(cmd)}")
-
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=_QUANTIZE_TIMEOUT,
-            )
-
-            if verbose:
-                print(result.stdout)
-
-            return True
-
-        except subprocess.CalledProcessError as e:
-            print(f"Quantization failed: {e.stderr}")
-            return False
-        except subprocess.TimeoutExpired:
-            print(f"Quantization timed out after {_QUANTIZE_TIMEOUT}s")
-            return False
 
     @retry(
         stop=stop_after_attempt(3),
@@ -937,20 +890,3 @@ def _find_bench_tool(perplexity_tool_path: str) -> Optional[str]:
         return found[0] if found else None
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return None
-
-
-# Quantization type mapping from MagicQuant to llama.cpp
-QUANT_TYPE_MAP: Dict[str, str] = {
-    "BF16": "BF16",  # Keep as-is
-    "Q8_0": "Q8_0",
-    "Q6_K": "Q6_K",
-    "Q5_K": "Q5_K",
-    "Q4_K_M": "Q4_K_M",
-    "IQ4_NL": "IQ4_NL",
-    "MXFP4_MOE": "MXFP4",  # native ggml type 39 (GGML_TYPE_MXFP4)
-}
-
-
-def get_llamacpp_quant_type(magicquant_type: str) -> str:
-    """Convert MagicQuant scheme name to llama.cpp type."""
-    return QUANT_TYPE_MAP.get(magicquant_type, "Q4_K_M")

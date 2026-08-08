@@ -633,28 +633,6 @@ def test_calculate_kl_divergence_cmd_includes_flags_when_set(tmp_path):
     assert cmd[cmd.index("-t") + 1] == "16"
 
 
-def test_quantize_model_cmd_unchanged_when_threads_unset():
-    tools = _bare_tools()
-    tools.quantize_tool = "/bin/true"
-    with mock.patch("magicquant.utils.llamacpp.subprocess.run") as run:
-        run.return_value = mock.Mock(stdout="")
-        tools.quantize_model("/in.gguf", "/out.gguf", "Q4_K_M", verbose=False)
-    cmd = run.call_args[0][0]
-    assert cmd == ["/bin/true", "/in.gguf", "/out.gguf", "Q4_K_M"]
-
-
-def test_quantize_model_cmd_appends_nthreads_positional_when_set():
-    tools = _bare_tools(threads=16)
-    tools.quantize_tool = "/bin/true"
-    with mock.patch("magicquant.utils.llamacpp.subprocess.run") as run:
-        run.return_value = mock.Mock(stdout="")
-        tools.quantize_model("/in.gguf", "/out.gguf", "Q4_K_M", verbose=False)
-    cmd = run.call_args[0][0]
-    assert cmd == ["/bin/true", "/in.gguf", "/out.gguf", "Q4_K_M", "16"]
-    # ngl must NOT appear -- llama-quantize has no such flag.
-    assert "-ngl" not in cmd
-
-
 # --- Live smoke test (real binaries + real tiny model) ----------------------
 
 _LLAMA_BENCH_BIN = "/home/lucas/ROCmFPX/build-strix-rocmfp4/bin/llama-bench"

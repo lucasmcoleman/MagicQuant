@@ -18,8 +18,7 @@ with an importance matrix), noise factors for imatrix-consuming schemes
 see `magicquant.quant.schemes.effective_noise_factor`.
 """
 
-from typing import Dict, List, Tuple, Optional
-import numpy as np
+from typing import Dict, List, Optional
 
 from magicquant.quant import calibration
 from magicquant.quant.schemes import effective_noise_factor, get_scheme_by_name
@@ -376,9 +375,3 @@ class PredictiveScorer:
     def record_residual(self, config: Dict[str, str], residual: float):
         key = self._make_config_key(config)
         self.residual_cache[key] = residual
-
-    def get_sensitivity_weights(self) -> Dict[str, float]:
-        return self.sensitivity_weights.copy()
-
-    def update_sensitivity_weights(self, new_weights: Dict[str, float]):
-        self.sensitivity_weights = new_weights

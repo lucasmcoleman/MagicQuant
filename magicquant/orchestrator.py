@@ -23,7 +23,7 @@ from magicquant.evolution.survival import EvolutionarySurvivor
 from magicquant.evolution.probing import SensitivityProber
 from magicquant.gguf.tensor_groups import TensorGroupClassifier
 from magicquant.utils.naming import generate_name
-from magicquant.utils.llamacpp import LlamaCppTools, get_llamacpp_quant_type
+from magicquant.utils.llamacpp import LlamaCppTools
 from magicquant.utils.measurement import measurement_eps
 from magicquant.logging import get_logger
 from magicquant.quant.schemes import get_scheme_by_name
@@ -174,6 +174,13 @@ class MagicQuantOrchestrator:
         # measurement noise (see run_measured_search's speed_epsilon
         # docstring for the ThinkingCap numbers that motivated this).
         self._speed_epsilon: Optional[float] = None
+        # Metric _speed_aware_pick re-ranks near-tied candidates by: "bytes"
+        # (size_gb, default) or "bench" (measured tg throughput). Overridden
+        # by run_measured_search's speed_metric param. See the getattr
+        # fallback at _select_final_survivors, which intentionally keeps a
+        # DIFFERENT default ("bytes") for bare-__new__ test doubles that never
+        # ran __init__ -- both defaults agree, so this is purely additive.
+        self._speed_metric: str = "bytes"
 
     def _apply_seed(self, seed: Optional[int]) -> None:
         """Seed the RNGs once for a reproducible search.
@@ -1688,12 +1695,13 @@ class MagicQuantOrchestrator:
             tier = self._classify_tier(info["size_gb"], baseline_gb)
             by_tier[tier].append(info)
 
-        # Conservative getattr fallback (False/None) for instances built via
-        # bare __new__ that predate this feature entirely -- a normally
-        # constructed orchestrator always has these attributes set (True /
-        # None by __init__, then possibly overridden by run_measured_search's
-        # own speed_aware/speed_epsilon params), so real callers get the new
-        # default; only pre-feature/stripped-down test doubles fall back here.
+        # Conservative getattr fallback (False/None/"bytes") for instances
+        # built via bare __new__ that predate this feature entirely -- a
+        # normally constructed orchestrator always has these attributes set
+        # (True / None / "bytes" by __init__, then possibly overridden by
+        # run_measured_search's own speed_aware/speed_epsilon/speed_metric
+        # params), so real callers get the new default; only pre-feature/
+        # stripped-down test doubles fall back here.
         speed_aware = getattr(self, "_speed_aware", False)
         speed_epsilon_override = getattr(self, "_speed_epsilon", None)
         speed_metric = getattr(self, "_speed_metric", "bytes")
@@ -1829,6 +1837,33 @@ class MagicQuantOrchestrator:
         """
         from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION
 
+        # Built once and reused for both "tiered" (full) and "tiered_survivors"
+        # (the same per-tier entry minus predicted_loss) below -- the two used
+        # to be independent dict comprehensions over the same `tiered.items()`
+        # and had to be hand-kept in sync.
+        _tiered_full = {
+            tier: {
+                "config": info["config"],
+                "ppl": info.get("ppl"),
+                "measured_loss": info.get("measured_loss"),
+                "predicted_loss": info.get("predicted_loss"),
+                "size_gb": info.get("size_gb", info.get("predicted_size_gb")),
+                # "incumbent" when this tier's winner IS one of
+                # magicquant.incumbents' seeded llama.cpp-mixture
+                # configs (info["incumbent"] holds the seed tier tag,
+                # e.g. "Q4"), "evolved" when the search itself produced
+                # the winner. Previously invisible -- across four real
+                # models the Q4/Q5 tiers were repeatedly won by the
+                # incumbent seed with the search contributing nothing,
+                # and there was no field recording that fact. Only
+                # populated by the measured-search path (run_full_search's
+                # prediction-only tiers don't carry seed provenance, so
+                # they always read "evolved" here).
+                "source": "incumbent" if info.get("incumbent") else "evolved",
+            }
+            for tier, info in tiered.items()
+        }
+
         results = {
             # Which TIER_BOUNDARIES set classified the tier labels below.
             # Old files without this key predate the fix and must be read as
@@ -1870,38 +1905,13 @@ class MagicQuantOrchestrator:
                 }
                 for k, v in self._measured.items()
             },
+            # Same per-tier entry as "tiered" below, minus predicted_loss --
+            # derived from _tiered_full so the two can't drift apart again.
             "tiered_survivors": {
-                tier: {
-                    "config": info["config"],
-                    "ppl": info.get("ppl"),
-                    "measured_loss": info.get("measured_loss"),
-                    "size_gb": info.get("size_gb", info.get("predicted_size_gb")),
-                    # "incumbent" when this tier's winner IS one of
-                    # magicquant.incumbents' seeded llama.cpp-mixture
-                    # configs (info["incumbent"] holds the seed tier tag,
-                    # e.g. "Q4"), "evolved" when the search itself produced
-                    # the winner. Previously invisible -- across four real
-                    # models the Q4/Q5 tiers were repeatedly won by the
-                    # incumbent seed with the search contributing nothing,
-                    # and there was no field recording that fact. Only
-                    # populated by the measured-search path (run_full_search's
-                    # prediction-only tiers don't carry seed provenance, so
-                    # they always read "evolved" here).
-                    "source": "incumbent" if info.get("incumbent") else "evolved",
-                }
-                for tier, info in tiered.items()
+                tier: {k: v for k, v in entry.items() if k != "predicted_loss"}
+                for tier, entry in _tiered_full.items()
             },
-            "tiered": {
-                tier: {
-                    "config": info["config"],
-                    "ppl": info.get("ppl"),
-                    "measured_loss": info.get("measured_loss"),
-                    "predicted_loss": info.get("predicted_loss"),
-                    "size_gb": info.get("size_gb", info.get("predicted_size_gb")),
-                    "source": "incumbent" if info.get("incumbent") else "evolved",
-                }
-                for tier, info in tiered.items()
-            },
+            "tiered": _tiered_full,
         }
 
         results_path = self.output_dir / "search_results.json"
@@ -2775,57 +2785,3 @@ class MagicQuantOrchestrator:
             default_size_gb=1.0,
         )
         return 1.0
-
-
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="MagicQuant Orchestrator - Hybrid Quantization Search"
-    )
-    parser.add_argument("source_model", help="Path to source model (GGUF, safetensors, or directory)")
-    parser.add_argument("--output-dir", default="./output")
-    parser.add_argument("--target-quant", default="MXFP4_MOE")
-    parser.add_argument("--generations", type=int, default=30)
-    parser.add_argument("--rounds", type=int, default=3, help="Measurement rounds (0 = prediction only)")
-    parser.add_argument("--candidates", type=int, default=4, help="Candidates to measure per round")
-    parser.add_argument("--llamacpp-path", help="Path to llama.cpp directory")
-    parser.add_argument("--adapter", help="Path to LoRA adapter directory")
-
-    args = parser.parse_args()
-
-    orchestrator = MagicQuantOrchestrator(
-        source_model_path=args.source_model,
-        output_dir=args.output_dir,
-        llamacpp_path=args.llamacpp_path,
-        adapter_path=args.adapter,
-    )
-
-    if args.rounds > 0:
-        all_configs, tiered = orchestrator.run_measured_search(
-            target_base_quant=args.target_quant,
-            search_generations=args.generations,
-            measurement_rounds=args.rounds,
-            candidates_per_round=args.candidates,
-            verbose=True,
-        )
-    else:
-        all_configs, tiered = orchestrator.run_full_search(
-            target_base_quant=args.target_quant,
-            max_generations=args.generations,
-            verbose=True,
-        )
-
-    # Generate final survivors
-    log.info("Generating final survivors", stage="generate")
-
-    orchestrator.generate_tiered_models(
-        tiered=tiered,
-        model_name_prefix=Path(args.source_model).stem,
-        tiers=["Q2", "Q4", "Q5", "Q6", "Q8"],
-        verify=False,
-    )
-
-
-if __name__ == "__main__":
-    main()
