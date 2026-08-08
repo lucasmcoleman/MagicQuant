@@ -23,24 +23,7 @@ class GGUFReader:
     
     # GGUF magic number: "GGUF" in little-endian
     GGUF_MAGIC = 0x46554747
-    
-    # Data types in GGUF
-    GGUF_TYPES = {
-        0: "UINT8",
-        1: "INT8",
-        2: "UINT16",
-        3: "INT16",
-        4: "UINT32",
-        5: "INT32",
-        6: "FLOAT32",
-        7: "BOOL",
-        8: "STRING",
-        9: "ARRAY",
-        10: "UINT64",
-        11: "INT64",
-        12: "FLOAT64"
-    }
-    
+
     def __init__(self, filepath: str):
         """
         Initialize the GGUF reader.
@@ -208,14 +191,7 @@ class GGUFReader:
         for key in arch_keys:
             if key in self.metadata:
                 return self.metadata[key]
-        
-        # Try to infer from tensor names
-        for tensor_name in self.get_tensor_names():
-            if 'transformer' in tensor_name.lower():
-                return 'gpt-next'
-            elif 'model' in tensor_name.lower():
-                return 'llama'
-        
+
         return 'unknown'
     
     def get_parameter_count(self) -> int:
@@ -243,28 +219,6 @@ class GGUFReader:
         
         file_bytes = self.file_size
         return (file_bytes * 8) / params
-    
-    def find_tensors_by_group(self, group_name: str) -> List[Dict[str, Any]]:
-        """
-        Find tensors that belong to a specific functional group.
-        
-        Args:
-            group_name: Group identifier ('E', 'H', 'Q', 'K', 'O', 'U', 'D')
-            
-        Returns:
-            List of tensor info dicts matching the group
-        """
-        self._ensure_open()
-        from magicquant.gguf.tensor_groups import TensorGroupClassifier
-        
-        classifier = TensorGroupClassifier()
-        tensors = []
-        
-        for tensor in self.tensors:
-            if classifier.classify_tensor(tensor['name']) == group_name:
-                tensors.append(tensor)
-        
-        return tensors
 
 
 def read_gguf_file(filepath: str) -> GGUFReader:

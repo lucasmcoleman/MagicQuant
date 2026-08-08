@@ -16,7 +16,7 @@ Groups:
 - V: Vision encoder (model.visual.*) — separate modality
 """
 
-from typing import Dict, List, Tuple
+from typing import Dict, List
 import logging
 import os
 import re
@@ -111,10 +111,10 @@ class TensorGroupClassifier:
     # Maps substrings found in tensor names to groups. Checked only if no
     # explicit pattern matched — prevents wack-a-mole with new architectures.
     _HEURISTIC_KEYWORDS = {
-        'N': ['norm', 'layernorm', 'rmsnorm'],
+        'N': ['norm', 'rmsnorm'],
         'E': ['embed', 'embd', 'wte'],
         'H': ['lm_head', 'nextn', 'mtp'],
-        'R': ['router', 'gate_inp', 'gating', 'exp_probs_b', 'e_score_correction'],
+        'R': ['gate_inp', 'gating', 'e_score_correction'],
         'X': ['expert', 'moe'],
         'S': ['ssm', 'mamba', 'conv1d', 'dt_bias', 'a_log', 'recurrence'],
         'Q': ['q_proj', 'query'],
@@ -249,39 +249,3 @@ class TensorGroupClassifier:
 
         self.warn_unclassified_once()
         return grouped
-
-    def get_group_info(self, model_metadata: Dict) -> Dict:
-        """
-        Get comprehensive information about tensor groups in a model.
-        
-        Args:
-            model_metadata: GGUF metadata containing tensor names and counts
-            
-        Returns:
-            Dictionary with group analysis including:
-                - tensor_counts: Number of tensors per group
-                - param_counts: Estimated parameters per group
-                - sensitivity_flags: High-sensitivity groups (E, H, O, R)
-                - is_moe: Whether model uses Mixture-of-Experts
-        """
-        tensors = model_metadata.get('tensors', [])
-        
-        grouped = self.classify_tensors(tensors)
-        
-        # Calculate tensor counts per group
-        tensor_counts = {group: len(t) for group, t in grouped.items()}
-        
-        # Identify MoE models (have R or X groups with tensors)
-        is_moe = len(grouped.get('X', [])) > 0 or len(grouped.get('R', [])) > 0
-        
-        # High sensitivity groups - these are critical to preserve
-        high_sensitivity_groups = ['E', 'H', 'O']  # Embeddings, Head, Output
-        if is_moe:
-            high_sensitivity_groups.append('R')  # MoE Router is also critical
-        
-        return {
-            'tensor_counts': tensor_counts,
-            'grouped_tensors': grouped,
-            'is_moe': is_moe,
-            'high_sensitivity_groups': high_sensitivity_groups
-        }

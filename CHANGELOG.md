@@ -4,6 +4,9 @@
 
 Systematic behavior-preserving cleanup pass in progress on branch `cleanup/2026-08` (plan and audit trail: `docs/cleanup-2026-08-plan.md`). Entries are appended per commit and record files touched and how the change was verified.
 
+### Removed
+- Dead code in GGUF reader/tensor-groups: `GGUFReader.GGUF_TYPES` (unread table) and `GGUFReader.find_tensors_by_group` (zero-caller method, plus its local `TensorGroupClassifier` import) deleted from `reader.py`; `get_model_architecture`'s unreachable tensor-name-substring fallback simplified to fall straight through to `'unknown'`; `TensorGroupClassifier.get_group_info` (zero-caller method) and the unused `Tuple` typing import deleted from `tensor_groups.py`; three `_HEURISTIC_KEYWORDS` entries removed as unreachable duplicates of Pass-1 `GROUP_PATTERNS` matches already covering the same substrings (`'layernorm'` from group N, `'router'` and `'exp_probs_b'` from group R). (2026-08-08; files: magicquant/gguf/reader.py, magicquant/gguf/tensor_groups.py; verified: full suite 903/20 unchanged)
+
 ## [0.3.0] - 2026-06-09
 
 *Backfills everything shipped since the 0.2.0 entry below. `pyproject.toml`'s version jumped straight from 0.1.0 to 0.3.0 in the commit dated here; no further version bump has landed since, so this single entry also covers work that kept shipping under 0.3.0 through 2026-08-07, the day before the cleanup branch started.*
