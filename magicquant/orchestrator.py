@@ -24,7 +24,7 @@ from magicquant.evolution.probing import SensitivityProber
 from magicquant.gguf.tensor_groups import TensorGroupClassifier
 from magicquant.utils.naming import generate_name, config_key as _naming_config_key
 from magicquant.utils.llamacpp import LlamaCppTools
-from magicquant.utils.measurement import measurement_eps
+from magicquant.utils.measurement import measurement_eps, predictor_is_tracking
 from magicquant.logging import get_logger
 from magicquant.quant.schemes import get_scheme_by_name
 
@@ -1226,6 +1226,8 @@ class MagicQuantOrchestrator:
                 "build errors logged above."
             )
 
+        self._log_predictor_tracking()
+
         # ── Step 5: Select final survivors per tier ──
         tiered = self._select_final_survivors(baseline_size_gb)
 
@@ -1964,6 +1966,91 @@ class MagicQuantOrchestrator:
             entry["measurement_invalid"] = v.get("measurement_invalid", False)
         return entry
 
+    def _log_predictor_tracking(self) -> None:
+        """Kendall-tau diagnostic: does the loss predictor's ranking of
+        candidates actually track measured reality? See
+        ``magicquant.utils.measurement``'s "Predictor tracking" section --
+        ``predictor_rank_correlation``/``predictor_is_tracking`` were built
+        and unit-tested there (the module's own docstring calls this "the
+        guard that would have caught the 2026-07 [Laguna-S] failure no
+        matter which layer was at fault", tau -0.043 over that run's
+        pairs) but were never wired into a live search until now.
+
+        Computed ONCE, cumulatively, over every accumulated
+        (predicted_loss, measured_loss) pair in ``self._measured`` --
+        deliberately NOT per-round: ``candidates_per_round`` defaults to 4,
+        far below ``MIN_TAU_SAMPLES`` (12), so a per-round call would
+        report "unknown" forever and never actually check anything.
+        ``measurement_invalid`` entries are excluded (their measured_loss
+        is a physically-impossible reading that would corrupt the
+        correlation the same way it would corrupt tier selection), and
+        the filter clauses use ``.get(...)`` so incumbent-seeded entries
+        (``predicted_loss`` present, ``measured_loss=None``) and
+        foreign/hand-edited checkpoints missing either field are skipped
+        before the value expression indexes them.
+
+        Report, never gate: ``predictor_is_tracking`` returns a
+        THREE-state verdict (True / False / None-for-"not enough data"),
+        and only False is evidence of a broken run. A None verdict is
+        logged the same as True (info) -- logging "not tracking" for
+        "unknown" would be the exact "measured nothing reported as
+        measured zero" defect this repo's audits keep flagging,
+        reproduced in the reporting layer instead of the measurement
+        layer. Never raises BY CONSTRUCTION (the whole body is wrapped,
+        like the sibling reporting helpers): this runs before
+        ``_save_results``, so an unexpected exception here -- e.g. an
+        older self-installed scipy without ``SignificanceResult
+        .statistic`` -- must not be able to destroy a multi-hour run's
+        results. scipy being absent (``predictor_rank_correlation``
+        degrades to ``(None, None)`` with its own one-time warning)
+        surfaces as the ordinary "unknown" verdict, not a crash.
+
+        Stores the verdict on ``self._predictor_tracking`` for
+        ``_save_results`` to persist under the additive
+        ``"predictor_tracking"`` search_results.json key.
+        """
+        try:
+            self._log_predictor_tracking_inner()
+        except Exception as exc:  # pragma: no cover - defensive, like siblings
+            log.warning(
+                "Predictor-tracking diagnostic failed (non-fatal)",
+                stage="measurement", error=str(exc),
+            )
+
+    def _log_predictor_tracking_inner(self) -> None:
+        pairs = [
+            (info["predicted_loss"], info["measured_loss"])
+            for info in self._measured.values()
+            if not info.get("measurement_invalid")
+            and info.get("predicted_loss") is not None
+            and info.get("measured_loss") is not None
+        ]
+        predicted = [p for p, _m in pairs]
+        measured = [m for _p, m in pairs]
+        is_tracking, tau = predictor_is_tracking(predicted, measured)
+        self._predictor_tracking = {
+            "is_tracking": is_tracking,
+            "tau": tau,
+            "n_pairs": len(pairs),
+        }
+        if is_tracking is False:
+            log.warning(
+                "Predictor is NOT tracking measured reality over this "
+                "run -- its ranking of candidates was no better than "
+                "chance. The search optimized against a signal "
+                "uncorrelated with quality; treat its tier winners with "
+                "suspicion.",
+                stage="measurement", tau=round(tau, 4), n_pairs=len(pairs),
+            )
+        else:
+            log.info(
+                "Predictor tracking check",
+                stage="measurement",
+                is_tracking=is_tracking,
+                tau=round(tau, 4) if tau is not None else None,
+                n_pairs=len(pairs),
+            )
+
     def _save_results(self, all_configs, tiered):
         """Persist search results and measurements to JSON.
 
@@ -2017,6 +2104,14 @@ class MagicQuantOrchestrator:
             "probing_provenance": getattr(self, "probing_provenance", "unknown"),
             "seed": self._search_seed,
             "measurement": self._measurement_metadata(),
+            # Additive key: the Kendall-tau predicted-vs-measured ranking
+            # check from _log_predictor_tracking(). None on a prediction-
+            # only run (run_full_search never sets self._predictor_tracking
+            # -- it has no measurements to check) or on a bare-__new__ test
+            # double that calls _save_results directly. See
+            # _log_predictor_tracking's docstring for the report-never-gate
+            # semantics of the True/False/None verdict this carries.
+            "predictor_tracking": getattr(self, "_predictor_tracking", None),
             "measurements": {
                 k: self._serialize_measurement(v, include_path=False)
                 for k, v in self._measured.items()

@@ -12,6 +12,7 @@ import json
 import pytest
 
 import magicquant.gguf.source as source_mod
+import magicquant.orchestrator as orch_mod
 from magicquant.orchestrator import MagicQuantOrchestrator
 
 
@@ -958,3 +959,182 @@ def test_overlap_auto_keeps_overlap_when_ram_unreadable(tmp_path, monkeypatch):
     monkeypatch.setattr(orch.__class__, "_available_ram_bytes",
                         staticmethod(lambda: None))
     assert orch._should_overlap_builds() is True
+
+
+# ── predictor-tracking diagnostic wiring (E8) ────────────────────────────────
+#
+# magicquant.utils.measurement.predictor_rank_correlation/predictor_is_tracking
+# were built and unit-tested (tests/test_probe_resolution.py::TestPredictorTracking)
+# but never called by the search they were designed to guard. These tests
+# check the wiring: _log_predictor_tracking (called once, end-of-run, from
+# run_measured_search) computes the verdict cumulatively over self._measured,
+# excludes measurement_invalid and incumbent-seeded (measured_loss=None)
+# entries, logs it, and _save_results persists it under the additive
+# "predictor_tracking" key.
+
+def _bare_orch_for_tracking(tmp_path):
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch.output_dir = tmp_path
+    orch.baseline_ppl = 34.8363
+    orch.baseline_provenance = "measured"
+    orch.probing_provenance = "measured"
+    orch._search_seed = None
+    return orch
+
+
+class _FakeLog:
+    """Records (level, event, kwargs) for every structlog-style call
+    (log.info(event, **kw) / log.warning(event, **kw) / ...). orchestrator.py
+    logs via magicquant.logging's structlog-based `log`, which is left
+    unconfigured in tests (nothing calls configure_logging) so its default
+    backing is a bare PrintLogger -- caplog never sees it, and
+    structlog.testing.capture_logs() is unreliable across a full test-suite
+    run because cache_logger_on_first_use=True (set by any earlier test that
+    DOES call configure_logging, e.g. a CLI test) permanently binds the
+    module-level `log` object's processor chain on its first real call,
+    ahead of any later capture_logs() context. Monkeypatching the module
+    attribute directly (the same pattern as
+    tests/test_generate_tiered_models_missing.py) sidesteps all of that."""
+
+    def __init__(self):
+        self.calls = []
+
+    def _record(self, level):
+        def _call(event, **kw):
+            self.calls.append((level, event, kw))
+        return _call
+
+    def __getattr__(self, level):
+        return self._record(level)
+
+
+# The exact pairs Laguna-S recorded (also used verbatim in
+# tests/test_probe_resolution.py::TestPredictorTracking) -- Kendall tau over
+# them is -0.0426, i.e. NOT tracking. Reusing the real incident's numbers
+# rather than synthetic ones keeps this test tied to the failure it guards.
+_LAGUNA_S_PREDICTED = [
+    4.253018, 2.966267, 2.28, 1.439624, 0.491492, 0.491492, 0.0,
+    0.913953, 1.385445, 1.385445, 1.385445, 3.064993, 0.446342,
+    1.033281, 0.857834, 0.446342,
+]
+_LAGUNA_S_MEASURED = [
+    0.025496, 0.013969, 0.004845, 0.047605, 0.045422, 0.020864,
+    0.025925, 0.244713, 0.046464, 0.051313, 0.240506, 0.21743,
+    0.047818, 0.043852, 0.241443, 0.025642,
+]
+
+
+def test_predictor_tracking_verdict_logged_and_persisted(tmp_path, monkeypatch):
+    # This test asserts a REAL computed tau, so it needs scipy for real
+    # (unlike test_predictor_tracking_unknown_when_scipy_absent below, which
+    # deliberately fakes scipy's absence). scipy is a [dev]-only dependency
+    # (pyproject.toml), and .venv-qat -- the QAT extra's own venv -- doesn't
+    # have it; skip rather than fail there, matching how
+    # tests/test_probe_resolution.py::TestPredictorTracking is documented as
+    # an accepted environment gap in that venv rather than something this
+    # test should also newly fail.
+    pytest.importorskip("scipy")
+
+    fake_log = _FakeLog()
+    monkeypatch.setattr(orch_mod, "log", fake_log)
+
+    orch = _bare_orch_for_tracking(tmp_path)
+    orch._measured = {
+        f"laguna-{i}": {
+            "config": {"E": "BF16"},
+            "predicted_loss": p, "measured_loss": m,
+            "ppl": 10.0, "size_gb": 4.0,
+        }
+        for i, (p, m) in enumerate(zip(_LAGUNA_S_PREDICTED, _LAGUNA_S_MEASURED))
+    }
+    # A measurement_invalid entry with a wildly different pair -- if this
+    # leaked into the correlation it would change tau; it must not.
+    orch._measured["poisoned"] = {
+        "config": {"E": "BF16"}, "predicted_loss": 99.0, "measured_loss": -0.9225,
+        "ppl": 2.7, "size_gb": 4.0, "measurement_invalid": True,
+    }
+    # An incumbent-seeded entry: predicted_loss present, measured_loss is
+    # None (never measured) -- must also be excluded, not treated as 0/NaN.
+    orch._measured["incumbent-seed"] = {
+        "config": {"E": "Q4_K_M"}, "predicted_loss": 0.5, "measured_loss": None,
+        "ppl": None, "size_gb": 4.0,
+    }
+
+    orch._log_predictor_tracking()
+
+    assert orch._predictor_tracking["is_tracking"] is False
+    assert orch._predictor_tracking["tau"] == pytest.approx(-0.0426, abs=1e-3)
+    assert orch._predictor_tracking["n_pairs"] == 16
+
+    # (a) verdict is logged -- NOT tracking is a warning, per the LB
+    # constraint that only False (not None/"unknown") is evidence of a
+    # broken run.
+    warnings = [(event, kw) for level, event, kw in fake_log.calls if level == "warning"]
+    assert any("not tracking" in event.lower() for event, kw in warnings)
+
+    # (b) verdict is persisted in _save_results' output under the additive
+    # "predictor_tracking" key, without disturbing any existing key.
+    orch._save_results([], {})
+    saved = json.loads((tmp_path / "search_results.json").read_text())
+    assert saved["predictor_tracking"]["is_tracking"] is False
+    assert saved["predictor_tracking"]["tau"] == pytest.approx(-0.0426, abs=1e-3)
+    assert saved["predictor_tracking"]["n_pairs"] == 16
+    # Pre-existing keys are untouched.
+    assert saved["baseline_ppl"] == 34.8363
+    assert "measurements" in saved and len(saved["measurements"]) == 18
+
+
+def test_predictor_tracking_unknown_when_scipy_absent(tmp_path, monkeypatch):
+    """.venv-qat has no scipy -- predictor_rank_correlation's ImportError
+    branch must degrade to (None, None) ("unknown"), not crash, and must not
+    be logged as "not tracking" (that would be the "measured nothing
+    reported as measured zero" defect reproduced in the reporting layer)."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _no_scipy(name, *args, **kwargs):
+        if name == "scipy.stats" or name.startswith("scipy"):
+            raise ImportError("simulated scipy-absent environment")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_scipy)
+
+    fake_log = _FakeLog()
+    monkeypatch.setattr(orch_mod, "log", fake_log)
+
+    orch = _bare_orch_for_tracking(tmp_path)
+    orch._measured = {
+        f"c{i}": {
+            "config": {"E": "BF16"}, "predicted_loss": p, "measured_loss": m,
+            "ppl": 10.0, "size_gb": 4.0,
+        }
+        for i, (p, m) in enumerate(zip(_LAGUNA_S_PREDICTED, _LAGUNA_S_MEASURED))
+    }
+
+    orch._log_predictor_tracking()  # must not raise
+
+    assert orch._predictor_tracking == {
+        "is_tracking": None, "tau": None, "n_pairs": 16,
+    }
+    warnings = [(event, kw) for level, event, kw in fake_log.calls if level == "warning"]
+    assert not any("not tracking" in event.lower() for event, kw in warnings)
+
+    orch._save_results([], {})
+    saved = json.loads((tmp_path / "search_results.json").read_text())
+    assert saved["predictor_tracking"] == {
+        "is_tracking": None, "tau": None, "n_pairs": 16,
+    }
+
+
+def test_predictor_tracking_absent_defaults_to_none_in_save_results(tmp_path):
+    """A bare orchestrator that calls _save_results directly (as
+    test_measurement_validity.py's fixtures do) without ever calling
+    _log_predictor_tracking -- e.g. run_full_search's prediction-only path,
+    which has no measurements to check -- must not KeyError or fabricate a
+    verdict; the additive key is simply None."""
+    orch = _bare_orch_for_tracking(tmp_path)
+    orch._measured = {}
+    orch._save_results([], {})
+    saved = json.loads((tmp_path / "search_results.json").read_text())
+    assert saved["predictor_tracking"] is None
