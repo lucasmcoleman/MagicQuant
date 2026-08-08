@@ -455,6 +455,106 @@ class _LibggmlHandle:
             return ggml_type in self.rocmfpx_supported
         return ggml_type in GGML_TYPE_IDS
 
+    def _resolve_quantize_shape(self, flat_size, imatrix, n_per_row):
+        """Derive (n_per_row, nrows, n_slices, imat_check) for encode().
+
+        Pure extraction of encode()'s imatrix-shape-derivation block: raises
+        the identical ValueErrors, with identical messages, for a missing
+        n_per_row, a shape-mismatched flat/n_per_row pair, a malformed
+        imatrix, or a per-expert-slice/row-count mismatch.
+
+        CONTRACTUAL: when ``imatrix`` is None, any caller-supplied
+        ``n_per_row`` is DISCARDED and overridden to ``flat_size`` with
+        ``nrows=1`` -- see encode()'s docstring ("ignored otherwise -- the
+        unweighted path quantizes the flat buffer as a single row"). Do not
+        change this to honor a caller-supplied n_per_row in the no-imatrix
+        case: it is byte-identical only for block-aligned row widths and
+        silently changes output bytes/size for the block32-fallback case.
+        """
+        n_slices = 1
+        imat_check = None
+        if imatrix is not None:
+            if n_per_row is None:
+                raise ValueError(
+                    "imatrix-weighted encoding requires n_per_row (the "
+                    "tensor's row width); importance is applied per column."
+                )
+            if n_per_row <= 0 or flat_size % n_per_row != 0:
+                raise ValueError(
+                    f"tensor size {flat_size} is not a multiple of "
+                    f"n_per_row={n_per_row}"
+                )
+            nrows = flat_size // n_per_row
+            imat_check = np.ascontiguousarray(imatrix, dtype=np.float32).reshape(-1)
+            if imat_check.size == 0 or imat_check.size % n_per_row != 0:
+                raise ValueError(
+                    f"imatrix length {imat_check.size} is not a multiple of "
+                    f"row width {n_per_row}. Each weight tensor needs one "
+                    f"([n_per_row]) or, for stacked MoE experts, several "
+                    f"([n_experts * n_per_row], expert-major) importance "
+                    f"vectors."
+                )
+            n_slices = imat_check.size // n_per_row
+            if n_slices > 1 and nrows % n_slices != 0:
+                raise ValueError(
+                    f"imatrix has {n_slices} per-expert slices but the "
+                    f"tensor's {nrows} rows don't divide evenly by that — "
+                    f"shape mismatch between the captured imatrix and this "
+                    f"weight tensor."
+                )
+        else:
+            # Historical fast path: one row spanning the whole buffer.
+            n_per_row = flat_size
+            nrows = 1
+        return n_per_row, nrows, n_slices, imat_check
+
+    def _quantize_chunk_or_raise(
+        self,
+        type_id,
+        src_ptr,
+        dst_ptr,
+        nrows,
+        n_per_row,
+        imat_ptr,
+        expected_bytes,
+        ggml_type,
+        context="",
+        detail="",
+    ):
+        """Call ggml_quantize_chunk once and raise on a byte-count mismatch.
+
+        Shared by encode()'s single-chunk dispatch and its per-expert MoE
+        loop -- the two call+verify blocks were identical except for which
+        pointer forms and RuntimeError text they used. ``context`` supplies
+        the optional " for expert slice N/M" mid-message insertion; ``detail``
+        supplies the optional ", n_elements=N" suffix inside the
+        "(type=...)" parenthetical. Together they reproduce both original
+        RuntimeError messages exactly:
+          single-chunk: context="", detail=", n_elements={n_per_row}"
+          per-expert:   context=" for expert slice {i}/{n}", detail=""
+
+        Caller builds src_ptr/dst_ptr/imat_ptr (keeping the underlying numpy
+        arrays alive as named locals for the duration of this call) and
+        passes them in; this helper does not derive offsets or pointers.
+        Returns the actual byte count written.
+        """
+        actual = self._base.ggml_quantize_chunk(
+            type_id,
+            src_ptr,
+            dst_ptr,
+            ctypes.c_int64(0),
+            ctypes.c_int64(nrows),
+            ctypes.c_int64(n_per_row),
+            imat_ptr if imat_ptr is not None else ctypes.POINTER(ctypes.c_float)(),
+        )
+        if actual != expected_bytes:
+            raise RuntimeError(
+                f"ggml_quantize_chunk wrote {actual} bytes{context}, expected "
+                f"{expected_bytes} (type={ggml_type}{detail}). Likely cause: "
+                f"wrong type_id or block-size mismatch."
+            )
+        return actual
+
     def encode(
         self,
         weights: np.ndarray,
@@ -504,41 +604,9 @@ class _LibggmlHandle:
 
         flat = np.ascontiguousarray(weights, dtype=np.float32).reshape(-1)
 
-        n_slices = 1
-        imat_check = None
-        if imatrix is not None:
-            if n_per_row is None:
-                raise ValueError(
-                    "imatrix-weighted encoding requires n_per_row (the "
-                    "tensor's row width); importance is applied per column."
-                )
-            if n_per_row <= 0 or flat.size % n_per_row != 0:
-                raise ValueError(
-                    f"tensor size {flat.size} is not a multiple of "
-                    f"n_per_row={n_per_row}"
-                )
-            nrows = flat.size // n_per_row
-            imat_check = np.ascontiguousarray(imatrix, dtype=np.float32).reshape(-1)
-            if imat_check.size == 0 or imat_check.size % n_per_row != 0:
-                raise ValueError(
-                    f"imatrix length {imat_check.size} is not a multiple of "
-                    f"row width {n_per_row}. Each weight tensor needs one "
-                    f"([n_per_row]) or, for stacked MoE experts, several "
-                    f"([n_experts * n_per_row], expert-major) importance "
-                    f"vectors."
-                )
-            n_slices = imat_check.size // n_per_row
-            if n_slices > 1 and nrows % n_slices != 0:
-                raise ValueError(
-                    f"imatrix has {n_slices} per-expert slices but the "
-                    f"tensor's {nrows} rows don't divide evenly by that — "
-                    f"shape mismatch between the captured imatrix and this "
-                    f"weight tensor."
-                )
-        else:
-            # Historical fast path: one row spanning the whole buffer.
-            n_per_row = flat.size
-            nrows = 1
+        n_per_row, nrows, n_slices, imat_check = self._resolve_quantize_shape(
+            flat.size, imatrix, n_per_row
+        )
 
         type_id = GGML_TYPE_IDS[ggml_type]
         out_size = _expected_size(ggml_type, flat.size)
@@ -561,21 +629,17 @@ class _LibggmlHandle:
             if imat_check is not None:
                 imat_ptr = imat_check.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-            actual = self._base.ggml_quantize_chunk(
+            self._quantize_chunk_or_raise(
                 type_id,
                 flat.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 ctypes.cast(dst_buf, ctypes.c_void_p),
-                ctypes.c_int64(0),
-                ctypes.c_int64(nrows),
-                ctypes.c_int64(n_per_row),
-                imat_ptr if imat_ptr is not None else ctypes.POINTER(ctypes.c_float)(),
+                nrows,
+                n_per_row,
+                imat_ptr,
+                out_size,
+                ggml_type,
+                detail=f", n_elements={n_per_row}",
             )
-            if actual != out_size:
-                raise RuntimeError(
-                    f"ggml_quantize_chunk wrote {actual} bytes, expected {out_size} "
-                    f"(type={ggml_type}, n_elements={n_per_row}). "
-                    f"Likely cause: wrong type_id or block-size mismatch."
-                )
             return bytes(dst_buf)
 
         # Per-expert MoE tensor: quantize each expert's slice separately with
@@ -594,22 +658,17 @@ class _LibggmlHandle:
             imat_slice = imat_check[slice_idx * n_per_row: (slice_idx + 1) * n_per_row]
             dst_ptr = ctypes.c_void_p(dst_base + slice_idx * slice_bytes)
 
-            actual = self._base.ggml_quantize_chunk(
+            actual = self._quantize_chunk_or_raise(
                 type_id,
                 src_slice.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 dst_ptr,
-                ctypes.c_int64(0),
-                ctypes.c_int64(rows_per_slice),
-                ctypes.c_int64(n_per_row),
+                rows_per_slice,
+                n_per_row,
                 imat_slice.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                slice_bytes,
+                ggml_type,
+                context=f" for expert slice {slice_idx}/{n_slices}",
             )
-            if actual != slice_bytes:
-                raise RuntimeError(
-                    f"ggml_quantize_chunk wrote {actual} bytes for expert "
-                    f"slice {slice_idx}/{n_slices}, expected {slice_bytes} "
-                    f"(type={ggml_type}). Likely cause: wrong type_id or "
-                    f"block-size mismatch."
-                )
             total_written += actual
 
         if total_written != out_size:
