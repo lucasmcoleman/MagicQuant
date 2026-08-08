@@ -222,6 +222,57 @@ def test_save_results_persists_measurement_invalid_field(tmp_path):
     assert entry["corpus_path"] == "/fake/corpus.txt"
 
 
+def test_write_pareto_report_excludes_measurement_invalid_entries(tmp_path, monkeypatch):
+    """A measurement_invalid entry's ppl is below baseline*(1-eps) by
+    construction (a physically impossible reading) -- if it reached
+    pareto_frontier() it would have a lower ppl than every real candidate
+    and dominate the frontier on a mixed valid/invalid run. Must be
+    filtered out of BOTH the persisted pareto.json (the pareto_frontier
+    call) and the logged table (the format_pareto_report call), matching
+    the filter already applied at _select_final_survivors and
+    _write_noise_calibration.
+    """
+    import magicquant.pareto as pareto_mod
+
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch.output_dir = tmp_path
+    orch._measured = {
+        "impossible": {
+            "config": {"E": "BF16"}, "ppl": 1.0, "size_gb": 2.0,
+            "measurement_invalid": True,
+        },
+        "small": {
+            "config": {"E": "Q4_K_M"}, "ppl": 10.0, "size_gb": 5.0,
+            "measurement_invalid": False,
+        },
+        "big": {
+            "config": {"E": "Q6_K"}, "ppl": 6.0, "size_gb": 10.0,
+            "measurement_invalid": False,
+        },
+    }
+
+    captured = {}
+    real_format = pareto_mod.format_pareto_report
+
+    def _spy_format(measurements, **kwargs):
+        captured["measurements"] = measurements
+        return real_format(measurements, **kwargs)
+
+    monkeypatch.setattr(pareto_mod, "format_pareto_report", _spy_format)
+
+    orch._write_pareto_report()
+
+    # pareto.json (the pareto_frontier() call) excludes the invalid entry;
+    # both valid entries survive unaffected (neither dominates the other).
+    frontier = json.loads((tmp_path / "pareto.json").read_text())
+    keys = {item["key"] for item in frontier}
+    assert keys == {"small", "big"}
+
+    # The logged table (the format_pareto_report() call) was also given
+    # the filtered dict, not the raw self._measured.
+    assert set(captured["measurements"]) == {"small", "big"}
+
+
 # ---------------------------------------------------------------------------
 # FIX 3: per-measurement corpus recording + pinning
 # ---------------------------------------------------------------------------

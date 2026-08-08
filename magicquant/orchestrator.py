@@ -2051,6 +2051,17 @@ class MagicQuantOrchestrator:
         output_dir or _measured entirely, e.g. ones that call
         ``_save_results`` directly without going through a real ``run_*``
         search) are skipped rather than crashing.
+
+        Excludes ``measurement_invalid`` entries before building the
+        frontier/table, same as ``_select_final_survivors`` and
+        ``_write_noise_calibration`` -- an invalid entry's ppl is below
+        baseline*(1-eps) by construction (a physically-impossible reading,
+        see the eps guard in the measurement loop), so it has a lower ppl
+        than every real candidate and would dominate the frontier on a
+        mixed valid/invalid run. This is a caller-side fix only:
+        ``magicquant.pareto.load_and_report()`` reading a persisted
+        search_results.json off disk still shows invalid entries, since
+        ``_save_results`` deliberately keeps them there for diagnostics.
         """
         output_dir = getattr(self, "output_dir", None)
         measured = getattr(self, "_measured", None)
@@ -2059,10 +2070,20 @@ class MagicQuantOrchestrator:
         try:
             from magicquant.pareto import pareto_frontier, format_pareto_report
 
-            frontier = pareto_frontier(measured)
+            usable = {
+                k: v for k, v in measured.items()
+                if not v.get("measurement_invalid")
+            }
+            excluded = len(measured) - len(usable)
+            if excluded:
+                log.info(
+                    "Pareto report excluding measurement_invalid entries",
+                    stage="pareto", excluded=excluded, total=len(measured),
+                )
+            frontier = pareto_frontier(usable)
             pareto_path = Path(output_dir) / "pareto.json"
             pareto_path.write_text(json.dumps(frontier, indent=2), encoding="utf-8")
-            log.info(format_pareto_report(measured))
+            log.info(format_pareto_report(usable))
         except Exception as exc:
             log.warning(
                 "Pareto report generation failed (non-fatal)",
