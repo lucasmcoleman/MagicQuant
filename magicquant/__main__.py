@@ -70,7 +70,7 @@ def cmd_probe(args: argparse.Namespace) -> None:
 
     log.info("Running sensitivity probes", model=args.model)
 
-    baseline_ppl = args.baseline_ppl if hasattr(args, 'baseline_ppl') and args.baseline_ppl else 5.0
+    baseline_ppl = args.baseline_ppl or 5.0
 
     # Try to initialise llama.cpp for real probing
     llama_tools = None
@@ -540,7 +540,13 @@ def cmd_card(args: argparse.Namespace) -> None:
     with open(results_file) as f:
         results = json.load(f)
 
-    base_name = args.base_model or Path(args.model).stem if getattr(args, "model", None) else (args.base_model or "model")
+    if args.base_model:
+        base_name = args.base_model
+    # getattr is defensive only -- card_parser always declares --model.
+    elif getattr(args, "model", None):
+        base_name = Path(args.model).stem
+    else:
+        base_name = "model"
     card = generate_model_card(results, base_model_name=base_name)
 
     card_path = output_dir / "README.md"

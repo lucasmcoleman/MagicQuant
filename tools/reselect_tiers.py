@@ -141,27 +141,16 @@ def pareto_front(rows: List[Dict[str, Any]]) -> None:
             row["pareto"] = False
 
 
-def analyze(path: Path, *, max_residual: float) -> Dict[str, Any]:
-    """Re-derive one run's ladder. Never raises for data problems."""
-    data = json.loads(path.read_text())
-    measurements = data.get("measurements") or {}
+def _rows_from_measurements(
+    measurements: Dict[str, Any], eps: Optional[float]
+) -> List[Dict[str, Any]]:
+    """One report row per measurement that has both a size and a loss.
 
-    report: Dict[str, Any] = {
-        "path": str(path),
-        "stored_scheme_version": tier_scheme_version(data),
-        "current_scheme_version": CURRENT_TIER_SCHEME_VERSION,
-        "n_measurements": len(measurements),
-        "error": None,
-    }
-
-    # A quantization cannot beat its own baseline by more than noise; an
-    # entry that claims to is a broken measurement, not a good candidate.
-    baseline_ppl = data.get("baseline_ppl")
-    eps = measurement_eps(float(baseline_ppl)) if baseline_ppl else None
-    report["baseline_ppl"] = baseline_ppl
-    report["implausible_eps"] = eps
-
-    candidates: List[Tuple[float, Dict[str, str]]] = []
+    Includes implausible (below-baseline) rows -- callers that feed this
+    into the size-model fit want every candidate; callers that want only
+    trustworthy candidates filter on ``row["implausible"]`` themselves. The
+    ``_parse_key`` fallback covers older files whose entries omit ``config``.
+    """
     rows: List[Dict[str, Any]] = []
     for key, entry in measurements.items():
         size = entry.get("size_gb")
@@ -169,10 +158,6 @@ def analyze(path: Path, *, max_residual: float) -> Dict[str, Any]:
         if size is None or loss is None:
             continue
         config = entry.get("config") or _parse_key(key)
-        # The size model is fit over every candidate: a bogus *perplexity*
-        # says nothing about whether the file's byte count was measured
-        # correctly, and dropping rows here would only weaken the fit.
-        candidates.append((float(size), config))
         rows.append(
             {
                 "key": key,
@@ -183,47 +168,36 @@ def analyze(path: Path, *, max_residual: float) -> Dict[str, Any]:
                 "implausible": eps is not None and float(loss) < -eps,
             }
         )
+    return rows
 
-    if not rows:
-        report["error"] = "no usable measurements"
-        return report
 
-    try:
-        baseline_gb, residual = recover_baseline_gb(
-            candidates, max_residual=max_residual
-        )
-    except (BaselineFitError, KeyError) as exc:
-        report["error"] = f"baseline recovery failed: {exc}"
-        return report
+def _corrected_ladder(usable: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Per-band winner: lowest loss, then smaller size.
 
-    report["baseline_gb"] = baseline_gb
-    report["fit_residual"] = residual
-
-    for row in rows:
-        row["ratio"] = row["size_gb"] / baseline_gb
-        row["tier"] = classify_tier(row["size_gb"], baseline_gb)
-
-    usable = [r for r in rows if not r["implausible"]]
-    pareto_front(usable)
-    for row in rows:
-        row.setdefault("pareto", False)
-    rows.sort(key=lambda r: r["size_gb"])
-    report["candidates"] = rows
-    report["n_implausible"] = len(rows) - len(usable)
-
-    # Corrected ladder: within a band prefer lower loss, then smaller.
+    ``usable`` must be in its original (measurements-dict insertion) order,
+    not size-sorted -- exact ties in (loss, size_gb) are broken by that
+    order, via the stability of ``sorted()``.
+    """
     by_band: Dict[str, List[Dict[str, Any]]] = {}
     for row in usable:
         by_band.setdefault(row["tier"], []).append(row)
-    corrected = {
+    return {
         tier: sorted(band, key=lambda r: (r["loss"], r["size_gb"]))[0]
         for tier, band in by_band.items()
     }
-    report["corrected"] = corrected
-    report["empty_bands"] = [t for t in TIER_ORDER if t not in corrected]
 
-    # What the run actually shipped, and how that reads under v2.
-    shipped = data.get("tiered_survivors") or data.get("tiered") or {}
+
+def _shipped_findings(
+    shipped: Dict[str, Any],
+    usable: List[Dict[str, Any]],
+    baseline_gb: float,
+    eps: Optional[float],
+) -> List[Dict[str, Any]]:
+    """Diff what a run actually shipped per tier against ``usable``.
+
+    ``usable`` must be in its original (measurements-dict insertion) order --
+    ``min(better, key=loss)`` resolves exact ties by that order.
+    """
     findings: List[Dict[str, Any]] = []
     for tier, entry in shipped.items():
         size = entry.get("size_gb")
@@ -259,7 +233,69 @@ def analyze(path: Path, *, max_residual: float) -> Dict[str, Any]:
                 "dominated_by_loss": winner["loss"] if winner else None,
             }
         )
-    report["shipped"] = findings
+    return findings
+
+
+def analyze(path: Path, *, max_residual: float) -> Dict[str, Any]:
+    """Re-derive one run's ladder. Never raises for data problems."""
+    data = json.loads(path.read_text())
+    measurements = data.get("measurements") or {}
+
+    report: Dict[str, Any] = {
+        "path": str(path),
+        "stored_scheme_version": tier_scheme_version(data),
+        "current_scheme_version": CURRENT_TIER_SCHEME_VERSION,
+        "n_measurements": len(measurements),
+        "error": None,
+    }
+
+    # A quantization cannot beat its own baseline by more than noise; an
+    # entry that claims to is a broken measurement, not a good candidate.
+    baseline_ppl = data.get("baseline_ppl")
+    eps = measurement_eps(float(baseline_ppl)) if baseline_ppl else None
+    report["baseline_ppl"] = baseline_ppl
+    report["implausible_eps"] = eps
+
+    rows = _rows_from_measurements(measurements, eps)
+    if not rows:
+        report["error"] = "no usable measurements"
+        return report
+
+    # The size model is fit over every candidate: a bogus *perplexity*
+    # says nothing about whether the file's byte count was measured
+    # correctly, and dropping rows here would only weaken the fit.
+    candidates: List[Tuple[float, Dict[str, str]]] = [
+        (row["size_gb"], row["config"]) for row in rows
+    ]
+    try:
+        baseline_gb, residual = recover_baseline_gb(
+            candidates, max_residual=max_residual
+        )
+    except (BaselineFitError, KeyError) as exc:
+        report["error"] = f"baseline recovery failed: {exc}"
+        return report
+
+    report["baseline_gb"] = baseline_gb
+    report["fit_residual"] = residual
+
+    for row in rows:
+        row["ratio"] = row["size_gb"] / baseline_gb
+        row["tier"] = classify_tier(row["size_gb"], baseline_gb)
+
+    usable = [r for r in rows if not r["implausible"]]
+    pareto_front(usable)
+    for row in rows:
+        row.setdefault("pareto", False)
+    rows.sort(key=lambda r: r["size_gb"])
+    report["candidates"] = rows
+    report["n_implausible"] = len(rows) - len(usable)
+
+    report["corrected"] = _corrected_ladder(usable)
+    report["empty_bands"] = [t for t in TIER_ORDER if t not in report["corrected"]]
+
+    # What the run actually shipped, and how that reads under v2.
+    shipped = data.get("tiered_survivors") or data.get("tiered") or {}
+    report["shipped"] = _shipped_findings(shipped, usable, baseline_gb, eps)
     return report
 
 
