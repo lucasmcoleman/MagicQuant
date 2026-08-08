@@ -494,15 +494,27 @@ _HF_TO_GGUF_PATTERNS = [
 _HF_TO_GGUF_COMPILED = [(re.compile(p), r) for p, r in _HF_TO_GGUF_PATTERNS]
 
 
-def _hf_name_to_gguf(hf_name: str, arch: str = "") -> str:
+def _hf_name_to_gguf(
+    hf_name: str, arch: str = "", *, strict: bool = False
+) -> Optional[str]:
     """Convert a HuggingFace tensor name to GGUF convention.
 
     Args:
         hf_name: The original HuggingFace tensor name.
         arch: GGUF architecture string (e.g. "qwen35") for arch-specific
               name adjustments.
+        strict: When False (default), an unmapped name falls back to
+                ``hf_name`` unchanged -- the original contract every existing
+                caller depends on (e.g. the unmapped-name gates below key off
+                ``gguf_name == hf_name``). When True, an unmapped name
+                returns ``None`` instead, so a caller can tell "matched
+                nothing" apart from "matched to an identical name" without a
+                second pattern-table scan (see ``magicquant.qat.names
+                .hf_to_ggml_name``).
     """
-    # Handle top-level output/lm_head directly
+    # Handle top-level output/lm_head directly. Ahead of any strict fallback:
+    # this is the one legitimate case where a name maps to itself via a
+    # pattern-independent self-map, not a "nothing matched" no-op.
     if hf_name in ("output.weight", "lm_head.weight"):
         return "output.weight"
 
@@ -512,10 +524,14 @@ def _hf_name_to_gguf(hf_name: str, arch: str = "") -> str:
     # requires these for qkv-bias architectures; without it the GGUF won't load).
     if hf_name.endswith(".bias"):
         weight_name = hf_name[: -len(".bias")] + ".weight"
+        # Deliberately non-strict regardless of the outer `strict`: this
+        # recursion tests "did the .weight name map to something new", which
+        # only the "returns hf_name unchanged" sentinel expresses directly.
         mapped = _hf_name_to_gguf(weight_name, arch)
         if mapped != weight_name and mapped.endswith(".weight"):
             return mapped[: -len(".weight")] + ".bias"
-        return hf_name  # projection's .weight didn't map -> leave bias untouched
+        # projection's .weight didn't map -> leave bias untouched
+        return None if strict else hf_name
 
     # Strip common multimodal prefixes so patterns match the LLM core
     stripped = hf_name
@@ -536,8 +552,8 @@ def _hf_name_to_gguf(hf_name: str, arch: str = "") -> str:
             if arch in ("qwen35", "qwen35moe") and ".ffn_norm." in result:
                 result = result.replace(".ffn_norm.", ".post_attention_norm.")
             return result
-    # Fallback: keep original name
-    return hf_name
+    # Fallback: no pattern matched.
+    return None if strict else hf_name
 
 
 # =====================================================================
