@@ -798,6 +798,16 @@ class GGUFWriter:
                     scheme = group_schemes.get(group, base_quant)
                 target_ggml_name = scheme_map.get(scheme, "Q4_0")
                 target_ggml_id = GGML_TYPE.get(target_ggml_name, GGML_TYPE["Q4_0"])
+                # Captured BEFORE the compat-mutation chain below (SSM-F32
+                # force, 1D-F32, BF16->F16/Q8_0, block-32 fallback, the
+                # can_decode passthrough overwrite) so the bad_tensors gate
+                # further down can read the tensor's PRE-compat desired type
+                # directly off the entry instead of re-deriving scheme
+                # resolution from tensor_overrides/group_schemes/base_quant a
+                # second time. Do not move this past any of the mutations
+                # below -- see the bad_tensors gate's comment for why the
+                # post-compat value would silently disable that check.
+                desired_ggml_name = target_ggml_name
 
                 # SSM conv-weight operands (ssm_conv1d / ssm_conv1d_{q,k,v})
                 # must be F32 no matter what scheme group S was configured
@@ -984,6 +994,7 @@ class GGUFWriter:
                     "_can_decode": can_decode,
                     "_group": group,
                     "_source_type_name": source_type_name,
+                    "_desired_ggml_name": desired_ggml_name,
                 })
 
                 data_offset = aligned_offset + expected_size
@@ -1017,17 +1028,19 @@ class GGUFWriter:
                         continue
                     # Recognized but pre-quantized: error only if the user
                     # wanted a different type than the source already is.
-                    # Same resolution order as Pass 1 (tensors[name] >
-                    # groups[group] > base) so an override doesn't get
-                    # silently ignored by this second, independent
-                    # re-derivation of "what scheme did the user actually ask
-                    # for".
-                    group = entry["_group"]
-                    if entry["name"] in tensor_overrides:
-                        scheme = tensor_overrides[entry["name"]]
-                    else:
-                        scheme = group_schemes.get(group, base_quant)
-                    desired_ggml_name = scheme_map.get(scheme, "Q4_0")
+                    # Reads the PRE-compat desired type captured in Pass 1
+                    # (entry["_desired_ggml_name"], set before the SSM-F32/
+                    # 1D-F32/BF16->F16/block-32/can_decode compat mutations)
+                    # rather than re-deriving scheme resolution from
+                    # tensor_overrides/group_schemes/base_quant a second
+                    # time -- so an override can't get silently ignored by
+                    # two independent copies of "what scheme did the user
+                    # actually ask for" drifting apart. The entry's
+                    # POST-compat "_target_ggml_name" is unusable here: on
+                    # the not-can_decode path it has already been overwritten
+                    # to the source type, which would make this comparison
+                    # always false and disable the gate silently.
+                    desired_ggml_name = entry["_desired_ggml_name"]
                     if desired_ggml_name != source_type:
                         bad_tensors.append((entry["name"], source_type, desired_ggml_name))
 
@@ -1122,17 +1135,34 @@ class GGUFWriter:
             # Aligned to llama.cpp's LLAMA_FTYPE enum. This is a cosmetic,
             # human-readable badge only (each tensor carries its own ggml_type,
             # so inference is unaffected). Generic "Q4_K"/"Q5_K" map to the _M
-            # variant. Previous values (Q4_K->12, Q5_K->16, IQ4_NL->20) were
-            # wrong (12=MOSTLY_Q4_1_SOME_F16-era, 16=Q5_K_S, 20=MOSTLY_IQ2_XS).
+            # variant. Values come from gguf.constants.LlamaFileType BY MEMBER
+            # NAME (not hand-typed ints) -- same "facts come from upstream,
+            # never drift" policy as the _GGUF_TYPE_*/GGML_TYPE tables above.
+            # This table's own hand-typed predecessor already drifted once
+            # (Q4_K->12, Q5_K->16, IQ4_NL->20 were wrong: 12=MOSTLY_Q4_1_SOME_
+            # F16-era, 16=Q5_K_S, 20=MOSTLY_IQ2_XS) -- deriving from the enum
+            # closes that class of bug. NOTE: the key set here is deliberate
+            # and load-bearing for the membership filter and fallback lookup
+            # below -- do not add or remove keys based on the enum's full
+            # membership.
+            _LlamaFileType = _gguf_constants.LlamaFileType
             _ftype_map = {
-                "F32": 0, "F16": 1, "BF16": 32,
-                "Q8_0": 7,
-                "Q6_K": 18,
-                "Q5_K": 17, "Q5_K_M": 17, "Q5_K_S": 16,
-                "Q4_K": 15, "Q4_K_M": 15, "Q4_K_S": 14,
-                "Q3_K": 12, "Q3_K_M": 12,
-                "Q2_K": 10,
-                "IQ4_NL": 25, "IQ4_XS": 30,
+                "F32": int(_LlamaFileType.ALL_F32),
+                "F16": int(_LlamaFileType.MOSTLY_F16),
+                "BF16": int(_LlamaFileType.MOSTLY_BF16),
+                "Q8_0": int(_LlamaFileType.MOSTLY_Q8_0),
+                "Q6_K": int(_LlamaFileType.MOSTLY_Q6_K),
+                "Q5_K": int(_LlamaFileType.MOSTLY_Q5_K_M),
+                "Q5_K_M": int(_LlamaFileType.MOSTLY_Q5_K_M),
+                "Q5_K_S": int(_LlamaFileType.MOSTLY_Q5_K_S),
+                "Q4_K": int(_LlamaFileType.MOSTLY_Q4_K_M),
+                "Q4_K_M": int(_LlamaFileType.MOSTLY_Q4_K_M),
+                "Q4_K_S": int(_LlamaFileType.MOSTLY_Q4_K_S),
+                "Q3_K": int(_LlamaFileType.MOSTLY_Q3_K_M),
+                "Q3_K_M": int(_LlamaFileType.MOSTLY_Q3_K_M),
+                "Q2_K": int(_LlamaFileType.MOSTLY_Q2_K),
+                "IQ4_NL": int(_LlamaFileType.MOSTLY_IQ4_NL),
+                "IQ4_XS": int(_LlamaFileType.MOSTLY_IQ4_XS),
             }
             from collections import Counter
             # Count elements per actual target ggml type from tensor_entries
