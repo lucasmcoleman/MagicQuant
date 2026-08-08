@@ -1,3 +1,7 @@
+> **Session closed — see git log for final commit history.** Kept for
+> historical reference only; the checkboxes and "Status" lines below are the
+> in-session state at time of writing, not a current status.
+
 # WORKLOG — MagicQuant algorithmic redesign (v2 "budget search")
 
 Mission: fable-sprint prompt 6 (/server/ai/docs/fable-sprint-prompts.md §6).
