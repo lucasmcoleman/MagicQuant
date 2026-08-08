@@ -40,7 +40,6 @@ class QuantizationScheme:
     noise_factor: float               # relative quantization noise (lower = better quality)
     speed_multiplier: float = 1.0     # relative inference speed vs BF16
     category: SchemeCategory = "k_quant"
-    is_moe_optimized: bool = False
     requires_imatrix: bool = False    # IQ-quants benefit from importance matrices
     # Whether ggml's `quantize_<type>` function actually reads the imatrix
     # pointer when one is passed to `ggml_quantize_chunk` -- distinct from
@@ -162,7 +161,6 @@ MXFP4_MOE = QuantizationScheme(
     noise_factor=4.0,
     speed_multiplier=3.8,
     category="mxfp4",
-    is_moe_optimized=True,
     upgrade_neighbor="IQ4_NL",
     downgrade_neighbor="Q4_K_M",
 )
@@ -325,7 +323,6 @@ ROCMFP4 = QuantizationScheme(
     noise_factor=4.2,           # ~Q4_K_M / MXFP4 band
     speed_multiplier=3.8,       # AMD-native FP4 kernel is the fork's fast path
     category="rocmfpx",
-    is_moe_optimized=True,
     upgrade_neighbor="ROCMFP6",
     downgrade_neighbor="ROCMFP3",
 )

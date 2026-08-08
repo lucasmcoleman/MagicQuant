@@ -25,10 +25,6 @@ from magicquant.quant.ggml_binding import get_handle, ggml_encode
 # These are exported (T) symbols in libggml-base.so. Map the ggml type name to
 # the exported symbol. Float passthroughs are handled separately below.
 _DEQUANT_SYMBOL = {
-    "Q4_0": "dequantize_row_q4_0",
-    "Q4_1": "dequantize_row_q4_1",
-    "Q5_0": "dequantize_row_q5_0",
-    "Q5_1": "dequantize_row_q5_1",
     "Q8_0": "dequantize_row_q8_0",
     "Q2_K": "dequantize_row_q2_K",
     "Q3_K": "dequantize_row_q3_K",
@@ -36,7 +32,6 @@ _DEQUANT_SYMBOL = {
     "Q5_K": "dequantize_row_q5_K",
     "Q6_K": "dequantize_row_q6_K",
     "IQ4_NL": "dequantize_row_iq4_nl",
-    "IQ4_XS": "dequantize_row_iq4_xs",
     "MXFP4": "dequantize_row_mxfp4",
 }
 

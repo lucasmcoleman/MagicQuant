@@ -10,7 +10,7 @@ Public API:
     ggml_tensor_data_size(ggml_type_name, n_elements) -> int
 """
 
-from typing import Dict, Optional
+from typing import Optional
 import numpy as np
 
 from magicquant.quant.ggml_binding import ggml_encode, GGML_TYPE_IDS
@@ -95,7 +95,7 @@ def encode_to_ggml_bytes(
             f"got dtype={weights.dtype}. Integer or pre-quantized tensors "
             f"cannot be re-quantized — use a BF16/F16/F32 source model."
         )
-    flat = weights.astype(np.float32).flatten()
+    flat = weights.astype(np.float32).ravel()
 
     if ggml_type_name == "BF16":
         return _encode_f32_to_bf16(flat)
