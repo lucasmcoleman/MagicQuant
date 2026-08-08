@@ -1,4 +1,4 @@
-.PHONY: install test lint format build docker-build docker-up clean
+.PHONY: install test lint format docker-build docker-up clean
 
 install:
 	pip install -e ".[dev]"
@@ -12,9 +12,6 @@ lint:
 format:
 	ruff format magicquant/ tests/
 
-build:
-	python -m build
-
 docker-build:
 	docker build -f docker/Dockerfile -t magicquant:latest .
 
@@ -22,6 +19,6 @@ docker-up:
 	docker run --rm -it magicquant:latest
 
 clean:
-	rm -rf build/ dist/ *.egg-info/ __pycache__/ .pytest_cache/
+	rm -rf build/ dist/ *.egg-info/ __pycache__/ .pytest_cache/ .ruff_cache/
 	find . -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
 	find . -name "*.pyc" -delete 2>/dev/null || true

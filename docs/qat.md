@@ -192,8 +192,9 @@ merge reads for its 3-D scale), `expert_quant_mode`, and a per-tensor
 
 ## The `[qat]` extra
 
-The heavy training stack (torch / transformers / peft / trl / datasets) lives
-behind an optional extra so the core MagicQuant install stays torch-free:
+The heavy training stack (torch / transformers / peft / accelerate, +transitively
+tokenizers / safetensors / huggingface_hub) lives behind an optional extra so the
+core MagicQuant install stays torch-free:
 
 ```bash
 pip install -e ".[qat]"

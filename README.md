@@ -116,7 +116,7 @@ For **Quantization-Aware Training** (`magicquant qat`) install the optional
 torch-free):
 
 ```bash
-pip install -e ".[qat]"   # torch, transformers, peft, trl, datasets
+pip install -e ".[qat]"   # torch, transformers, peft, accelerate
 ```
 
 > `torch` must be the build that works on your hardware (the ROCm wheel on AMD,

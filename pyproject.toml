@@ -52,8 +52,11 @@ qat = [
     "torch>=2.2.0",
     "transformers>=4.40.0",
     "peft>=0.10.0",
-    "trl>=0.8.0",
-    "datasets>=2.18.0",
+    # transformers does not declare accelerate itself, but TrainingArguments
+    # hard-requires accelerate>=1.1.0 (transformers/training_args.py
+    # ACCELERATE_MIN_VERSION check). Declared explicitly here so a fresh
+    # install can't legally resolve an accelerate below that floor.
+    "accelerate>=1.1.0",
 ]
 
 [project.scripts]

@@ -9,11 +9,13 @@ build/
 # Virtual environments
 venv/
 .venv/
+.venv-qat/
 
 # Model files (large)
 *.gguf
 output/
 models/
+/o/
 
 # IDE / tools
 .claude/
@@ -31,3 +33,6 @@ MagicQuant-Wiki/
 
 # pytest
 .pytest_cache/
+
+# ruff
+.ruff_cache/

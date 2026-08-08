@@ -6,8 +6,9 @@ that will ship), trains only the LoRA adapters on a chat dataset with
 **completion-only loss** (system/user turns masked), and saves the adapters plus a
 ``qat_meta.json`` describing the run. Returns the output directory.
 
-Heavy deps (transformers/trl/datasets) are imported lazily inside ``run_qat`` so
-``import magicquant.qat`` stays light (only torch).
+Heavy deps (transformers/peft/accelerate, +transitively tokenizers/safetensors/
+huggingface_hub) are imported lazily inside ``run_qat`` so ``import magicquant.qat``
+stays light (only torch).
 
 Offline fallback: if the named HF model can't be downloaded, ``run_qat`` builds a
 tiny ``LlamaForCausalLM`` from a small config (with a minimal byte-level

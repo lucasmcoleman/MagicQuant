@@ -11,7 +11,7 @@ MagicQuant creates hybrid GGUF files with per-tensor-group quantization. Differe
 ```bash
 pip install -e .                    # Install (editable)
 pip install -e ".[yaml,dev]"        # With optional deps (yaml + pytest + gguf)
-pip install -e ".[qat]"             # QAT training stack (torch/transformers/peft/trl/datasets)
+pip install -e ".[qat]"             # QAT training stack (torch/transformers/peft/accelerate)
 magicquant analyze model.gguf       # Inspect tensor groups
 magicquant search model.gguf --rounds 3  # Measured evolutionary search
 magicquant generate model.gguf --tiers Q4,Q5,Q6  # Generate hybrids
@@ -117,7 +117,8 @@ libggml within a tolerance, NOT byte-exact), wraps routed `nn.Linear`s with
 completion-only loss. The per-group config is loaded by `qat.config.load_hybrid_config`
 (search_results.json tier → `{group: ggml_type_name}`); HF→GGUF name mapping reuses
 `gguf/source.py`'s `_HF_TO_GGUF_PATTERNS` via `qat.names.hf_to_ggml_name`. Heavy
-training deps (torch/transformers/peft/trl/datasets) live in the `[qat]` extra;
+training deps (torch/transformers/peft/accelerate, +transitively tokenizers/
+safetensors/huggingface_hub) live in the `[qat]` extra;
 the package `__init__` keeps `run_qat` lazily imported (from `qat.train`) so the
 light surface only needs torch. Surfaced as Foundry's **QAT** pipeline stage.
 
