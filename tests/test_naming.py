@@ -3,7 +3,7 @@
 Locks the Q2-tier label gap fix: a model named "...-Q2" must expand to a
 HuggingFace-recognized quant string ("Q2_K"), not stay as a bare "-Q2".
 """
-from magicquant.utils.naming import generate_name, _TIER_TO_HF_LABEL
+from magicquant.utils.naming import config_key, generate_name, _TIER_TO_HF_LABEL
 
 
 def test_q2_tier_label_expands():
@@ -27,3 +27,14 @@ def test_q5_tier_label_expands():
 def test_no_tier_suffix_unchanged():
     name = generate_name("PlainName", base_quant="MXFP4_MOE", overrides={})
     assert name == "PlainName.gguf"
+
+
+def test_config_key_round_trips_through_reselect_tiers_parser():
+    """config_key's output is a PERSISTED interchange format: it becomes the
+    measurement keys of search_results.json / resume checkpoints, and
+    tools/reselect_tiers.py's _parse_key parses it back. Guard the round trip
+    directly so a format change can't ship on a green suite."""
+    from tools.reselect_tiers import _parse_key
+
+    config = {"E": "BF16", "U": "MXFP4_MOE", "D": "Q4_K_M"}
+    assert _parse_key(config_key(config)) == config

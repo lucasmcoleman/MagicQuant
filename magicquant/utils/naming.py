@@ -18,6 +18,28 @@ Example: Qwen3-4B-MXFP4-EH-B16-QKO-IQ4NL.gguf
 from typing import Dict, Optional
 
 
+def config_key(config: Dict[str, str]) -> str:
+    """Canonical ``group:scheme`` key for a per-group hybrid config, groups
+    sorted -- e.g. ``{"D": "Q4_K_M", "E": "Q6_K"}`` -> ``"D:Q4_K_M|E:Q6_K"``.
+
+    CONTRACT: this format is a PERSISTED interchange format, not just an
+    in-memory key. These strings become the keys of the orchestrator's
+    ``self._measured``, which are serialized as the "measurements" dict
+    keys in search_results.json AND into the measured-search checkpoint
+    (magicquant.orchestrator's ``_write_measured_checkpoint`` /
+    ``_config_key``), and are parsed back by ``tools/reselect_tiers.py``'s
+    ``_parse_key`` (split on "|" then ":"). Do NOT change the separator,
+    the sort, or add a prefix here -- that would silently break checkpoint
+    resume (stale keys stop matching freshly-computed ones) and break
+    reselect_tiers parsing. This is a pure move of the one-liner that used
+    to be hand-duplicated in orchestrator.py, pareto.py, and
+    evolution/predictor.py; it is unrelated to the SPACE-separated
+    human-display variant used elsewhere (e.g. utils/model_card.py's
+    ``_format_scheme_map``).
+    """
+    return "|".join(f"{g}:{config[g]}" for g in sorted(config))
+
+
 # Group code definitions
 GROUP_CODES = {
     'E': 'Embeddings',

@@ -22,7 +22,7 @@ from magicquant.evolution.predictor import PredictiveScorer
 from magicquant.evolution.survival import EvolutionarySurvivor
 from magicquant.evolution.probing import SensitivityProber
 from magicquant.gguf.tensor_groups import TensorGroupClassifier
-from magicquant.utils.naming import generate_name
+from magicquant.utils.naming import generate_name, config_key as _naming_config_key
 from magicquant.utils.llamacpp import LlamaCppTools
 from magicquant.utils.measurement import measurement_eps
 from magicquant.logging import get_logger
@@ -1825,6 +1825,78 @@ class MagicQuantOrchestrator:
             "weights_degenerate": weights_degenerate,
         }
 
+    @staticmethod
+    def _serialize_measurement(v: Dict[str, Any], *, include_path: bool) -> Dict[str, Any]:
+        """Single field list for a per-measurement export entry, shared by
+        ``_save_results``' "measurements" dict (include_path=False) and
+        ``_write_measured_checkpoint``'s "measured" dict (include_path=True).
+        Both used to independently re-list the same fields off
+        ``self._measured.items()`` and had to be hand-kept in sync.
+
+        CONTRACT: this whitelist feeds a PERSISTED interchange format.
+        search_results.json's "measurements" is consumed by
+        qat.config.load_hybrid_config, Foundry's rocmfpx MQ-hybrid mode,
+        tools/reselect_tiers.py, and tools/fit_noise_factors.py. The
+        checkpoint's "measured" dict is read back verbatim on resume
+        (``self._measured[key] = dict(entry)``, no second filter) -- this
+        whitelist is therefore the ONLY gate on what a resumed run keeps.
+        A field added here lands in BOTH artifacts; a field dropped here
+        is silently lost by every resumed run. See the BLOCKER note below
+        for why that is not hypothetical.
+
+        Per-site key ORDER is preserved exactly as it was before this
+        helper existed, and is CONTRACTUAL: these artifacts are persisted
+        interchange formats read by external tools, so treat raw JSON key
+        order as part of the format -- do not collapse the two branches
+        into one uniform order. ``_save_results`` ends
+        ...incumbent, corpus_path, measurement_invalid; the checkpoint
+        inserts "path" right after "residual" and ends
+        ...incumbent, measurement_invalid, corpus_path.
+        """
+        entry: Dict[str, Any] = {
+            "config": v["config"],
+            "ppl": v.get("ppl"),
+            "measured_loss": v.get("measured_loss"),
+            "predicted_loss": v.get("predicted_loss"),
+            "residual": v.get("residual"),
+        }
+        if include_path:
+            # Checkpoint-only, write-only field: the candidate GGUF it
+            # names is unlink()ed moments after the checkpoint write, and
+            # nothing ever reads it back on resume. Deliberately NOT
+            # emitted into search_results.json -- that would leak a dead
+            # temp-build path into a published, externally-consumed
+            # artifact.
+            entry["path"] = v.get("path")
+        entry["size_gb"] = v.get("size_gb")
+        entry["kl"] = v.get("kl")
+        entry["bench"] = v.get("bench")
+        entry["incumbent"] = v.get("incumbent")
+        if include_path:
+            # BLOCKER fix: this whitelist used to omit
+            # measurement_invalid/corpus_path, so a resumed run's entries
+            # came back WITHOUT them -- info.get("measurement_invalid") is
+            # None (falsy) post-resume, and a physically-impossible
+            # candidate could win a tier again across a resume boundary.
+            # See tests/test_measured_search_checkpoint_resume.py::
+            # test_measurement_invalid_and_corpus_path_survive_checkpoint_round_trip.
+            entry["measurement_invalid"] = v.get("measurement_invalid", False)
+            entry["corpus_path"] = v.get("corpus_path")
+        else:
+            # Per-measurement corpus (fix for CORPUS PROVENANCE: the
+            # top-level "measurement"/"corpus" field below is still
+            # stamped once, kept for backward compat with older readers,
+            # but each measurement now carries the corpus it was ACTUALLY
+            # taken over, so a mid-run change would be visible here even
+            # if the single summary field wasn't updated).
+            entry["corpus_path"] = v.get("corpus_path")
+            # True when this reading was physically impossible
+            # (measured_loss below -eps) and excluded from
+            # _select_final_survivors -- kept in the record for
+            # diagnostics rather than silently dropped.
+            entry["measurement_invalid"] = v.get("measurement_invalid", False)
+        return entry
+
     def _save_results(self, all_configs, tiered):
         """Persist search results and measurements to JSON.
 
@@ -1879,30 +1951,7 @@ class MagicQuantOrchestrator:
             "seed": self._search_seed,
             "measurement": self._measurement_metadata(),
             "measurements": {
-                k: {
-                    "config": v["config"],
-                    "ppl": v.get("ppl"),
-                    "measured_loss": v.get("measured_loss"),
-                    "predicted_loss": v.get("predicted_loss"),
-                    "residual": v.get("residual"),
-                    "size_gb": v.get("size_gb"),
-                    "kl": v.get("kl"),
-                    "bench": v.get("bench"),
-                    "incumbent": v.get("incumbent"),
-                    # Per-measurement corpus (fix for CORPUS PROVENANCE: the
-                    # top-level "measurement"/"corpus" field below is still
-                    # stamped once, kept for backward compat with older
-                    # readers, but each measurement now carries the corpus
-                    # it was ACTUALLY taken over, so a mid-run change would
-                    # be visible here even if the single summary field
-                    # wasn't updated).
-                    "corpus_path": v.get("corpus_path"),
-                    # True when this reading was physically impossible
-                    # (measured_loss below -eps) and excluded from
-                    # _select_final_survivors -- kept in the record for
-                    # diagnostics rather than silently dropped.
-                    "measurement_invalid": v.get("measurement_invalid", False),
-                }
+                k: self._serialize_measurement(v, include_path=False)
                 for k, v in self._measured.items()
             },
             # Same per-tier entry as "tiered" below, minus predicted_loss --
@@ -2412,7 +2461,16 @@ class MagicQuantOrchestrator:
 
     @staticmethod
     def _config_key(config: Dict[str, str]) -> str:
-        return "|".join(f"{g}:{config[g]}" for g in sorted(config))
+        # Thin delegate -- canonical implementation now lives in
+        # magicquant.utils.naming.config_key (search-v1/4: was hand-
+        # reimplemented identically here, in pareto._scheme_str, and in
+        # evolution.predictor._make_config_key). Kept as a staticmethod
+        # rather than inlined at call sites: it's called on the class
+        # directly (tests/test_measurement_candidate_coverage.py) and has
+        # ~10 internal call sites in the hot measured-search loop. Its
+        # output is a PERSISTED interchange format -- see
+        # magicquant.utils.naming.config_key's docstring.
+        return _naming_config_key(config)
 
     def _build_incumbent_seeds(
         self, seed_incumbents: bool
@@ -2678,28 +2736,7 @@ class MagicQuantOrchestrator:
                 "n_tensors": len(self._imatrix) if self._imatrix else None,
             },
             "measured": {
-                k: {
-                    "config": v["config"],
-                    "ppl": v.get("ppl"),
-                    "measured_loss": v.get("measured_loss"),
-                    "predicted_loss": v.get("predicted_loss"),
-                    "residual": v.get("residual"),
-                    "path": v.get("path"),
-                    "size_gb": v.get("size_gb"),
-                    "kl": v.get("kl"),
-                    "bench": v.get("bench"),
-                    "incumbent": v.get("incumbent"),
-                    # BLOCKER fix: this whitelist used to omit
-                    # measurement_invalid/corpus_path, so a resumed run's
-                    # entries came back WITHOUT them -- info.get(
-                    # "measurement_invalid") is None (falsy) post-resume,
-                    # and a physically-impossible candidate could win a
-                    # tier again across a resume boundary. See
-                    # tests/test_measured_search_checkpoint_resume.py::
-                    # test_measurement_invalid_and_corpus_path_survive_checkpoint_round_trip.
-                    "measurement_invalid": v.get("measurement_invalid", False),
-                    "corpus_path": v.get("corpus_path"),
-                }
+                k: self._serialize_measurement(v, include_path=True)
                 for k, v in self._measured.items()
             },
         }

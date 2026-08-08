@@ -28,6 +28,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
+from magicquant.utils.naming import config_key as _naming_config_key
+
 # Direction of "better" per objective name. "min" = lower is better
 # (size_gb, ppl, measured_loss); "max" = higher is better (throughput
 # fields pulled out of a candidate's "bench" dict). Any objective name not
@@ -144,10 +146,15 @@ def pareto_frontier(
 
 def _scheme_str(entry: Dict[str, Any]) -> str:
     """Compact ``group:scheme`` string, groups sorted -- matches
-    MagicQuantOrchestrator._config_key's format so a frontier entry's "key"
-    (when present) and its recomputed scheme string always agree."""
+    MagicQuantOrchestrator._config_key's format (both now delegate to
+    magicquant.utils.naming.config_key) so a frontier entry's "key" (when
+    present) and its recomputed scheme string always agree. Kept as its
+    own wrapper rather than calling naming.config_key directly at the call
+    site: it takes an *entry* (not a bare config dict) and has a
+    None-safe ``entry.get("config") or {}`` guard -- a display concern
+    that only coincidentally shares the key format."""
     config = entry.get("config") or {}
-    return "|".join(f"{g}:{config[g]}" for g in sorted(config))
+    return _naming_config_key(config)
 
 
 def format_pareto_report(

@@ -22,6 +22,7 @@ from typing import Dict, List, Optional
 
 from magicquant.quant import calibration
 from magicquant.quant.schemes import effective_noise_factor, get_scheme_by_name
+from magicquant.utils.naming import config_key as _naming_config_key
 
 
 class PredictiveScorer:
@@ -234,7 +235,13 @@ class PredictiveScorer:
         return self.baseline_size_gb * (avg_bpw / 16.0)
 
     def _make_config_key(self, group_schemes: Dict[str, str]) -> str:
-        return "|".join(f"{g}:{group_schemes[g]}" for g in sorted(group_schemes))
+        # Delegates to magicquant.utils.naming.config_key (search-v1/4).
+        # Unlike MagicQuantOrchestrator._config_key, this instance's key
+        # only feeds the in-memory self.residual_cache (written by
+        # record_residual, read by predict_loss) -- there's no enforced
+        # cross-module contract here, it just happens to share the same
+        # format.
+        return _naming_config_key(group_schemes)
 
     def _noise_factor_for(self, scheme: str) -> float:
         """Prefer an empirically calibrated noise_factor (from
