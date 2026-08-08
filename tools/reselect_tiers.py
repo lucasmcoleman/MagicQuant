@@ -74,8 +74,6 @@ DEFAULT_MAX_RESIDUAL = 0.005
 def _bpw(scheme_name: str) -> float:
     """Storage bits-per-weight for a scheme name, straight from the registry."""
     scheme = get_scheme_by_name(scheme_name)
-    if scheme is None:
-        raise KeyError(f"unknown scheme {scheme_name!r}")
     return float(scheme.bits_per_weight)
 
 
@@ -247,6 +245,7 @@ def analyze(path: Path, *, max_residual: float) -> Dict[str, Any]:
             flags.append("DOMINATED")
         if eps is not None and shipped_loss is not None and float(shipped_loss) < -eps:
             flags.append("IMPLAUSIBLE")
+        winner = min(better, key=lambda r: r["loss"]) if better else None
         findings.append(
             {
                 "shipped_as": tier,
@@ -255,15 +254,9 @@ def analyze(path: Path, *, max_residual: float) -> Dict[str, Any]:
                 "ppl": entry.get("ppl"),
                 "actual_tier": actual_tier,
                 "flags": flags,
-                "dominated_by": (
-                    min(better, key=lambda r: r["loss"])["key"] if better else None
-                ),
-                "dominated_by_size_gb": (
-                    min(better, key=lambda r: r["loss"])["size_gb"] if better else None
-                ),
-                "dominated_by_loss": (
-                    min(better, key=lambda r: r["loss"])["loss"] if better else None
-                ),
+                "dominated_by": winner["key"] if winner else None,
+                "dominated_by_size_gb": winner["size_gb"] if winner else None,
+                "dominated_by_loss": winner["loss"] if winner else None,
             }
         )
     report["shipped"] = findings

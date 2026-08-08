@@ -84,11 +84,6 @@ class MagicQuantSettings(BaseSettings):
     }
 
     @property
-    def output_path(self) -> Path:
-        """Return output_dir as a resolved Path."""
-        return Path(self.output_dir).resolve()
-
-    @property
     def source_path(self) -> Path:
         """Return source_model_path as a resolved Path."""
         return Path(self.source_model_path).resolve()

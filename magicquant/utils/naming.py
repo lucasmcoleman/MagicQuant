@@ -17,8 +17,6 @@ Example: Qwen3-4B-MXFP4-EH-B16-QKO-IQ4NL.gguf
 
 from typing import Dict, Optional
 
-from magicquant.quant.schemes import get_scheme_by_name
-
 
 # Group code definitions
 GROUP_CODES = {
@@ -89,69 +87,3 @@ def generate_name(
 def get_group_names() -> Dict[str, str]:
     """Get the mapping of group codes to full names."""
     return GROUP_CODES.copy()
-
-
-def generate_config_for_quant(
-    model_name: str,
-    base_quant: str,
-    overrides: Dict[str, str]
-) -> Dict:
-    """
-    Generate a configuration dictionary for hybrid quant creation.
-    
-    This can be used to create the config.yaml needed by the hybrid generator.
-    
-    Args:
-        model_name: Base model name
-        base_quant: Base quantization scheme
-        overrides: Which groups get different quantization
-        
-    Returns:
-        Configuration dictionary in format:
-        {
-            "model": {...},
-            "quantization": {
-                "base": "...",
-                "groups": {
-                    "...": "..."
-                }
-            }
-        }
-    """
-    return {
-        "model": {"name": model_name, "source": None},  # source will be set by user
-        "quantization": {
-            "base": base_quant,
-            "groups": overrides
-        }
-    }
-
-
-def get_scheme_bits(scheme_name: str) -> float:
-    """Get the bits per weight for a quantization scheme."""
-    try:
-        return get_scheme_by_name(scheme_name).bits_per_weight
-    except ValueError:
-        return 8.0
-
-
-if __name__ == "__main__":
-    # Demonstrate the naming scheme
-    print("Testing MagicQuant Naming Scheme")
-    print("=" * 50)
-
-    # Example 1: tier suffix expands to an HF-recognized quant label
-    name1 = generate_name(
-        model_name="Qwen3-4B-Instruct-Q5",
-        base_quant="MXFP4_MOE",
-        overrides={"E": "BF16", "H": "BF16"},
-    )
-    print(f"Example 1: {name1}")
-
-    # Example 2: Q2 tier now also expands (was a gap before)
-    name2 = generate_name(
-        model_name="Qwen3-30B-A3B-Q2",
-        base_quant="Q2_K",
-        overrides={"Q": "Q6_K", "K": "Q6_K", "O": "Q8_0"},
-    )
-    print(f"Example 2: {name2}")
