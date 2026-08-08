@@ -15,7 +15,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from magicquant.logging import get_logger
 from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION
+
+log = get_logger(__name__)
 
 
 def budget_tier_key(budget_gib: float) -> str:
@@ -51,8 +54,9 @@ def write_interchange_block(search_results_path: Path | str, results: dict) -> s
         try:
             data = json.loads(path.read_text())
         except (ValueError, OSError):
-            print(f"Warning: {path} unreadable; rewriting with budget block only",
-                  flush=True)
+            log.warning(
+                f"Warning: {path} unreadable; rewriting with budget block only"
+            )
             data = {}
     fresh = not data
     data.setdefault("tiered", {})[key] = block

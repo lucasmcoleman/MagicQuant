@@ -80,3 +80,25 @@ def test_missing_anchor_bytes_reads_none(tmp_path):
     write_interchange_block(path, dict(RESULTS, anchors=[]))
     data = json.loads(path.read_text())
     assert data["tiered"]["BUDGET-12.5GiB"]["actual_bytes"] is None
+
+
+def test_corrupt_existing_file_warns_and_is_replaced(tmp_path, capsys):
+    """A pre-existing search_results.json that isn't valid JSON is treated
+    as absent (this module's documented treat-corrupt-as-absent policy):
+    the corrupt content is replaced by a fresh file containing only this
+    run's budget block, a warning naming the path is logged, and — because
+    the corrupt file is indistinguishable from "no file" — it is treated as
+    fresh and gets stamped with tier_scheme_version (same as the
+    from-scratch case in test_creates_file_with_stamped_version)."""
+    path = tmp_path / "search_results.json"
+    path.write_text("{not json")
+    key = write_interchange_block(path, RESULTS)
+
+    out = capsys.readouterr().out
+    assert "unreadable" in out
+    assert str(path) in out
+
+    data = json.loads(path.read_text())
+    assert data["tier_scheme_version"] == CURRENT_TIER_SCHEME_VERSION
+    assert set(data["tiered"]) == {key}
+    assert data["tiered"][key]["config"] == RESULTS["group_summary"]

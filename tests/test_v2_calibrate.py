@@ -166,3 +166,167 @@ def test_invalid_probe_mode_rejected():
     with pytest.raises(ValueError):
         cal.run_group_probes(_Tools(), "m.gguf", "/tmp/x", ["E"], 18.0,
                              probe_mode="bogus")
+
+
+# --- failure-path coverage for the shared build/measure/retry/cleanup core
+# extracted into calibrate._measure_probe (used by both the base-aggressive
+# probe and each per-group probe in run_group_probes) ---
+
+def test_group_probe_retries_then_succeeds():
+    """A build that raises on the first attempt and succeeds on the second:
+    attempts is recorded correctly, and the probe GGUF from the failed
+    attempt (and the successful one, once measured) is cleaned up — the
+    ``finally: unlink`` runs on every attempt."""
+    import tempfile
+    import magicquant.v2.calibrate as cal
+    from pathlib import Path as _P
+
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+        def calculate_perplexity(self, path, verbose=True, **kw):
+            return 18.0
+
+    calls = {"n": 0}
+
+    def _flaky_create(output_path, base_model_path, quant_config, verbose=False, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated build failure")
+        _P(output_path).write_bytes(b"x")
+        return output_path
+
+    import magicquant.gguf.writer as wmod
+    orig = wmod.create_hybrid_gguf
+    wmod.create_hybrid_gguf = _flaky_create
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            outcomes = cal.run_group_probes(
+                _Tools(), "m.gguf", d, ["E"], 18.0,
+                probe_mode="single", retries=1,
+            )
+            assert outcomes["E"].ok
+            assert outcomes["E"].attempts == 2
+            # unlinked on both the failed and the successful attempt
+            assert not list(_P(d).glob("_v2_probes/*.gguf"))
+    finally:
+        wmod.create_hybrid_gguf = orig
+
+
+def test_group_probe_exhausts_retries_records_failure_with_allow_partial():
+    """A PPL that never parses: attempts == retries + 1, the failure is
+    recorded (not raised) under --allow-partial-probes, and the probe file
+    is cleaned up."""
+    import tempfile
+    import magicquant.v2.calibrate as cal
+    from pathlib import Path as _P
+
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+        def calculate_perplexity(self, path, verbose=True, **kw):
+            # slice-baseline (measured against source_model_path) succeeds;
+            # the per-group probe GGUF never parses.
+            if str(path) == "m.gguf":
+                return 18.0
+            return None  # unparsable PPL, every attempt
+
+    def _fake_create(output_path, base_model_path, quant_config, verbose=False, **kw):
+        _P(output_path).write_bytes(b"x")
+        return output_path
+
+    import magicquant.gguf.writer as wmod
+    orig = wmod.create_hybrid_gguf
+    wmod.create_hybrid_gguf = _fake_create
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            outcomes = cal.run_group_probes(
+                _Tools(), "m.gguf", d, ["E"], 18.0,
+                probe_mode="single", retries=1, allow_partial=True,
+            )
+            assert outcomes["E"].status == "failed"
+            assert outcomes["E"].attempts == 2
+            assert outcomes["E"].error == "llama-perplexity produced no parseable PPL"
+            assert not list(_P(d).glob("_v2_probes/*.gguf"))
+    finally:
+        wmod.create_hybrid_gguf = orig
+
+
+def test_group_probe_failure_without_allow_partial_raises():
+    """Per-group failure defers to the aggregate check at the end of
+    run_group_probes, which raises ProbeMeasurementError when
+    allow_partial is False."""
+    import tempfile
+    import pytest
+    import magicquant.v2.calibrate as cal
+    from magicquant.v2.outcome import ProbeMeasurementError
+    from pathlib import Path as _P
+
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+        def calculate_perplexity(self, path, verbose=True, **kw):
+            if str(path) == "m.gguf":
+                return 18.0
+            return None
+
+    def _fake_create(output_path, base_model_path, quant_config, verbose=False, **kw):
+        _P(output_path).write_bytes(b"x")
+        return output_path
+
+    import magicquant.gguf.writer as wmod
+    orig = wmod.create_hybrid_gguf
+    wmod.create_hybrid_gguf = _fake_create
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            with pytest.raises(ProbeMeasurementError):
+                cal.run_group_probes(
+                    _Tools(), "m.gguf", d, ["E"], 18.0,
+                    probe_mode="single", retries=0, allow_partial=False,
+                )
+    finally:
+        wmod.create_hybrid_gguf = orig
+
+
+def test_base_aggressive_failure_raises_and_persists_cache_before_raise():
+    """Base-aggressive probe failure (cumulative mode) raises
+    ProbeMeasurementError immediately when allow_partial is False — every
+    leave-one-group kappa is measured against that base — and the failure
+    is written to v2_probes.json BEFORE the raise, so a resumed run sees
+    it."""
+    import tempfile
+    import json
+    import pytest
+    import magicquant.v2.calibrate as cal
+    from magicquant.v2.outcome import ProbeMeasurementError
+    from pathlib import Path as _P
+
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+        def calculate_perplexity(self, path, verbose=True, **kw):
+            # slice-baseline (measured against source_model_path) succeeds;
+            # the base-aggressive probe GGUF never parses.
+            if "base_aggressive" in str(path):
+                return None
+            return 18.0
+
+    def _fake_create(output_path, base_model_path, quant_config, verbose=False, **kw):
+        _P(output_path).write_bytes(b"x")
+        return output_path
+
+    import magicquant.gguf.writer as wmod
+    orig = wmod.create_hybrid_gguf
+    wmod.create_hybrid_gguf = _fake_create
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            with pytest.raises(ProbeMeasurementError, match="base-aggressive"):
+                cal.run_group_probes(
+                    _Tools(), "m.gguf", d, ["E"], 18.0,
+                    probe_mode="cumulative", retries=0, allow_partial=False,
+                )
+            cache = json.loads((_P(d) / "v2_probes.json").read_text())
+            assert cache["probes"]["__base_aggressive__"]["status"] == "failed"
+            assert not list(_P(d).glob("_v2_probes/*.gguf"))
+    finally:
+        wmod.create_hybrid_gguf = orig

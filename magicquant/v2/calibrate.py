@@ -175,53 +175,28 @@ def run_group_probes(
                 )
             else:
                 base_path = probe_dir / "probe__base_aggressive.gguf"
-                b_outcome: Optional[MeasurementOutcome] = None
-                b_attempts = 0
-                b_err = "unknown"
-                while b_attempts <= retries and b_outcome is None:
-                    b_attempts += 1
-                    try:
-                        create_hybrid_gguf(
-                            output_path=str(base_path),
-                            base_model_path=str(source_model_path),
-                            quant_config={"base": probe_scheme, "groups": {}},
-                            verbose=False,
-                            imatrix=imatrix,
-                        )
-                        ppl = llama_tools.calculate_perplexity(
-                            str(base_path), verbose=False
-                        )
-                        if ppl is None:
-                            b_err = "llama-perplexity produced no parseable PPL"
-                            continue
-                        b_outcome = MeasurementOutcome.success(
-                            ppl, attempts=b_attempts, kind="base-aggressive",
-                        )
-                    except Exception as exc:  # noqa: BLE001 — recorded
-                        b_err = f"{type(exc).__name__}: {exc}"
-                        log.warning(
-                            "base-aggressive probe failed (attempt %d/%d): %s",
-                            b_attempts, retries + 1, b_err, stage="calibrate",
-                        )
-                    finally:
-                        if base_path.exists():
-                            try:
-                                base_path.unlink()
-                            except OSError:
-                                pass
-                if b_outcome is None:
+                b_outcome = _measure_probe(
+                    llama_tools=llama_tools,
+                    create_hybrid_gguf=create_hybrid_gguf,
+                    source_model_path=source_model_path,
+                    out_path=base_path,
+                    quant_config={"base": probe_scheme, "groups": {}},
+                    imatrix=imatrix,
+                    retries=retries,
+                    log_template="base-aggressive probe failed (attempt %d/%d): %s",
+                    log_prefix_args=(),
+                    meta={"kind": "base-aggressive"},
+                )
+                if not b_outcome.ok:
                     # Without the base, no cumulative κ can be computed at
                     # all — fail loudly (unless partial explicitly allowed,
                     # in which case fit_kappa falls back to imputed median).
-                    b_outcome = MeasurementOutcome.failure(
-                        b_err, attempts=b_attempts, kind="base-aggressive",
-                    )
                     if not allow_partial:
                         outcomes["__base_aggressive__"] = b_outcome
                         _write_probe_cache(cache_path, conditions, outcomes, cached)
                         raise ProbeMeasurementError(
                             "cumulative probe base-aggressive measurement "
-                            f"failed: {b_err}. Every leave-one-group κ is "
+                            f"failed: {b_outcome.error}. Every leave-one-group κ is "
                             "measured against this base; refusing to continue. "
                             "Fix the measurement and re-run to resume, or pass "
                             "--allow-partial-probes."
@@ -239,52 +214,24 @@ def run_group_probes(
                 continue
 
             probe_path = probe_dir / f"probe_{group}.gguf"
-            outcome: Optional[MeasurementOutcome] = None
-            attempts = 0
-            last_error = "unknown"
-            while attempts <= retries and outcome is None:
-                attempts += 1
-                try:
-                    quant_config = _probe_config(group)
-                    create_hybrid_gguf(
-                        output_path=str(probe_path),
-                        base_model_path=str(source_model_path),
-                        quant_config=quant_config,
-                        verbose=False,
-                        imatrix=imatrix,
-                    )
-                    ppl = llama_tools.calculate_perplexity(
-                        str(probe_path), verbose=False
-                    )
-                    if ppl is None:
-                        last_error = (
-                            "llama-perplexity produced no parseable PPL"
-                        )
-                        continue
-                    outcome = MeasurementOutcome.success(
-                        ppl, attempts=attempts, group=group,
-                        probe_scheme=probe_scheme,
-                    )
-                except Exception as exc:  # noqa: BLE001 — recorded, not hidden
-                    last_error = f"{type(exc).__name__}: {exc}"
-                    log.warning(
-                        "probe build/measure failed for group %s "
-                        "(attempt %d/%d): %s",
-                        group, attempts, retries + 1, last_error,
-                        stage="calibrate",
-                    )
-                finally:
-                    if probe_path.exists():
-                        try:
-                            probe_path.unlink()
-                        except OSError:
-                            pass
-
-            if outcome is None:
-                outcome = MeasurementOutcome.failure(
-                    last_error, attempts=attempts, group=group,
-                    probe_scheme=probe_scheme,
-                )
+            # _probe_config is a pure dict builder over an already-validated
+            # probe_mode (checked at function entry) and cannot raise, so
+            # evaluating it here rather than inside _measure_probe's retry
+            # loop is behavior-preserving.
+            quant_config = _probe_config(group)
+            outcome = _measure_probe(
+                llama_tools=llama_tools,
+                create_hybrid_gguf=create_hybrid_gguf,
+                source_model_path=source_model_path,
+                out_path=probe_path,
+                quant_config=quant_config,
+                imatrix=imatrix,
+                retries=retries,
+                log_template="probe build/measure failed for group %s "
+                "(attempt %d/%d): %s",
+                log_prefix_args=(group,),
+                meta={"group": group, "probe_scheme": probe_scheme},
+            )
             outcomes[group] = outcome
 
             # Persist after every probe (atomic) so a killed run resumes.
@@ -306,6 +253,72 @@ def run_group_probes(
             "with imputed-median kappa for the failed group(s)."
         )
     return outcomes
+
+
+def _measure_probe(
+    llama_tools,
+    create_hybrid_gguf,
+    source_model_path: str,
+    out_path: Path,
+    # Reused as the same dict object across every retry attempt below --
+    # safe only while create_hybrid_gguf never mutates its quant_config/
+    # group_schemes/tensor_overrides arguments.
+    quant_config: Dict[str, Any],
+    imatrix: Optional[Dict[str, Any]],
+    retries: int,
+    log_template: str,
+    log_prefix_args: Tuple[Any, ...],
+    meta: Dict[str, Any],
+) -> MeasurementOutcome:
+    """Build one probe GGUF and measure its PPL, retrying up to ``retries``
+    times after the first attempt. Shared build/measure/retry/cleanup core
+    of both the base-aggressive probe and each per-group probe in
+    ``run_group_probes`` — the only things that differ between call sites
+    are the quant_config, the log message, and the outcome ``meta``.
+
+    ``create_hybrid_gguf`` is passed in rather than imported here so that
+    ``run_group_probes``'s function-local import (relied on by a test that
+    monkeypatches ``magicquant.gguf.writer.create_hybrid_gguf``) stays the
+    single source of that binding.
+
+    Returns the final ``MeasurementOutcome`` (success or failure) and never
+    raises or decides what a failure means for the caller — the
+    base-aggressive-vs-per-group asymmetry (abort immediately vs. record
+    and defer to the aggregate check) stays entirely at the call sites.
+    """
+    outcome: Optional[MeasurementOutcome] = None
+    attempts = 0
+    last_error = "unknown"
+    while attempts <= retries and outcome is None:
+        attempts += 1
+        try:
+            create_hybrid_gguf(
+                output_path=str(out_path),
+                base_model_path=str(source_model_path),
+                quant_config=quant_config,
+                verbose=False,
+                imatrix=imatrix,
+            )
+            ppl = llama_tools.calculate_perplexity(str(out_path), verbose=False)
+            if ppl is None:
+                last_error = "llama-perplexity produced no parseable PPL"
+                continue
+            outcome = MeasurementOutcome.success(ppl, attempts=attempts, **meta)
+        except Exception as exc:  # noqa: BLE001 — recorded, not hidden
+            last_error = f"{type(exc).__name__}: {exc}"
+            log.warning(
+                log_template, *log_prefix_args, attempts, retries + 1,
+                last_error, stage="calibrate",
+            )
+        finally:
+            if out_path.exists():
+                try:
+                    out_path.unlink()
+                except OSError:
+                    pass
+    if outcome is None:
+        outcome = MeasurementOutcome.failure(last_error, attempts=attempts, **meta)
+    return outcome
 
 
 def _write_probe_cache(
