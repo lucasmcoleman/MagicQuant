@@ -38,10 +38,6 @@ class Unit:
     choices: List[Choice]                 # ≥1; fixed units have exactly 1
     hull: List[Choice] = field(default_factory=list)  # filled by _build_hull
 
-    @property
-    def fixed(self) -> bool:
-        return len(self.choices) == 1
-
 
 @dataclass
 class FrontierPoint:

@@ -392,7 +392,10 @@ def fit_kappa(
     for g, rel in raw_rel.items():
         eps = eps_sums[g]
         if rel < censor_floor:
-            kappa[g] = max(rel, censor_floor, MIN_REL_DPPL) / eps
+            # `rel` is provably < the other two args under this branch
+            # guard (which also excludes NaN, since `nan < censor_floor`
+            # is False), so it can never win the max and is safely omitted.
+            kappa[g] = max(censor_floor, MIN_REL_DPPL) / eps
             provenance[g] = "measured-censored"
             log.info(
                 "kappa for group %s censored at floor (raw rel-dPPL %.3g "
