@@ -98,6 +98,12 @@ class EvolutionarySurvivor:
         return self._walk(scheme, "downgrade_neighbor")
 
     # Groups that are sensitive to quantization ("brain" layers)
+    # Cross-reference: magicquant.evolution.predictor.PredictiveScorer.HIGH_SENSITIVITY_GROUPS
+    # is the canonical home for this same {E,H,O,R} set (collapse-penalty
+    # use); this copy is intentionally left uncoupled for now -- it feeds
+    # sampling-category bucketing and floor-clamp logic that CLAUDE.md names
+    # as a seed-pinned regression-fixture trigger. Full unification is
+    # logged future work, not part of this cleanup.
     _HIGH_SENSITIVITY = {'E', 'H', 'O', 'R'}
 
     # Streamed matmul groups: their full weight is read every generated token

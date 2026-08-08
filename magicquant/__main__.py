@@ -21,6 +21,7 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     """Analyze model structure and tensor groups."""
     from magicquant.gguf.reader import GGUFReader
     from magicquant.gguf.tensor_groups import TensorGroupClassifier
+    from magicquant.utils.naming import get_group_names
 
     log = get_logger("analyze")
 
@@ -45,18 +46,8 @@ def cmd_analyze(args: argparse.Namespace) -> None:
     classifier = TensorGroupClassifier()
     grouped = classifier.classify_tensors(tensor_names)
 
-    group_labels = {
-        'E': 'Embeddings',
-        'H': 'LM Head',
-        'Q': 'Attention Query',
-        'K': 'Attention Key/Value',
-        'O': 'Attention Output',
-        'U': 'FFN Up/Gate',
-        'D': 'FFN Down',
-        'X': 'MoE Experts',
-        'R': 'MoE Router',
-        'UNKNOWN': 'Unclassified',
-    }
+    group_labels = get_group_names()
+    group_labels['UNKNOWN'] = 'Unclassified'
 
     print("Tensor Group Distribution:")
     for group, tensors in grouped.items():

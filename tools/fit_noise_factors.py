@@ -66,9 +66,12 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from magicquant.quant.schemes import get_scheme_by_name  # noqa: E402
+from magicquant.evolution.predictor import (  # noqa: E402
+    DEFAULT_COLLAPSE_PENALTY_BETA,
+    PredictiveScorer,
+)
 
-HIGH_SENSITIVITY_GROUPS = ("E", "H", "O", "R")
-DEFAULT_COLLAPSE_PENALTY_BETA = 0.02  # matches PredictiveScorer's default
+HIGH_SENSITIVITY_GROUPS = PredictiveScorer.HIGH_SENSITIVITY_GROUPS
 BASELINE_SCHEME = "BF16"  # fixed at noise_factor=0.0; never a fitted unknown
 
 
