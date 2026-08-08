@@ -6,7 +6,7 @@ Quantized formats route through magicquant.quant.ggml_binding (libggml
 ctypes binding); float passthroughs (BF16/F16/F32) stay native.
 
 Public API:
-    encode_to_ggml_bytes(weights, ggml_type_name, imatrix=None) -> bytes
+    encode_to_ggml_bytes(weights, ggml_type_name, imatrix=None, n_per_row=None) -> bytes
     ggml_tensor_data_size(ggml_type_name, n_elements) -> int
 """
 
@@ -80,7 +80,14 @@ def encode_to_ggml_bytes(
         weights: Float32 numpy array (any shape — will be flattened).
             Must be a floating-point dtype.
         ggml_type_name: Target ggml type (e.g. "Q8_0", "Q4_K", "BF16").
-        imatrix: Optional importance matrix (used by IQ-quants in PR4).
+        imatrix: Optional per-column importance matrix. Consumed by the
+            K-quants and the IQ family; ignored by MXFP4/ROCmFPX/float/
+            legacy Q8_0 (ggml design — absmax/E8M0 scaling has no
+            importance input).
+        n_per_row: The tensor's row width. Conditionally required: only
+            when imatrix is given AND weights is 1-D (weights.ndim < 2)
+            — otherwise it's inferred from weights.shape[-1]. Ignored
+            when imatrix is None.
 
     Returns:
         Raw bytes in the on-disk ggml block layout.

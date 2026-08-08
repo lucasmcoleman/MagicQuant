@@ -7,10 +7,14 @@ Discovery order (first match wins):
     3. llama-cpp-python's bundled libs (always available since it's a hard dep)
 
 Public API:
-    ggml_encode(weights, ggml_type, imatrix=None) -> bytes
+    ggml_encode(weights, ggml_type, imatrix=None, n_per_row=None) -> bytes
+        (n_per_row is required whenever imatrix is not None; imatrix itself
+        is consumed by the K-quants and the IQ family, ignored by
+        MXFP4/ROCmFPX/float/legacy Q8_0)
     ggml_decode(data, ggml_type, n_elements) -> np.ndarray (float32)
     supports_decode(ggml_type) -> bool
-    GGML_TYPE_IDS  (mapping name -> numeric ggml type enum, synced from ggml.h)
+    GGML_TYPE_IDS  (mapping name -> numeric ggml type enum, derived from
+        magicquant.quant.ggml_facts / the installed gguf package)
     LibggmlNotFound  (exception)
 """
 
@@ -287,42 +291,15 @@ class _LibggmlHandle:
         targets -- see the load_bearing union below), plus supported ROCmFPX
         fork types.
 
-        HISTORICAL NOTE on Q8_1 (id=9), why it was excluded from this scope
-        and no longer needs to be: this scoping was originally forced by a
-        confirmed, narrow discrepancy -- the installed `gguf` pip package
-        (0.18.0) reports Q8_1 as 40 bytes/block (a stale
-        "float d; float s; qs[32]" formula), while every real libggml build
-        checked (four independent builds, cross-probed 2026-07-28) reports
-        36 bytes/block (the current "ggml_fp16_t d; ggml_fp16_t s; qs[32]"
-        struct). Q8_1 is an ephemeral CPU dot-product intermediate type,
-        never written into an on-disk GGUF and not offered by any
-        MagicQuant scheme, so at the time this exclusion was written, one
-        stale gguf-py constant for a type nothing here ever quantizes into
-        was kept from blocking every other type's construction-time safety
-        net by excluding Q8_1 from load_bearing rather than overriding the
-        upstream fact.
-
-        ggml_facts.py has SINCE added a documented override
-        (``TYPE_SIZE["Q8_1"] = 36``) correcting this at the source, so the
-        value this method would see for Q8_1 is now the real-libggml-
-        verified 36, not gguf-py's stale 40 -- the original reason for
-        excluding it no longer applies, but Q8_1 remains excluded here
-        anyway because it's still not a real quantization target for any
-        scheme (the scoping's actual, ongoing rationale). The discrepancy
-        this exclusion once had to route around is no longer swallowed
-        upstream of this method either way: it's still surfaced, non-fatally,
-        by _cross_check_block_type_sizes below (which scans every type in
-        GGML_TYPE_IDS, scoped or not) -- though post-override that check now
-        finds agreement (36 == 36) rather than a mismatch. Anything actually
-        dispatched to ggml_quantize_chunk with a wrong TYPE_SIZE would
-        additionally be caught the moment it's used for real, by encode()'s
-        own actual-bytes-written-vs-expected-size check.
-
-        See tests/test_ggml_facts_snapshot.py's
-        test_q8_1_known_upstream_staleness, which pins both the corrected
-        exported value (36) and the still-stale raw gguf-py constant (40),
-        and fails the moment upstream fixes the latter -- the signal to
-        revisit this note and the override together.
+        Q8_1 (id=9) is deliberately excluded from this scope: it's an
+        ephemeral CPU dot-product intermediate, never written to an on-disk
+        GGUF and not dispatched to by any MagicQuant scheme, so it isn't a
+        real quantization target and doesn't need this hard construction-
+        time gate. For the full upstream-gguf-vs-real-libggml discrepancy
+        this type is involved in, and the documented TYPE_SIZE override
+        that corrects it, see magicquant/quant/ggml_facts.py -- that module
+        owns the narrative and the fix; this docstring only records the
+        scoping decision.
         """
         from magicquant.quant.schemes import get_all_schemes
 
@@ -412,6 +389,10 @@ class _LibggmlHandle:
 
         Non-fork types are assumed supported (stock ggml has them all);
         ROCmFPX fork types require the fork's libggml (probed at load).
+
+        Intentional public API surface: no in-repo caller today (name-checked
+        by CLAUDE.md and docs/redesign.md as the intended v2 ROCmFPX-support
+        probe), and external fork tooling may call it directly. Not dead code.
         """
         if ggml_type in ROCMFPX_TYPE_NAMES:
             return ggml_type in self.rocmfpx_supported

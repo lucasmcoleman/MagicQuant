@@ -206,8 +206,8 @@ SafetensorsSource strips `model.language_model.` prefix for multimodal models, t
   threads per-tensor importance vectors to the encoder with the true row width,
   and Pass 1 hard-errors if a target type REQUIRES an imatrix (IQ1/IQ2 family,
   once PR3 registers them) but none was provided. Weighting is USED by the
-  K-quants (Q2_K–Q6_K) and IQ4_NL; **MXFP4 and Q8_0 ignore it by ggml design**
-  (absmax/E8M0 scaling has no importance input). A row whose width isn't a
+  K-quants and the IQ family; **MXFP4/ROCmFPX/float/legacy Q8_0 ignore it by
+  ggml design** (absmax/E8M0 scaling has no importance input). A row whose width isn't a
   multiple of the requested K-quant's 256-block falls back to a block-32
   quant (MXFP4 for low-bit targets, Q8_0 for high-bit) rather than F32; F32
   is used only for SSM/linear-attention operands (group `S`, which llama.cpp
