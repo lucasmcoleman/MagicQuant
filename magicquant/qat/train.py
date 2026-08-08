@@ -407,10 +407,30 @@ def _try_load_base_weight_map(
 def _config_hash(
     model_id: str,
     scheme_by_group: Dict[str, str],
+    lora_r: int,
+    lora_alpha: float,
     scheme_by_tensor: Optional[Dict[str, str]] = None,
     expert_config: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Identity of everything a resumed checkpoint's adapters were trained against.
+
+    ``lora_r``/``lora_alpha`` are folded in UNCONDITIONALLY, alongside
+    ``scheme_by_group`` -- unlike ``scheme_by_tensor``/``expert_config``, every
+    run has a base LoRA rank/alpha, so there is no "old checkpoint predates
+    this key" case to preserve. Pass the RESOLVED values (what ``wrap_model``
+    was actually called with), not a raw ``cfg.get(...)`` -- a run that omits
+    the key and one that passes the default explicitly must hash identically.
+    A changed ``lora_r`` fails loudly later inside the trainer's checkpoint
+    load (a torch shape mismatch on ``lora_A``/``lora_B``); a changed
+    ``lora_alpha`` alone changes no tensor shape and would otherwise resume
+    silently under a different effective adapter scale -- exactly the failure
+    class ``_check_config_identity`` exists to stop.
+
+    BEHAVIOR DELTA: because this makes the hash unconditional, any checkpoint
+    already written under a version of this function without ``lora_r``/
+    ``lora_alpha`` in the payload will refuse to resume (its saved hash no
+    longer matches), even if lora_r/lora_alpha are unchanged. Restart it with
+    ``--no-resume``.
 
     ``scheme_by_tensor`` and ``expert_config`` are folded in only when non-empty,
     so a run with neither hashes exactly as it did before they existed (an old
@@ -423,6 +443,8 @@ def _config_hash(
     payload: Dict[str, Any] = {
         "model": model_id,
         "scheme_by_group": scheme_by_group,
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
     }
     if scheme_by_tensor:
         payload["scheme_by_tensor"] = scheme_by_tensor
@@ -626,12 +648,13 @@ def _check_config_identity(checkpoint_dir: str, config_hash: str) -> None:
     A checkpoint with no hash file predates this guard (or its best-effort
     write previously failed) -- resuming from it is unchanged prior behavior,
     not a new risk, so it's allowed through silently. A checkpoint WITH a
-    hash file that disagrees means the model id or per-group quant scheme
-    changed since it was written: resuming those LoRA adapters would train
-    them against a frozen base / fake-quant config that no longer matches
-    what this run is compensating for, silently corrupting the result. That
-    must stop the run outright rather than degrade to a fresh start -- the
-    safe fallback is explicit, named in the error: ``--no-resume``.
+    hash file that disagrees means the model id, per-group/per-tensor quant
+    scheme, base or expert LoRA rank/alpha, or expert config changed since it
+    was written: resuming those LoRA adapters would train them against a
+    frozen base / fake-quant config (or adapter shape/scale) that no longer
+    matches what this run is compensating for, silently corrupting the
+    result. That must stop the run outright rather than degrade to a fresh
+    start -- the safe fallback is explicit, named in the error: ``--no-resume``.
     """
     hash_path = os.path.join(checkpoint_dir, _CONFIG_HASH_FILENAME)
     if not os.path.isfile(hash_path):
@@ -642,11 +665,12 @@ def _check_config_identity(checkpoint_dir: str, config_hash: str) -> None:
         raise RuntimeError(
             f"Refusing to resume from {checkpoint_dir!r}: its config_hash "
             f"({saved_hash}) does not match the current run's config_hash "
-            f"({config_hash}) -- the model or scheme_by_group changed since "
-            f"this checkpoint was written. Resuming LoRA adapters trained "
-            f"against a different frozen base/quant config would silently "
-            f"corrupt the run. Start fresh with --no-resume (or resume=False) "
-            f"if this is intentional."
+            f"({config_hash}) -- the model, scheme_by_group/scheme_by_tensor, "
+            f"lora_r/lora_alpha, or expert_config changed since this "
+            f"checkpoint was written. Resuming LoRA adapters trained against "
+            f"a different frozen base/quant config or adapter rank/scale "
+            f"would silently corrupt the run. Start fresh with --no-resume "
+            f"(or resume=False) if this is intentional."
         )
 
 
@@ -1019,8 +1043,11 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     } if rc.wrap_experts else None
     # Computed once, reused for both the checkpoint config-identity guard
     # (below) and qat_meta.json -- see _check_config_identity's docstring.
+    # lora_r/lora_alpha are the RESOLVED locals from _RunConfig (not a raw
+    # cfg.get), matching what wrap_model below is actually called with.
     config_hash = _config_hash(
-        cfg["model"], scheme_by_group, scheme_by_tensor, expert_config
+        cfg["model"], scheme_by_group, rc.lora_r, rc.lora_alpha,
+        scheme_by_tensor, expert_config,
     )
 
     model, tokenizer, loaded_from = _load_model_and_tokenizer(
