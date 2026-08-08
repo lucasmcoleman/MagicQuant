@@ -27,6 +27,7 @@ from typing import Dict, List, Any, Optional
 from pathlib import Path
 import collections
 import concurrent.futures
+import json
 import re
 import struct
 import os
@@ -62,8 +63,6 @@ _GGML_NAME_TO_BPW: Dict[str, float] = {
 # see that module's docstring). GGML_TYPE name kept for backward
 # compatibility (external references, e.g. tests/test_writer_tensor_overrides.py).
 GGML_TYPE = dict(ggml_facts.NAME_TO_ID)
-
-_GGML_TYPE_NAME = dict(ggml_facts.ID_TO_NAME)
 
 # GGUF metadata value-type tags. Derived from the installed `gguf` package's
 # own GGUFValueType enum (gguf.constants) rather than hand-typed ints — same
@@ -210,7 +209,6 @@ def _write_metadata_value(f, value: Any):
                 for item in norm:
                     _write_string(f, str(item))
     elif isinstance(value, dict):
-        import json
         f.write(struct.pack("<I", _GGUF_TYPE_STRING))
         _write_string(f, json.dumps(value))
     else:
@@ -308,10 +306,7 @@ def _encode_entry(source, entry, imatrix=None) -> bytes:
         # Passthrough: the bad_tensors gate in Pass 1 already confirmed the
         # desired type equals the source type, so there's nothing to decode
         # or re-encode -- just copy the tensor's exact on-disk bytes.
-        # getattr-guarded for duck-typed sources in tests that predate the
-        # read_tensor_raw() contract.
-        _read_raw_fn = getattr(source, "read_tensor_raw", None)
-        raw = _read_raw_fn(name) if _read_raw_fn is not None else None
+        raw = source.read_tensor_raw(name)
         if raw is None:
             raise RuntimeError(
                 f"Tensor {name}: passthrough (source type "
@@ -938,13 +933,7 @@ class GGUFWriter:
                 # Ask the source rather than testing the type name here: a
                 # GGUFSource opened with dequant enabled can also decode
                 # quantized types via libggml's dequantize_row_* kernels.
-                # getattr-guarded for duck-typed sources in tests that predate
-                # the can_decode() contract.
-                _can_decode_fn = getattr(source, "can_decode", None)
-                if _can_decode_fn is not None:
-                    can_decode = _can_decode_fn(name)
-                else:
-                    can_decode = source_type_name in ("F32", "F16", "BF16")
+                can_decode = source.can_decode(name)
                 if (
                     can_decode
                     and source_type_name not in ("F32", "F16", "BF16")
@@ -1019,12 +1008,12 @@ class GGUFWriter:
             #      asked to re-quantize to a different scheme — also an error,
             #      since MagicQuant requires high-precision source weights.
             bad_tensors = []
-            unknown_tensors = []
+            undecodable_source_tensors = []
             for entry in tensor_entries:
                 if not entry["_can_decode"]:
                     source_type = entry["_source_type_name"]
                     if source_type.startswith("UNKNOWN"):
-                        unknown_tensors.append((entry["name"], source_type))
+                        undecodable_source_tensors.append((entry["name"], source_type))
                         continue
                     # Recognized but pre-quantized: error only if the user
                     # wanted a different type than the source already is.
@@ -1042,9 +1031,9 @@ class GGUFWriter:
                     if desired_ggml_name != source_type:
                         bad_tensors.append((entry["name"], source_type, desired_ggml_name))
 
-            if unknown_tensors:
-                count = len(unknown_tensors)
-                first_name, first_type = unknown_tensors[0]
+            if undecodable_source_tensors:
+                count = len(undecodable_source_tensors)
+                first_name, first_type = undecodable_source_tensors[0]
                 raise ValueError(
                     f"Cannot encode {count} tensor(s) with an UNKNOWN/undecodable "
                     f"source type. First: '{first_name}' (source type '{first_type}'). "
@@ -1124,7 +1113,6 @@ class GGUFWriter:
                 self.metadata[k] = v
             self.metadata["magicquant.hybrid"] = True
             self.metadata["magicquant.base_quant"] = base_quant
-            import json
             self.metadata["magicquant.group_schemes"] = json.dumps(group_schemes)
 
             # Set general.file_type for llama.cpp compatibility.
@@ -1331,11 +1319,10 @@ class GGUFWriter:
                         break
                     if isinstance(item, Exception):
                         # Drain queue so worker thread can finish
-                        import queue as _queue_mod
                         while True:
                             try:
                                 result_q.get_nowait()
-                            except _queue_mod.Empty:
+                            except queue.Empty:
                                 break
                         worker.join(timeout=5)
                         raise item
@@ -1371,12 +1358,6 @@ class GGUFWriter:
                     # needed -- release lets _parallel_encode_iter admit
                     # the next one under the byte cap.
                     budget.release(footprint)
-
-    def set_metadata(self, key: str, value: Any):
-        self.metadata[key] = value
-
-    def get_metadata(self) -> Dict[str, Any]:
-        return self.metadata.copy()
 
 
 def create_hybrid_gguf(
