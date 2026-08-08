@@ -235,11 +235,17 @@ def _load_model_and_tokenizer(model_id: str, dtype=None):
         _log.info("Loaded %r with %s (dtype=%s).", model_id, cls_name, dtype)
         return model, _ensure_pad_and_template(tokenizer), model_id
 
-    _log.warning(
-        "Could not load %r with any auto-class (last error: %s); falling back to an "
-        "offline tiny LlamaForCausalLM (smoke/CI path).",
-        model_id, last_exc,
+    msg = (
+        f"Could not load {model_id!r} with any auto-class (last error: {last_exc}); "
+        "falling back to an offline tiny LlamaForCausalLM (smoke/CI path)."
     )
+    # Both _log.warning and print: this is a must-not-be-missed message --
+    # the run silently trains on a 2-layer toy model instead of the requested
+    # one and continues to completion -- and this file echoes those messages
+    # to stdout regardless of log level, since an unattended run's stdout is
+    # what actually gets captured and read.
+    _log.warning(msg)
+    print(f"WARNING: {msg}", flush=True)
     return _build_offline_tiny_model()
 
 
