@@ -11,7 +11,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from magicquant.logging import get_logger
 from magicquant.v2.allocate import Allocation, Choice, Unit, allocate
@@ -158,22 +158,8 @@ def _dominant_group_schemes(
     }
 
 
-def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
-    """Execute the v2 pipeline end to end. Returns the results dict (also
-    written to ``<output_dir>/v2_results.json``)."""
-    from magicquant.utils.llamacpp import LlamaCppTools
-
-    t_start = time.time()
-    out_dir = Path(cfg.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    budget_bytes = int(cfg.budget_gb * 1024**3)
-    failures: List[Dict[str, Any]] = []
-
-    tools = LlamaCppTools(cfg.llamacpp_path, data_file=cfg.data_file)
-    if cfg.measurement_chunks is not None:
-        tools.ppl_chunks = cfg.measurement_chunks
-
-    # ── 1. Baseline (never fabricated) ──
+def _measure_baseline(tools, cfg: V2Config) -> float:
+    """── 1. Baseline (never fabricated) ──"""
     log.info("v2: measuring baseline perplexity", stage="baseline")
     baseline_ppl = tools.calculate_perplexity(
         cfg.source_model_path, verbose=False
@@ -185,8 +171,13 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
             "baseline is meaningless — fix the llama.cpp build / corpus."
         )
     log.info("v2 baseline", stage="baseline", ppl=round(baseline_ppl, 4))
+    return baseline_ppl
 
-    # ── 2. imatrix (optional, loud when absent) ──
+
+def _resolve_imatrix_and_schemes(
+    tools, cfg: V2Config
+) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """── 2. imatrix (optional, loud when absent) ── + scheme selection."""
     imatrix = None
     if cfg.use_imatrix:
         from magicquant.imatrix import ensure_imatrix
@@ -211,9 +202,15 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
     if not schemes:
         raise RuntimeError("v2: empty scheme choice set after capability filtering")
     log.info("v2 choice set", stage="init", schemes=schemes)
+    return imatrix, schemes
 
-    # ── 3. Distortion table (CPU) ──
-    table = compute_distortion_table(
+
+def _build_distortion_table(
+    cfg: V2Config, schemes: List[str], imatrix: Optional[Dict[str, Any]],
+    out_dir: Path,
+) -> Dict[str, Any]:
+    """── 3. Distortion table (CPU) ──"""
+    return compute_distortion_table(
         cfg.source_model_path,
         schemes=schemes,
         imatrix=imatrix,
@@ -221,12 +218,25 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
         sample_rows=cfg.sample_rows,
     )
 
-    # ── 4. κ calibration ──
+
+def _calibrate_kappa(
+    tools, cfg: V2Config, table: Dict[str, Any],
+    imatrix: Optional[Dict[str, Any]], baseline_ppl: float, out_dir: Path,
+) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, MeasurementOutcome], Dict[str, float], List[Dict[str, Any]]]:
+    """── 4. κ calibration ──
+
+    Returns (kappa, kappa_provenance, probe_outcomes, eps_sums, failures).
+    probe_outcomes and eps_sums must both survive into the results/report-fit
+    phase — probe_outcomes carries the "__slice_baseline__"/
+    "__base_aggressive__" sentinel keys that phase 7's report fit and
+    cumulative-mode detection read directly.
+    """
     eps_sums = group_epsilon_sums(table, cfg.probe_scheme)
     groups = sorted(g for g, s in eps_sums.items() if s > 0)
     kappa: Dict[str, float] = {g: 1.0 for g in groups}
     kappa_provenance: Dict[str, str] = {g: "uncalibrated" for g in groups}
     probe_outcomes: Dict[str, MeasurementOutcome] = {}
+    failures: List[Dict[str, Any]] = []
     if cfg.group_probes and groups:
         probe_outcomes = run_group_probes(
             tools,
@@ -246,8 +256,19 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
         for g, o in probe_outcomes.items():
             if not o.ok and g not in ("__slice_baseline__", "__base_aggressive__"):
                 failures.append({"stage": "probe", "group": g, **o.to_json()})
+    return kappa, kappa_provenance, probe_outcomes, eps_sums, failures
 
-    # ── 5. Allocation + frontier ──
+
+def _allocate_frontier_and_anchors(
+    table: Dict[str, Any], kappa: Dict[str, float], cfg: V2Config,
+    budget_bytes: int,
+) -> Tuple[Allocation, List[Allocation], List[Dict[str, Any]]]:
+    """── 5. Allocation + frontier ──
+
+    ``chosen`` (the primary budget allocation) is allowed to raise
+    BudgetInfeasibleError uncaught — only the NEIGHBOR anchors are wrapped
+    in a try/except and recorded as failures.
+    """
     units = _build_units(table, kappa, cfg.floors)
     chosen = allocate(units, budget_bytes)
     log.info(
@@ -260,6 +281,7 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
 
     # Anchor allocations: the budget point plus neighbors on the frontier.
     anchor_allocs: List[Allocation] = [chosen]
+    failures: List[Dict[str, Any]] = []
     for i in range(1, max(1, cfg.anchors)):
         sign = -1 if i % 2 else 1
         step = (i + 1) // 2
@@ -271,14 +293,25 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
                 "stage": "anchor-allocate", "factor": factor,
                 "status": "failed", "error": str(exc),
             })
+    return chosen, anchor_allocs, failures
 
-    # ── 6. Build + verify anchors (full corpus; per-candidate failures
-    #       recorded, run continues) ──
+
+def _build_and_verify_anchors(
+    cfg: V2Config, tools, imatrix: Optional[Dict[str, Any]],
+    baseline_ppl: float, anchor_allocs: List[Allocation], out_dir: Path,
+) -> Tuple[List[Dict[str, Any]], Optional[str], List[Dict[str, Any]]]:
+    """── 6. Build + verify anchors (full corpus; per-candidate failures
+    recorded, run continues) ──
+
+    Raises RuntimeError if every anchor fails (never report an unverified
+    allocation).
+    """
     from magicquant.gguf.writer import create_hybrid_gguf
 
     stem = cfg.model_name or Path(cfg.source_model_path).stem
     measured_anchors: List[Dict[str, Any]] = []
     final_model_path: Optional[str] = None
+    failures: List[Dict[str, Any]] = []
     for idx, alloc in enumerate(anchor_allocs):
         gb = alloc.total_bytes / 1024**3
         tag = "budget" if idx == 0 else f"n{idx}"
@@ -339,7 +372,18 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
             "'failures' in v2_results.json for per-anchor errors."
         )
 
-    # ── 7. Report calibration + results ──
+    return measured_anchors, final_model_path, failures
+
+
+def _compute_report_fit(
+    measured_anchors: List[Dict[str, Any]],
+    probe_outcomes: Dict[str, MeasurementOutcome],
+    kappa: Dict[str, float],
+    eps_sums: Dict[str, float],
+    baseline_ppl: float,
+) -> Optional[Tuple[float, float]]:
+    """First half of ── 7. Report calibration + results ── — the reporting
+    fit alone, independently of results-dict assembly."""
     fit_points = [
         (a["predicted_loss"], a["measured_rel_loss"])
         for a in measured_anchors
@@ -361,8 +405,20 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
                     (kappa[g] * eps_sums[g],
                      max((o.value - probe_baseline) / probe_baseline, 0.0))
                 )
-    report_fit = affine_report_fit(fit_points)
+    return affine_report_fit(fit_points)
 
+
+def _assemble_results(
+    cfg: V2Config, tools, out_dir: Path, budget_bytes: int, t_start: float,
+    baseline_ppl: float, imatrix: Optional[Dict[str, Any]], schemes: List[str],
+    table: Dict[str, Any], kappa: Dict[str, float],
+    kappa_provenance: Dict[str, str], eps_sums: Dict[str, float],
+    chosen: Allocation, measured_anchors: List[Dict[str, Any]],
+    final_model_path: Optional[str], failures: List[Dict[str, Any]],
+    report_fit: Optional[Tuple[float, float]],
+) -> Dict[str, Any]:
+    """Second half of ── 7. Report calibration + results ── — results-dict
+    assembly, the three file writes, and completion logging."""
     frontier_json = [p.to_json() for p in chosen.frontier]
     results = {
         "version": 2,
@@ -422,6 +478,54 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
         seconds=results["seconds"],
     )
     return results
+
+
+def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
+    """Execute the v2 pipeline end to end. Returns the results dict (also
+    written to ``<output_dir>/v2_results.json``)."""
+    from magicquant.utils.llamacpp import LlamaCppTools
+
+    t_start = time.time()
+    out_dir = Path(cfg.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    budget_bytes = int(cfg.budget_gb * 1024**3)
+    failures: List[Dict[str, Any]] = []
+
+    # Single LlamaCppTools instance threaded through every phase below —
+    # load-bearing for two mechanisms: _resolve_data_file's corpus pin
+    # (checked in _assemble_results) and run_group_probes' ppl_chunks
+    # save/restore (_calibrate_kappa), neither of which would work with a
+    # freshly-constructed instance per phase.
+    tools = LlamaCppTools(cfg.llamacpp_path, data_file=cfg.data_file)
+    if cfg.measurement_chunks is not None:
+        tools.ppl_chunks = cfg.measurement_chunks
+
+    baseline_ppl = _measure_baseline(tools, cfg)
+    imatrix, schemes = _resolve_imatrix_and_schemes(tools, cfg)
+    table = _build_distortion_table(cfg, schemes, imatrix, out_dir)
+    kappa, kappa_provenance, probe_outcomes, eps_sums, probe_failures = (
+        _calibrate_kappa(tools, cfg, table, imatrix, baseline_ppl, out_dir)
+    )
+    failures.extend(probe_failures)
+    chosen, anchor_allocs, anchor_allocate_failures = (
+        _allocate_frontier_and_anchors(table, kappa, cfg, budget_bytes)
+    )
+    failures.extend(anchor_allocate_failures)
+    measured_anchors, final_model_path, anchor_failures = (
+        _build_and_verify_anchors(
+            cfg, tools, imatrix, baseline_ppl, anchor_allocs, out_dir
+        )
+    )
+    failures.extend(anchor_failures)
+
+    report_fit = _compute_report_fit(
+        measured_anchors, probe_outcomes, kappa, eps_sums, baseline_ppl
+    )
+    return _assemble_results(
+        cfg, tools, out_dir, budget_bytes, t_start, baseline_ppl, imatrix,
+        schemes, table, kappa, kappa_provenance, eps_sums, chosen,
+        measured_anchors, final_model_path, failures, report_fit,
+    )
 
 
 def _atomic_write_json(path: Path, obj: Any) -> None:
