@@ -687,19 +687,20 @@ def main() -> None:
         help="Run evolutionary search for optimal configurations",
     )
     search_parser.add_argument("model", help="Path to source GGUF model (BF16/F16)")
+    # Defaults are None so we can detect "not provided on CLI" and fall back to
+    # MagicQuantSettings (env / .env / config defaults: ./output output dir,
+    # MXFP4_MOE target quant, 30 generations, 80 population). An explicit CLI
+    # value always overrides the settings value.
     search_parser.add_argument(
         "--output-dir",
-        default="./output",
-        help="Output directory (default: ./output)",
+        default=None,
+        help="Output directory (default: MAGICQUANT_OUTPUT_DIR or ./output)",
     )
     search_parser.add_argument(
         "--target-quant",
-        default="MXFP4_MOE",
-        help="Target base quantization (default: MXFP4_MOE)",
+        default=None,
+        help="Target base quantization (default: MAGICQUANT_TARGET_BASE_QUANT or MXFP4_MOE)",
     )
-    # Defaults are None so we can detect "not provided on CLI" and fall back to
-    # MagicQuantSettings (env / .env / config defaults: 30 generations, 80
-    # population). An explicit CLI value always overrides the settings value.
     search_parser.add_argument(
         "--generations",
         type=int,

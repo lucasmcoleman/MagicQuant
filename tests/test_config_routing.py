@@ -6,6 +6,7 @@ truth for defaults (30/80).
 """
 import argparse
 import json
+import sys
 
 import pytest
 
@@ -306,6 +307,52 @@ def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
     assert "kl_weight" not in call
     assert "write_calibration" not in call
     assert "enable_speed_bench" not in call
+
+
+# ── search subparser real-argparse routing ──────────────────────────────────
+# Regression test for a bug where search_parser's own --output-dir/--target-quant
+# argparse defaults ("./output" / "MXFP4_MOE", non-None) always won inside
+# _maybe(), so MAGICQUANT_OUTPUT_DIR / MAGICQUANT_TARGET_BASE_QUANT could never
+# reach MagicQuantSettings for `search`. _args()/_search_args() above build a
+# Namespace by hand with output_dir=None/target_quant=None and so cannot catch
+# this class of bug -- this test builds the real parser via cli.main() instead.
+
+
+def test_search_real_parser_env_and_flag_output_dir_target_quant(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "magicquant.orchestrator.MagicQuantOrchestrator", _FakeSearchOrchestrator
+    )
+
+    env_out = tmp_path / "env_out"
+    monkeypatch.setenv("MAGICQUANT_OUTPUT_DIR", str(env_out))
+    monkeypatch.setenv("MAGICQUANT_TARGET_BASE_QUANT", "Q6_K")
+
+    # No --output-dir / --target-quant on the CLI -> env vars must resolve.
+    monkeypatch.setattr(
+        sys, "argv", ["magicquant", "search", "/tmp/base.gguf", "--rounds", "0"]
+    )
+    cli.main()
+
+    orch = _FakeSearchOrchestrator.last
+    assert orch is not None
+    assert orch.kwargs["output_dir"] == str(env_out)
+    assert orch.full_calls[0]["target_base_quant"] == "Q6_K"
+
+    # Explicit CLI flags still win over the env vars.
+    cli_out = tmp_path / "cli_out"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--rounds", "0",
+            "--output-dir", str(cli_out), "--target-quant", "Q4_K_M",
+        ],
+    )
+    cli.main()
+
+    orch2 = _FakeSearchOrchestrator.last
+    assert orch2.kwargs["output_dir"] == str(cli_out)
+    assert orch2.full_calls[0]["target_base_quant"] == "Q4_K_M"
 
 
 # ── cmd_generate routing (M5 finish) ────────────────────────────────────────
