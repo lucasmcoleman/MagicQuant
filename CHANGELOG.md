@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+Systematic behavior-preserving cleanup pass in progress on branch `cleanup/2026-08` (plan and audit trail: `docs/cleanup-2026-08-plan.md`). Entries are appended per commit and record files touched and how the change was verified.
+
+## [0.3.0] - 2026-06-09
+
+*Backfills everything shipped since the 0.2.0 entry below. `pyproject.toml`'s version jumped straight from 0.1.0 to 0.3.0 in the commit dated here; no further version bump has landed since, so this single entry also covers work that kept shipping under 0.3.0 through 2026-08-07, the day before the cleanup branch started.*
+
+### Added
+- **Sub-4-bit IQ-quant family** (PR3): `IQ4_XS`/`IQ3_S`/`IQ3_XXS`/`IQ2_S`/`IQ2_XS`/`IQ2_XXS`/`IQ1_M`/`IQ1_S` added to the scheme registry, opt-in via `enable_iq` so the default search and its seed-42 regression fixture are unaffected; per-scheme `requires_imatrix` is read from the real libggml rather than guessed.
+- **imatrix support** (PR4): `magicquant imatrix` captures an importance matrix via `llama-imatrix`; `create_hybrid_gguf(..., imatrix=...)` threads per-tensor importance vectors (true row width) into the encoder; Pass 1 hard-errors when a target type requires an imatrix but none was given; calibration and evaluation corpora are asserted disjoint.
+- **v2 budget search** (`--algo v2`, `docs/redesign.md`): per-tensor × per-scheme distortion table (imatrix-weighted encode+decode through libggml), optional group-probe κ fitting, and an exact multiple-choice-knapsack allocator (`v2/allocate.py`) emitting the full predicted quality-size frontier in one solve; `--target-profile q4nx` restricts choices to NPU-packable schemes.
+- **QAT-LoRA** (`magicquant qat`, `docs/qat.md`): fake-quant + straight-through-estimator training (`qat/fake_quant.py`) covering BF16/Q8_0/MXFP4/Q4_K/Q5_K/Q6_K/Q3_K/Q2_K/IQ4_NL, `QATLinear` expert-aware wrapping with `live`/`frozen` expert-quant modes, and a merge pipeline (`merge_qat_adapters`) back to a byte-identical GGUF pack.
+- Validated end-to-end: QAT recovers 38.1% of quantization loss in the real shipped GGUF pack (B 12.56 / Q 14.21 / QT 11.94 / BT 10.92 PPL); `frozen` mode recovers roughly 55% of `live`'s recovery at about half the compute.
+- **ROCmFPX fork schemes**: AMD-native `ROCMFP3/4/6/8` (ggml ids 100-104) registered opt-in via `enable_rocmfpx`; `ggml_binding` probes fork support by type name so a stock libggml raises a clear error instead of silently misencoding.
+
+### Changed
+- **libggml binding rewrite**: deleted ~850 lines of pure-Python K-quant encoders; every quantized type now routes through a ctypes binding calling `ggml_quantize_chunk` — the same function `llama-quantize` uses — proven byte-identical by a new encoder-parity test suite (`tests/integration/test_encoder_parity.py`).
+- **Measured-search hardening**: added checkpoint/resume for long measured-search runs; `SensitivityProber(strict=True)` now raises `ProbeMeasurementError` on a failed probe instead of silently poisoning the run with heuristic sensitivities; probes measure against Q8_0 rather than BF16 and are scored by KL divergence against saved reference logits rather than raw perplexity.
+- **KL probe/objective split**: `probe_kl` (default on) now gates KL-scored sensitivity probing independently of `enable_kl`, which alone controls the measured-search objective blend; falls back to PPL probing when logit capture isn't possible.
+
 ## [0.2.0] - 2026-04-03 — Production Hardening
 
 ### Bug Fixes
@@ -23,3 +44,19 @@
   - Extracted `_parse_perplexity_output()` as a standalone function for testability.
 - **Pathlib conversion**: Replaced `os.path.join()`, `os.path.exists()`, `os.path.isfile()`, `os.path.getsize()`, `os.makedirs()`, and `os.remove()` with `pathlib.Path` operations in `orchestrator.py`, `writer.py`, `llamacpp.py`, and `__main__.py`. Public APIs still accept `str` paths.
 - **Dependencies**: Added `pydantic-settings>=2.0.0`, `structlog>=24.0.0`, `tenacity>=8.2.0`, `python-dotenv>=1.0.0` to core deps. Added `pytest-asyncio>=0.21.0` to dev deps.
+
+## Future work
+
+Surfaced by the 2026-08 cleanup audit but out of scope for a behavior-preserving pass — each needs its own design decision or investigation before anything touches it:
+
+- Atomic-publish (temp-file + `os.replace`) crash-safety is implemented separately 7 times across 4 subsystems, 3-way diverged — needs one shared implementation.
+- Two diverged dequant-symbol tables exist in the codebase and need reconciling into one.
+- Safetensors shard discovery is implemented twice and needs folding into one.
+- "Load `search_results.json` tier" logic is duplicated across 3 call sites and needs unifying.
+- Config-signature computation is duplicated across 6 sites and needs unifying.
+- The `tests/` tree itself (19.3k LOC) was never audited for dead code or duplication in this pass.
+- `run_full_search` constructs its `SensitivityProber` WITHOUT `parameter_counts` — a real behavioral divergence between the measured-search and prediction-only paths (possible bug, needs investigation).
+- A latent interaction between v2's `--target-profile q4nx` and `probe_scheme` was found during verification (possible bug, needs investigation).
+- v2's scheme filter is missing v1's `IMATRIX_DEPENDENT_SCHEME_NAMES` gate, which compounds with an imatrix probe-cache issue fixed elsewhere in this cleanup pass.
+- `SensitivityProber`'s `baseline_ppl_err` field is structurally unreachable.
+- A handful of additional lower-priority items were discussed during the audit but not individually written up (see `docs/cleanup-2026-08-plan.md` for the full notes).
