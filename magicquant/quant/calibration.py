@@ -57,6 +57,25 @@ def _reset_cache() -> None:
     _source_cache.clear()
 
 
+def _read_json_dict_tolerant(path: Union[str, Path]) -> Dict[str, dict]:
+    """Read `path` as a JSON dict, tolerating a missing/unreadable file or
+    malformed JSON by returning {} instead of raising. A well-formed but
+    non-dict top-level JSON value (e.g. a bare list) is likewise normalized
+    to {}.
+
+    Shared read body for `_load` and `_load_source` below -- the two
+    functions differ only in which Path they read and which (deliberately
+    separate, see module docstring) cache they populate.
+    """
+    try:
+        data = json.loads(Path(path).read_text())
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    return data
+
+
 def _load() -> Dict[str, dict]:
     """Load and cache the calibration results dict from the default
     `_CALIBRATION_PATH`.
@@ -68,15 +87,7 @@ def _load() -> Dict[str, dict]:
     if _cache is not None:
         return _cache
 
-    try:
-        raw = _CALIBRATION_PATH.read_text()
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            data = {}
-    except (OSError, ValueError):
-        data = {}
-
-    _cache = data
+    _cache = _read_json_dict_tolerant(_CALIBRATION_PATH)
     return _cache
 
 
@@ -91,14 +102,7 @@ def _load_source(source_path: Union[str, Path]) -> Dict[str, dict]:
     if key in _source_cache:
         return _source_cache[key]
 
-    try:
-        raw = Path(source_path).read_text()
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            data = {}
-    except (OSError, ValueError):
-        data = {}
-
+    data = _read_json_dict_tolerant(source_path)
     _source_cache[key] = data
     return data
 

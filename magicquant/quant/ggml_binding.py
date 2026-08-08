@@ -159,20 +159,29 @@ def _check_dir(d: Path) -> Optional[Tuple[Path, Path]]:
 
 
 # ── Block format size tables ────────────────────────────────────────
-# Used to compute output buffer size for ctypes calls. Derived from
-# magicquant.quant.ggml_facts (stock from the `gguf` package, fork overlay
-# from ggml_facts.FORK_TYPES) — see that module's docstring. Names kept
-# here as aliases since this module's tests reference them directly.
+# Used by _cross_check_block_type_sizes (below) to validate the loaded
+# libggml against ggml_facts, and kept as re-exports for backward-compatible
+# direct imports (this module's own tests read _GGML_BLOCK_SIZE/
+# _GGML_TYPE_SIZE by name). They no longer feed _expected_size's arithmetic
+# below, which now goes straight through ggml_facts.expected_size (reading
+# ggml_facts.BLOCK_SIZE/TYPE_SIZE directly). Any overlay/correction belongs
+# in ggml_facts, never bolted onto these local copies: a hand-edit here
+# would be silently ignored by _expected_size.
 _GGML_BLOCK_SIZE = dict(ggml_facts.BLOCK_SIZE)
 _GGML_TYPE_SIZE = dict(ggml_facts.TYPE_SIZE)
 
 
 def _expected_size(ggml_type: str, n_elements: int) -> int:
-    """Return expected output byte count for a quantized tensor."""
-    block = _GGML_BLOCK_SIZE.get(ggml_type, 1)
-    type_sz = _GGML_TYPE_SIZE.get(ggml_type, 2)
-    n_blocks = (n_elements + block - 1) // block
-    return n_blocks * type_sz
+    """Return expected output byte count for a quantized tensor.
+
+    Thin delegate to ggml_facts.expected_size. Kept as a real module-level
+    function -- not inlined at its call sites, not bound as a default arg,
+    not a staticmethod/closure -- because tests/test_security_bounds.py
+    monkeypatches ``ggml_binding._expected_size`` by name; the call sites
+    below resolve this name via a bare global lookup at call time, which is
+    what makes that monkeypatch work.
+    """
+    return ggml_facts.expected_size(ggml_type, n_elements)
 
 
 # ── Dequantize row symbol table (synced with ggml/src/ggml-quants.h /
@@ -214,6 +223,7 @@ class _LibggmlHandle:
         self.rocmfpx_supported: frozenset = self._probe_rocmfpx()
         self._verify_type_ids()
         self._cross_check_block_type_sizes()
+        self._cross_check_requires_imatrix()
         self._dequant_fn_cache: dict = {}
         # Initialize all type tables (-1 = init all). Required for IQ-quants
         # which use precomputed grid tables.
@@ -382,6 +392,53 @@ class _LibggmlHandle:
                     "says %d. Investigate before trusting offset math for "
                     "this type.",
                     name, type_id, expected_size, self._base_path, actual_size,
+                )
+
+    def _cross_check_requires_imatrix(self) -> None:
+        """One-time, LOG-ONLY cross-check of each registered scheme's static
+        ``requires_imatrix`` field (magicquant.quant.schemes) against this
+        handle's LIVE ``requires_imatrix()`` answer (the real
+        ggml_quantize_requires_imatrix call).
+
+        Deliberately soft, same rationale as ``_cross_check_block_type_sizes``
+        above: a requires_imatrix mismatch cannot corrupt output bytes --
+        writer.py's hard error gate already reads the LIVE value (via
+        ``requires_imatrix`` below), so it stays correct by construction even
+        under drift. The only consequence of drift is an over- or under-
+        inclusive search pool, since survival.py / v2/search.py filter their
+        candidate pool on the STATIC field. A hard raise here, mirroring
+        ``_verify_type_ids``, would kill ALL encoding -- including every
+        scheme with no imatrix relationship at all -- over what is at worst a
+        search-pool-quality issue, so this follows the log-only pattern
+        instead.
+
+        Compared per SCHEME, not per ggml type: several schemes share a
+        ggml_type_name (e.g. MXFP4_MOE -> MXFP4, Q4_K_M -> Q4_K), and each
+        scheme's static field is an independently-settable fact that could be
+        wrong on its own.
+
+        ROCmFPX fork types are safe to include unconditionally here: this
+        handle's own ``requires_imatrix()`` method already short-circuits to
+        False for a fork type the loaded libggml doesn't support, so an
+        out-of-range id is never forwarded to ggml_quantize_requires_imatrix.
+        """
+        from magicquant.quant.schemes import get_all_schemes
+
+        for scheme in get_all_schemes():
+            static = scheme.requires_imatrix
+            live = self.requires_imatrix(scheme.ggml_type_name)
+            if static != live:
+                logger.warning(
+                    "requires_imatrix drift: scheme '%s' (ggml_type=%s) has "
+                    "static requires_imatrix=%s in schemes.py, but the "
+                    "loaded libggml (%s) reports %s. The search's exclusion "
+                    "list (survival.py / v2/search.py, which trust the "
+                    "static field) may now disagree with the writer's real "
+                    "hard gate (which trusts the live value and stays "
+                    "correct regardless of this drift). Investigate before "
+                    "trusting the static field for this scheme.",
+                    scheme.name, scheme.ggml_type_name, static,
+                    self._base_path, live,
                 )
 
     def supports(self, ggml_type: str) -> bool:

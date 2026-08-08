@@ -30,16 +30,24 @@ from magicquant.quant import ggml_facts
 # stock table too, since the `gguf` package publishes them directly.
 # ---------------------------------------------------------------------------
 
+# NOTE: these two tables are re-exports kept for backward-compatible direct
+# imports (e.g. `from converters import GGML_BLOCK_SIZE`) -- they no longer
+# feed ggml_tensor_data_size's arithmetic below, which now goes straight
+# through ggml_facts.expected_size (reading ggml_facts.BLOCK_SIZE/TYPE_SIZE
+# directly). Any overlay/correction belongs in ggml_facts, never bolted onto
+# these local copies: a hand-edit here would be silently ignored by
+# ggml_tensor_data_size.
 GGML_BLOCK_SIZE = dict(ggml_facts.BLOCK_SIZE)
 GGML_TYPE_SIZE = dict(ggml_facts.TYPE_SIZE)
 
 
 def ggml_tensor_data_size(ggml_type_name: str, n_elements: int) -> int:
-    """Return the byte-size of tensor data for a given ggml type and element count."""
-    block_size = GGML_BLOCK_SIZE.get(ggml_type_name, 1)
-    type_size = GGML_TYPE_SIZE.get(ggml_type_name, 2)
-    n_blocks = (n_elements + block_size - 1) // block_size
-    return n_blocks * type_size
+    """Return the byte-size of tensor data for a given ggml type and element count.
+
+    Thin delegate to ggml_facts.expected_size -- see that function's
+    docstring for the shared arithmetic and fallback-default rationale.
+    """
+    return ggml_facts.expected_size(ggml_type_name, n_elements)
 
 
 # ── Float-format encoders (native; no ggml needed) ──────────────────

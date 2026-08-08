@@ -23,6 +23,7 @@ Exports:
     TYPE_SIZE  : name -> encoded bytes per block       (stock + fork)
     FORK_TYPES : the ONE fork-only registry (id/block/size/registered_name)
     ROCMFPX_TYPE_NAMES : frozenset of fork type names
+    expected_size : name x n_elements -> encoded byte size (the ONE size formula)
 
 Fail-safe: if `gguf` cannot be imported, this module raises ImportError at
 import time (the normal Python behavior for a missing hard dependency) —
@@ -240,3 +241,31 @@ TYPE_SIZE.update({name: info["size"] for name, info in FORK_TYPES.items()})
 # revisit ggml_binding.py's _verify_type_ids docstring, which still
 # describes the pre-override state.
 TYPE_SIZE["Q8_1"] = 36
+
+# ---------------------------------------------------------------------------
+# Encoded-byte-size arithmetic: single canonical body.
+#
+# magicquant.quant.converters.ggml_tensor_data_size (Pass-1 GGUF offset math)
+# and magicquant.quant.ggml_binding._expected_size (ctypes output-buffer
+# sizing) used to each hand-roll this exact ceil-div computation over their
+# own module-local copies of BLOCK_SIZE/TYPE_SIZE. Both are now thin
+# delegates to this function, so the writer's offset math and the encoder's
+# buffer-size math are structurally the same computation rather than two
+# independently-maintained copies that happen to agree today.
+# ---------------------------------------------------------------------------
+
+def expected_size(name: str, n_elements: int) -> int:
+    """Return the encoded byte size for `n_elements` scalars of ggml type
+    `name`.
+
+    Fallback defaults are semantic, not sloppy: an unrecognized type name is
+    treated as block=1 (no blocking) / type_size=2 bytes/element (F16-like).
+    Do NOT tighten this to a KeyError -- this reproduces the exact fallback
+    behavior of the two pre-fold copies (converters.ggml_tensor_data_size and
+    ggml_binding._expected_size), and a behavior-preserving fold must keep it
+    even though no current caller is known to hit it.
+    """
+    block_size = BLOCK_SIZE.get(name, 1)
+    type_size = TYPE_SIZE.get(name, 2)
+    n_blocks = (n_elements + block_size - 1) // block_size
+    return n_blocks * type_size
