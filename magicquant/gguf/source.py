@@ -1078,40 +1078,19 @@ def _detect_tokenizer_pre(tok_json: Dict[str, Any]):
     return None
 
 
-def _build_tokenizer_metadata(
-    model_dir: str, arch: str = "", config: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """
-    Read tokenizer data from a HuggingFace model directory and return
-    GGUF-compatible tokenizer metadata.
+def _extract_tokenizer_vocab(
+    tok: Dict[str, Any], arch: str, config: Optional[Dict[str, Any]], model_dir: str,
+) -> Tuple[Dict[str, Any], Any, Any]:
+    """Extract tokenizer.ggml.model/pre, the vocab (tokens/scores/token_type,
+    including config.json vocab_size padding and the config.json-derived
+    bos_token_id), and merges. Extracted verbatim from
+    _build_tokenizer_metadata's tokenizer.json vocab-extraction section.
 
-    Handles the common case: BPE tokenizer from tokenizer.json
-    (covers LLaMA, Qwen, Mistral, GPT-NeoX, Falcon, etc.).
-
-    Args:
-        arch: GGUF architecture string, used only to disambiguate
-            ``tokenizer.ggml.pre`` for qwen35/qwen35moe (see below --
-            regex matching alone can't tell it apart from qwen2).
-        config: Already-parsed config.json contents, if the caller has
-            one (e.g. SafetensorsSource._ensure_loaded, which reads
-            config.json before this is called). When given, skips this
-            function's own config.json read. Pass ``{}`` (not None) to
-            represent "config.json does not exist" -- an empty dict
-            resolves through the same effective-config/vocab_size/
-            bos_token_id lookups as a missing file and yields identical
-            metadata. Leave as ``None`` (the default) to preserve the
-            original read-from-disk behavior.
+    Returns (meta, vocab, added): ``vocab`` (post BPE/Unigram-rebind) and
+    ``added`` (added_tokens) are threaded on to _resolve_special_tokens,
+    which needs them to build its own token->id lookup.
     """
     meta: Dict[str, Any] = {}
-
-    # ── tokenizer.json (BPE vocab + merges) ──
-    tokenizer_path = os.path.join(model_dir, "tokenizer.json")
-    if not os.path.exists(tokenizer_path):
-        return meta
-
-    with open(tokenizer_path, encoding="utf-8") as f:
-        tok = json.load(f)
-
     model_info = tok.get("model", {})
     tok_type = model_info.get("type", "BPE")
 
@@ -1168,6 +1147,20 @@ def _build_tokenizer_metadata(
         # special tokens at 248044+).  Also, config.json vocab_size may be
         # larger still (padding for alignment).  Allocate enough room for
         # all of them.
+        #
+        # NOTE: `added` is bound ONLY inside this `if vocab:` block, same as
+        # HEAD's pre-decomposition single function. This function's `return
+        # meta, vocab, added` below unconditionally references it, so an
+        # empty/falsy vocab makes THIS function raise UnboundLocalError at
+        # its own return statement -- a pre-existing latent bug, not touched
+        # or fixed here. Decomposition widened its reach: HEAD only hit this
+        # when the vocab was empty AND tokenizer_config.json existed (the
+        # only place `added` was read downstream); now it fires whenever the
+        # vocab is empty, tokenizer_config.json or not, because `added` must
+        # cross this function's return boundary to reach
+        # _resolve_special_tokens. See the CHANGELOG "Decomposed two more
+        # god-functions" entry for the accepted-edge-case disclosure -- no
+        # real BPE/Unigram tokenizer.json ships an empty vocab.
         added = tok.get("added_tokens", [])
         if added:
             max_added_id = max(at.get("id", -1) for at in added)
@@ -1195,7 +1188,10 @@ def _build_tokenizer_metadata(
             # is absent (it lives under text_config, already merged into
             # _eff above) and was previously dropped entirely, leaving
             # llama.cpp to default BOS to token 0. Emit generically for any
-            # arch that has it.
+            # arch that has it. This is the FIRST of two bos_token_id
+            # writes -- _resolve_special_tokens's tokenizer_config.json
+            # bos_token write is the second and takes priority when it
+            # resolves (see the comment there).
             bos_id = _eff.get("bos_token_id")
             if bos_id is not None:
                 meta["tokenizer.ggml.bos_token_id"] = int(bos_id)
@@ -1230,49 +1226,111 @@ def _build_tokenizer_metadata(
     if merges:
         meta["tokenizer.ggml.merges"] = _normalize_merges(merges)
 
-    # ── tokenizer_config.json (special token IDs) ──
-    config_path = os.path.join(model_dir, "tokenizer_config.json")
-    if os.path.exists(config_path):
-        with open(config_path, encoding="utf-8") as f:
-            tok_cfg = json.load(f)
+    return meta, vocab, added
 
-        # Map special token config keys to GGUF metadata keys
-        special_map = {
-            "bos_token": "tokenizer.ggml.bos_token_id",
-            "eos_token": "tokenizer.ggml.eos_token_id",
-            "pad_token": "tokenizer.ggml.padding_token_id",
-            "unk_token": "tokenizer.ggml.unknown_token_id",
-        }
 
-        # Build a complete token->id lookup including added tokens
-        # (special tokens like <|im_end|> are often only in added_tokens,
-        # not in the base BPE vocab)
-        all_token_ids = dict(vocab)
-        for at in added:
-            content = at.get("content", "")
-            tid = at.get("id", -1)
-            if content and tid >= 0:
-                all_token_ids[content] = tid
+_NO_TOKENIZER_CFG = object()
+# Sentinel distinguishing "tokenizer_config.json does not exist" from "it
+# exists and parses to JSON null" (tok_cfg is then a real ``None``). HEAD's
+# original single-function code only ever entered its special-token/chat-
+# template block behind ``if os.path.exists(config_path):`` -- a present-
+# but-null file got in, then crashed with AttributeError the first time it
+# called ``tok_cfg.get(...)``. Using bare ``None`` as the "absent" default
+# here would conflate the two cases and turn that crash into a silent
+# skip. _build_tokenizer_metadata passes this sentinel when the file is
+# absent; _resolve_special_tokens/_resolve_chat_template check identity
+# against it (not ``is None``) so a real ``None`` still falls through to
+# ``.get()`` and raises exactly as before.
 
-        for hf_key, gguf_key in special_map.items():
-            val = tok_cfg.get(hf_key)
-            if val is None:
-                continue
-            # Value can be a string or a dict with "content" key
-            if isinstance(val, dict):
-                val = val.get("content", "")
-            if isinstance(val, str) and val in all_token_ids:
-                meta[gguf_key] = all_token_ids[val]
 
-        # Whether to prepend BOS at tokenization time. llama.cpp otherwise
-        # applies its own per-arch default (often True), which silently corrupts
-        # perplexity for models that don't use BOS (e.g. Qwen has it False).
-        if "add_bos_token" in tok_cfg:
-            meta["tokenizer.ggml.add_bos_token"] = bool(tok_cfg["add_bos_token"])
-        if "add_eos_token" in tok_cfg and tok_cfg["add_eos_token"] is not None:
-            meta["tokenizer.ggml.add_eos_token"] = bool(tok_cfg["add_eos_token"])
+def _resolve_special_tokens(
+    tok_cfg: Any, vocab: Any, added: Any,
+) -> Dict[str, Any]:
+    """Resolve bos/eos/pad/unk token ids and add_bos_token/add_eos_token
+    from tokenizer_config.json. Extracted verbatim from
+    _build_tokenizer_metadata's special-token-resolution section (the
+    ``if os.path.exists(config_path):`` block, minus the chat_template
+    read now in _resolve_chat_template). ``vocab``/``added`` are
+    _extract_tokenizer_vocab's return values, needed to build the
+    token->id lookup here. ``tok_cfg`` is the parsed tokenizer_config.json
+    contents, ``_NO_TOKENIZER_CFG`` if the file doesn't exist, or ``None``
+    if it exists and parses to JSON null (see ``_NO_TOKENIZER_CFG``'s
+    docstring -- that case is NOT skipped, it falls through to ``.get()``
+    and raises, matching HEAD).
+    """
+    meta: Dict[str, Any] = {}
+    if tok_cfg is _NO_TOKENIZER_CFG:
+        return meta
 
-        # Chat template
+    # Map special token config keys to GGUF metadata keys
+    special_map = {
+        "bos_token": "tokenizer.ggml.bos_token_id",
+        "eos_token": "tokenizer.ggml.eos_token_id",
+        "pad_token": "tokenizer.ggml.padding_token_id",
+        "unk_token": "tokenizer.ggml.unknown_token_id",
+    }
+
+    # Build a complete token->id lookup including added tokens
+    # (special tokens like <|im_end|> are often only in added_tokens,
+    # not in the base BPE vocab)
+    all_token_ids = dict(vocab)
+    for at in added:
+        content = at.get("content", "")
+        tid = at.get("id", -1)
+        if content and tid >= 0:
+            all_token_ids[content] = tid
+
+    # bos_token_id double-write, priority is INTENTIONAL: this is the
+    # SECOND write. The first write is _extract_tokenizer_vocab's
+    # config.json-derived tokenizer.ggml.bos_token_id, above/before this
+    # function runs. Here, tokenizer_config.json's bos_token OVERWRITES it
+    # -- takes priority over the config.json value, the same way the
+    # qwen35 rope_theta override takes priority over the generic
+    # field_map (see _build_gguf_metadata_from_config). The overwrite is
+    # conditional, not unconditional: it only fires when bos_token
+    # resolves to a known id below (`val in all_token_ids`); if it doesn't
+    # (e.g. Qwen's tokenizer_config.json has bos_token: null), this loop
+    # skips it and the config.json value from the first write survives.
+    for hf_key, gguf_key in special_map.items():
+        val = tok_cfg.get(hf_key)
+        if val is None:
+            continue
+        # Value can be a string or a dict with "content" key
+        if isinstance(val, dict):
+            val = val.get("content", "")
+        if isinstance(val, str) and val in all_token_ids:
+            meta[gguf_key] = all_token_ids[val]
+
+    # Whether to prepend BOS at tokenization time. llama.cpp otherwise
+    # applies its own per-arch default (often True), which silently corrupts
+    # perplexity for models that don't use BOS (e.g. Qwen has it False).
+    if "add_bos_token" in tok_cfg:
+        meta["tokenizer.ggml.add_bos_token"] = bool(tok_cfg["add_bos_token"])
+    if "add_eos_token" in tok_cfg and tok_cfg["add_eos_token"] is not None:
+        meta["tokenizer.ggml.add_eos_token"] = bool(tok_cfg["add_eos_token"])
+
+    return meta
+
+
+def _resolve_chat_template(
+    model_dir: str, tok_cfg: Any,
+) -> Dict[str, Any]:
+    """Resolve tokenizer.chat_template from tokenizer_config.json, then the
+    standalone chat_template.jinja/.json file fallbacks, then warn if a
+    template file exists but yielded nothing. Extracted verbatim from
+    _build_tokenizer_metadata's chat-template section (the chat_template
+    read out of the same ``if os.path.exists(config_path):`` block as
+    _resolve_special_tokens, plus the two file-based fallbacks and the
+    warn-if-nothing-emitted check). ``tok_cfg`` -- see _NO_TOKENIZER_CFG's
+    docstring for the file-absent-vs-null distinction; in practice a real
+    ``None`` never reaches here because _resolve_special_tokens (called
+    first by _build_tokenizer_metadata) already raises AttributeError on
+    it, matching HEAD.
+    """
+    meta: Dict[str, Any] = {}
+
+    # Chat template
+    if tok_cfg is not _NO_TOKENIZER_CFG:
         chat_template = tok_cfg.get("chat_template")
         if isinstance(chat_template, list):
             # Find the "default" template, or use the first one
@@ -1324,6 +1382,56 @@ def _build_tokenizer_metadata(
     return meta
 
 
+def _build_tokenizer_metadata(
+    model_dir: str, arch: str = "", config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Read tokenizer data from a HuggingFace model directory and return
+    GGUF-compatible tokenizer metadata.
+
+    Handles the common case: BPE tokenizer from tokenizer.json
+    (covers LLaMA, Qwen, Mistral, GPT-NeoX, Falcon, etc.).
+
+    Args:
+        arch: GGUF architecture string, used only to disambiguate
+            ``tokenizer.ggml.pre`` for qwen35/qwen35moe (see below --
+            regex matching alone can't tell it apart from qwen2).
+        config: Already-parsed config.json contents, if the caller has
+            one (e.g. SafetensorsSource._ensure_loaded, which reads
+            config.json before this is called). When given, skips this
+            function's own config.json read. Pass ``{}`` (not None) to
+            represent "config.json does not exist" -- an empty dict
+            resolves through the same effective-config/vocab_size/
+            bos_token_id lookups as a missing file and yields identical
+            metadata. Leave as ``None`` (the default) to preserve the
+            original read-from-disk behavior.
+    """
+    meta: Dict[str, Any] = {}
+
+    # ── tokenizer.json (BPE vocab + merges) ──
+    tokenizer_path = os.path.join(model_dir, "tokenizer.json")
+    if not os.path.exists(tokenizer_path):
+        return meta
+
+    with open(tokenizer_path, encoding="utf-8") as f:
+        tok = json.load(f)
+
+    vocab_meta, vocab, added = _extract_tokenizer_vocab(tok, arch, config, model_dir)
+    meta.update(vocab_meta)
+
+    # ── tokenizer_config.json (special token IDs) ──
+    config_path = os.path.join(model_dir, "tokenizer_config.json")
+    tok_cfg = _NO_TOKENIZER_CFG
+    if os.path.exists(config_path):
+        with open(config_path, encoding="utf-8") as f:
+            tok_cfg = json.load(f)
+
+    meta.update(_resolve_special_tokens(tok_cfg, vocab, added))
+    meta.update(_resolve_chat_template(model_dir, tok_cfg))
+
+    return meta
+
+
 class SafetensorsSource(ModelSource):
     """
     Read tensors from a HuggingFace safetensors model directory.
@@ -1350,16 +1458,38 @@ class SafetensorsSource(ModelSource):
     def _ensure_loaded(self):
         if self._loaded:
             return
+        # Set BEFORE any work: if the arch gate or unmapped-name gate below
+        # raises, the object is deliberately left flagged loaded with a
+        # partially-built _tensor_map, so a subsequent call returns silently
+        # instead of re-raising. LoRAMergedSource.__init__ depends on this
+        # indirectly (it calls self._base.get_metadata() inside a bare
+        # `except Exception`, swallowing that first raise). Do NOT move this
+        # to the end of the method.
         self._loaded = True
 
-        # Discover safetensors files
+        self._discover_files()
+        config, arch = self._load_config_and_gate_arch()
+        self._resolve_qk_permute_cfg(arch, config)
+        self._resolve_qwen35_cfg(arch, config)
+        expert_groups = self._parse_headers_and_map_names(arch)
+        self._stack_moe_experts(expert_groups)
+        self._alias_tied_embeddings(config)
+
+        # Load tokenizer data
+        tokenizer_meta = _build_tokenizer_metadata(self._model_dir, arch=arch, config=config)
+        self._metadata.update(tokenizer_meta)
+
+    def _discover_files(self):
+        """Discover safetensors shard files. Extracted verbatim from
+        _ensure_loaded's shard-discovery stage.
+        """
         if not self._files:
             index_path = os.path.join(self._model_dir, "model.safetensors.index.json")
             if os.path.exists(index_path):
                 with open(index_path) as f:
                     index = json.load(f)
                 weight_map = index.get("weight_map", {})
-                for hf_name, filename in weight_map.items():
+                for _hf_name, filename in weight_map.items():
                     full = os.path.join(self._model_dir, filename)
                     self._files.setdefault(full, None)
             else:
@@ -1372,6 +1502,12 @@ class SafetensorsSource(ModelSource):
                         f"No safetensors files found in {self._model_dir}"
                     )
 
+    def _load_config_and_gate_arch(self) -> Tuple[Dict[str, Any], str]:
+        """Load config.json, build metadata + resolve arch, and run the
+        architecture gate. Extracted verbatim from _ensure_loaded's
+        config-load / arch-gate stage. Returns (config, arch); also sets
+        self._metadata as a side effect, matching the original inline code.
+        """
         # Load metadata from config.json first — we need the architecture
         # to apply arch-specific tensor name mappings.
         config_path = os.path.join(self._model_dir, "config.json")
@@ -1407,6 +1543,12 @@ class SafetensorsSource(ModelSource):
             else:
                 raise UnsupportedSourceArchitecture(msg)
 
+        return config, arch
+
+    def _resolve_qk_permute_cfg(self, arch: str, config: Dict[str, Any]):
+        """Set self._qk_heads for NORM-rope arches. Extracted verbatim from
+        _ensure_loaded's QK-permute head-count setup stage.
+        """
         # Rope permutation setup for NORM-rope arches (see _QK_PERMUTED_ARCHS):
         # resolve head counts from the (text_config-aware) effective config.
         self._qk_heads = None
@@ -1423,6 +1565,11 @@ class SafetensorsSource(ModelSource):
                     "broken in llama.cpp).", arch,
                 )
 
+    def _resolve_qwen35_cfg(self, arch: str, config: Dict[str, Any]):
+        """Set self._qwen35_cfg for the qwen3_5 hybrid-arch value transform.
+        Extracted verbatim from _ensure_loaded's qwen35 linear-attention
+        cfg-setup stage.
+        """
         # qwen3_5 (qwen35/qwen35moe) hybrid-arch value-transform setup:
         # resolve the linear-attention head counts read_tensor_f32 needs to
         # apply _qwen35_value_transform's V-head reorder. None of these are
@@ -1438,6 +1585,16 @@ class SafetensorsSource(ModelSource):
                 "head_v_dim": effective.get("linear_value_head_dim"),
             }
 
+    def _parse_headers_and_map_names(self, arch: str) -> Dict[str, Dict[int, Dict[str, Any]]]:
+        """Parse every shard's header, map HF tensor names to GGUF names
+        (populating self._tensor_map directly), group MoE per-expert
+        projections for later stacking, and run the unmapped-name gate.
+        Extracted verbatim from _ensure_loaded's per-file header-parse /
+        MoE-expert-grouping / name-mapping loop, plus the unmapped-name
+        gate that must run immediately after (same gate, same escape
+        hatch as the architecture gate). Returns expert_groups for
+        _stack_moe_experts.
+        """
         # Per-expert MoE projection tensors accumulate here instead of going
         # straight into self._tensor_map: gguf_stacked_name -> {expert_idx: raw_info}.
         # Stacked into single virtual 3-D tensors after all files are parsed
@@ -1546,6 +1703,16 @@ class SafetensorsSource(ModelSource):
             else:
                 raise UnsupportedSourceArchitecture(msg)
 
+        return expert_groups
+
+    def _stack_moe_experts(self, expert_groups: Dict[str, Dict[int, Dict[str, Any]]]):
+        """Stack grouped per-expert MoE projections into virtual 3-D
+        tensors in self._tensor_map. Extracted verbatim from
+        _ensure_loaded's MoE expert-stacking stage. Must run after
+        _parse_headers_and_map_names (needs its expert_groups) and before
+        _alias_tied_embeddings (tensor insertion order determines GGUF
+        on-disk tensor order).
+        """
         # Stack each MoE expert group into one virtual 3-D tensor: shape
         # [n_expert, out_features, in_features], experts in ascending index
         # order along the new leading axis (matches llama.cpp's
@@ -1587,6 +1754,12 @@ class SafetensorsSource(ModelSource):
                 "expert_parts": ordered_parts,  # ascending expert-index order
             }
 
+    def _alias_tied_embeddings(self, config: Dict[str, Any]):
+        """Alias output.weight to token_embd.weight for tied embeddings.
+        Extracted verbatim from _ensure_loaded's tied-embedding-aliasing
+        stage. Must run after _stack_moe_experts (tensor insertion order
+        determines GGUF on-disk tensor order).
+        """
         # Handle tied weights: if output.weight is missing and embeddings are tied,
         # create a reference to token_embd.weight
         if "output.weight" not in self._tensor_map and "token_embd.weight" in self._tensor_map:
@@ -1594,10 +1767,6 @@ class SafetensorsSource(ModelSource):
                 ref = dict(self._tensor_map["token_embd.weight"])
                 ref["gguf_name"] = "output.weight"
                 self._tensor_map["output.weight"] = ref
-
-        # Load tokenizer data
-        tokenizer_meta = _build_tokenizer_metadata(self._model_dir, arch=arch, config=config)
-        self._metadata.update(tokenizer_meta)
 
     @staticmethod
     def _parse_header(filepath: str) -> Tuple[Dict, int]:
