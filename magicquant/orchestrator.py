@@ -2538,8 +2538,12 @@ class MagicQuantOrchestrator:
                 stage="generate",
                 tier=tier,
                 name=name,
-                ppl=round(entry["ppl"], 4) if "ppl" in entry else None,
-                measured_loss=round(entry["measured_loss"], 4) if "measured_loss" in entry else None,
+                # .get() is not None, not key presence: prediction-only
+                # search results serialize ppl/measured_loss as null, so the
+                # keys are PRESENT with value None (round(None) crashed here
+                # for every `generate` after a --rounds 0 search).
+                ppl=round(entry["ppl"], 4) if entry.get("ppl") is not None else None,
+                measured_loss=round(entry["measured_loss"], 4) if entry.get("measured_loss") is not None else None,
             )
 
             path = self.generate_hybrid_model(

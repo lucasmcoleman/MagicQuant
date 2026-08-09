@@ -160,3 +160,31 @@ def test_missing_tier_surfacing_is_best_effort_when_file_absent(tmp_path):
         tiers=["Q4", "Q5", "Q6"],
     )
     assert len(generated) == 2
+
+
+def test_generate_handles_prediction_only_null_ppl(tmp_path, fake_log):
+    """Regression: prediction-only (--rounds 0) search results serialize
+    ppl/measured_loss as null -- the keys are PRESENT with value None. The
+    tier-generation log line used key-presence checks and crashed on
+    round(None), killing every `magicquant generate` after a prediction-only
+    search (found by 2026-08-08 end-to-end verification; identical on the
+    pre-cleanup master)."""
+    orch = _make_orch(tmp_path)
+    tiered = {
+        "Q4": {
+            "config": {"E": "Q6_K", "U": "MXFP4_MOE", "D": "MXFP4_MOE"},
+            "ppl": None,
+            "measured_loss": None,
+            "predicted_loss": 0.021,
+            "size_gb": 0.31,
+            "source": "evolved",
+        }
+    }
+    generated = orch.generate_tiered_models(
+        tiered=tiered, tiers=["Q4"], verify=False
+    )
+    assert generated == [str(tmp_path / "fake.gguf")]
+    gen_calls = [c for c in fake_log.calls if c[1] == "Generating tier model"]
+    assert len(gen_calls) == 1
+    assert gen_calls[0][2]["ppl"] is None
+    assert gen_calls[0][2]["measured_loss"] is None
