@@ -104,4 +104,5 @@ Surfaced by the 2026-08 cleanup audit but out of scope for a behavior-preserving
 - A latent interaction between v2's `--target-profile q4nx` and `probe_scheme` was found during verification (possible bug, needs investigation).
 - v2's scheme filter is missing v1's `IMATRIX_DEPENDENT_SCHEME_NAMES` gate, which compounds with an imatrix probe-cache issue fixed elsewhere in this cleanup pass.
 - `SensitivityProber`'s `baseline_ppl_err` field is structurally unreachable.
+- `generate_tiered_models` crashes with `round(None)` on prediction-only search results: it checks `"ppl" in entry` but prediction-only runs serialize `ppl: null`, so `magicquant generate` after a `--rounds 0` search dies (possible bug, pre-existing — reproduced identically on master during the 2026-08-08 end-to-end verification; every historical run was measured, so it never fired; fix is `entry.get("ppl") is not None`).
 - A handful of additional lower-priority items were discussed during the audit but not individually written up (see `docs/cleanup-2026-08-plan.md` for the full notes).
