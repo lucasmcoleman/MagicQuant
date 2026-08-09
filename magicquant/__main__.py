@@ -187,7 +187,6 @@ _V2_IGNORED_V1_FLAGS = (
     ("--enable-kl", "enable_kl"),
     ("--kl-weight", "kl_weight"),
     ("--enable-speed-bench", "enable_speed_bench"),
-    ("--enable-iq", "enable_iq"),
     ("--stream-aware", "stream_aware"),
     ("--head-aggressive", "head_aggressive"),
     ("--speed-weight", "speed_weight"),
@@ -236,6 +235,7 @@ def _run_v2_search(args: argparse.Namespace, settings) -> None:
         budget_gb=settings.budget_gb,
         llamacpp_path=settings.llamacpp_path,
         enable_rocmfpx=settings.enable_rocmfpx,
+        enable_iq=settings.enable_iq,
         target_profile=getattr(args, "target_profile", None),
         use_imatrix=True if getattr(args, "use_imatrix", None) is None
         else bool(args.use_imatrix),

@@ -394,6 +394,42 @@ def test_cmd_search_v2_real_parser_warns_ignored_v1_flags_and_still_runs(
         assert flag not in ignored_clause
 
 
+def test_cmd_search_v2_enable_iq_not_warned_and_reaches_v2config(monkeypatch, capsys):
+    """F9: --enable-iq stopped being a v2 no-op, so it must (a) not appear
+    in the ignored-v1-flags warning and (b) actually reach V2Config, making
+    BudgetInfeasibleError's "--enable-iq" advice true."""
+    calls = []
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search", lambda cfg: calls.append(cfg) or {}
+    )
+
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--enable-iq",
+        ],
+    )
+    cli.main()
+
+    assert len(calls) == 1
+    assert calls[0].enable_iq is True
+    out = capsys.readouterr().out
+    assert "--enable-iq" not in out
+
+
+def test_cmd_search_v2_default_enable_iq_is_false(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search", lambda cfg: calls.append(cfg) or {}
+    )
+
+    cli.cmd_search(_search_args(algo="v2", budget_gb=5.0))
+
+    assert len(calls) == 1
+    assert calls[0].enable_iq is False
+
+
 def test_cmd_search_v2_no_warning_without_v1_only_flags(monkeypatch, capsys):
     calls = []
     monkeypatch.setattr(

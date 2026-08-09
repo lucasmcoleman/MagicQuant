@@ -38,6 +38,12 @@ ROCMFPX_SCHEMES = ["ROCMFP8", "ROCMFP6", "ROCMFP4", "ROCMFP3"]
 # tensors are Q4_0/Q4_1/Q8_0/MXFP4-family — restrict choices so the emitted
 # hybrid converts losslessly for NPU serving (docs/redesign.md §7).
 Q4NX_PROFILE_SCHEMES = ["BF16", "Q8_0", "Q4_0", "Q4_1", "MXFP4_MOE"]
+# Sub-2-bit IQ family excluded from v2's --enable-iq addition per
+# docs/redesign.md §9 Non-goals ("Sub-2-bit IQ types"). Everything else in
+# quant.schemes.IQ_SCHEME_NAMES (4.25 down to 2.0625 bpw) is fair game;
+# per-scheme requires_imatrix (IQ2_XS/IQ2_XXS) is still enforced by the
+# ordinary filter loop below, same as any other scheme.
+_V2_SUB_2BIT_IQ_NAMES = frozenset({"IQ1_M", "IQ1_S"})
 
 
 @dataclass
@@ -68,10 +74,17 @@ class V2Config:
     floors: Dict[str, str] = field(default_factory=dict)  # group -> min scheme
     keep_anchors: bool = False
     model_name: Optional[str] = None
+    # Sub-4-bit stock-ggml IQ family (quant.schemes.IQ_SCHEME_NAMES minus the
+    # sub-2-bit members — see _V2_SUB_2BIT_IQ_NAMES), for parity with v1's
+    # --enable-iq gate (evolution/survival.py). Default False: byte-identical
+    # choice set to today. Only applies to the capability-defaults branch of
+    # _select_schemes (explicit cfg.schemes and target_profile="q4nx" are
+    # unaffected either way).
+    enable_iq: bool = False
 
 
 def _select_schemes(cfg: V2Config, imatrix_active: bool) -> List[str]:
-    from magicquant.quant.schemes import get_scheme_by_name
+    from magicquant.quant.schemes import get_scheme_by_name, IQ_SCHEME_NAMES
 
     if cfg.schemes is not None:
         names = list(cfg.schemes)
@@ -81,6 +94,8 @@ def _select_schemes(cfg: V2Config, imatrix_active: bool) -> List[str]:
         names = list(DEFAULT_SCHEMES)
         if cfg.enable_rocmfpx:
             names += ROCMFPX_SCHEMES
+        if cfg.enable_iq:
+            names += sorted(IQ_SCHEME_NAMES - _V2_SUB_2BIT_IQ_NAMES)
 
     kept: List[str] = []
     for n in names:

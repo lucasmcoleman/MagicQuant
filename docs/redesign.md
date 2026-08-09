@@ -356,7 +356,11 @@ about v1 is untouched.
   computed through the fork's exported dequant symbols
   (`rocmfp4_dequantize_row_q4_0`, `rocmfpx_dequantize_row_fp{3,6,8}`), and
   gated by `--enable-rocmfpx` exactly like v1 (files with these types load
-  only on the fork). No sampling-mass hand-tuning needed anymore — measured
+  only on the fork). The IQ family (minus the sub-2-bit types §9 excludes) is
+  likewise gated by `--enable-iq`, with the imatrix-requiring members
+  (IQ2_XS/IQ2_XXS) admitted only when an imatrix is active — the
+  BudgetInfeasibleError advice to pass `--enable-iq` is real as of the 2026-08
+  cleanup pass. No sampling-mass hand-tuning needed anymore — measured
   ε prices them against MXFP4/K-quants directly, which is the head-to-head
   the fork always needed.
 - **Q4NX (`/server/programming/FLM_Q4NX_Converter`)** — investigated:
