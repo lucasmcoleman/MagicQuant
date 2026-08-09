@@ -74,4 +74,8 @@ Original-Research = "https://github.com/magiccodingman/MagicQuant-Wiki"
 
 [tool.setuptools.packages.find]
 where = ["."]
-exclude = ["docker*", "tests*"]
+# tools* excluded: it's a dev-only bag of scripts (fit_noise_factors.py is
+# now a thin CLI shim over magicquant.evolution.fit_noise_factors -- the
+# only piece the installed package ever needed at runtime), not meant to
+# install as a top-level `tools` package alongside `magicquant`.
+exclude = ["docker*", "tests*", "tools*"]

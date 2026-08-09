@@ -1,4 +1,6 @@
-"""Tests for tools/fit_noise_factors.py.
+"""Tests for magicquant.evolution.fit_noise_factors (the module
+tools/fit_noise_factors.py is now a thin CLI shim over -- F4, 2026-08
+packaging fix).
 
 Round-trips the least-squares fit against a synthetic search_results.json
 built from KNOWN ground-truth noise factors (so the fit should recover them
@@ -8,14 +10,11 @@ tests/fixtures/qwopus_search_results_2026-07-04/) to confirm it runs
 end-to-end on real data without raising.
 """
 import json
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from tools.fit_noise_factors import (  # noqa: E402
+from magicquant.evolution.fit_noise_factors import (
     build_calibration_envelope,
     fit_noise_factors,
     load_fit_inputs,
@@ -166,3 +165,19 @@ def test_smoke_on_real_qwopus_search_results():
         if scheme != "BF16"
     }
     assert used_schemes == set(fitted)
+
+
+# ── tools/fit_noise_factors.py shim (F4, 2026-08 packaging fix) ─────────
+
+def test_tools_shim_reexports_the_real_module():
+    """tools/fit_noise_factors.py must stay a thin re-export, not drift into
+    its own copy: every name it re-exports must be the SAME object as the
+    real module's (identity, not just equal value)."""
+    import tools.fit_noise_factors as shim
+    import magicquant.evolution.fit_noise_factors as real
+
+    for name in (
+        "FitInput", "build_calibration_envelope", "fit_noise_factors",
+        "load_fit_inputs", "main", "BASELINE_SCHEME", "HIGH_SENSITIVITY_GROUPS",
+    ):
+        assert getattr(shim, name) is getattr(real, name), name

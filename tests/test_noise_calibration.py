@@ -3,7 +3,9 @@
 Covers:
   - MagicQuantOrchestrator._write_noise_calibration: fits per-scheme noise
     factors from THIS run's measurements + sensitivity weights (reusing
-    tools/fit_noise_factors.py's least-squares fit directly) and writes
+    magicquant.evolution.fit_noise_factors's least-squares fit directly --
+    tools/fit_noise_factors.py is now a thin CLI shim over that module,
+    F4 2026-08) and writes
     <output_dir>/noise_calibration.json in the nested envelope
     magicquant.quant.calibration reads. Opt-in via
     run_measured_search(write_calibration=True); off by default.
@@ -143,21 +145,23 @@ def test_write_noise_calibration_no_measurements_skips_gracefully(tmp_path):
     assert not (orch.output_dir / "noise_calibration.json").exists()
 
 
-def test_write_noise_calibration_survives_missing_repo_root_on_sys_path(
+def test_write_noise_calibration_does_not_depend_on_tools_package(
     tmp_path, monkeypatch
 ):
-    """Regression: the Foundry pipeline stage imports `magicquant` via
-    PYTHONPATH without the repo root on sys.path, so the plain
-    `from tools.fit_noise_factors import ...` raised ModuleNotFoundError and
-    write_calibration silently no-opped (run 3, 2026-07-06). The fallback
-    must locate `tools/` next to the package and still write the file."""
+    """Regression for the tools/ packaging defect (2026-08 cleanup, F4):
+    _write_noise_calibration used to do `from tools.fit_noise_factors import
+    ...` at runtime, which only worked when the repo root (or a PEP 660
+    editable finder mapping `tools`) was on sys.path -- broken for any
+    caller that only has `magicquant` installed/on PYTHONPATH (e.g. Foundry
+    via PYTHONPATH, run 3, 2026-07-06). The fix moved the fitting logic
+    in-package (`magicquant.evolution.fit_noise_factors`); this test proves
+    the write no longer depends on `tools` being importable AT ALL, by
+    making `import tools` fail outright (repo root off sys.path, no
+    editable finder mapping it, and a poisoned sys.modules entry -- `None`
+    there makes Python's import system raise ImportError immediately)."""
     import sys
 
     repo_root = str(Path(orch_mod.__file__).resolve().parents[1])
-    # Simulate the stage context: repo root absent, `tools` not yet imported,
-    # and no PEP 660 editable finder mapping `tools` (Foundry's venv maps only
-    # `magicquant`; this repo's own editable install maps both, which would
-    # mask the bug).
     monkeypatch.setattr(
         sys, "path", [p for p in sys.path if str(Path(p or ".").resolve()) != repo_root]
     )
@@ -175,6 +179,7 @@ def test_write_noise_calibration_survives_missing_repo_root_on_sys_path(
     )
     for mod in [m for m in sys.modules if m == "tools" or m.startswith("tools.")]:
         monkeypatch.delitem(sys.modules, mod)
+    monkeypatch.setitem(sys.modules, "tools", None)
 
     orch = _make_bare_orchestrator(tmp_path)
     orch._write_noise_calibration()

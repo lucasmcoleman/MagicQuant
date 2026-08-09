@@ -2187,9 +2187,10 @@ class MagicQuantOrchestrator:
         sensitivity weights and write ``<output_dir>/noise_calibration.json``
         (opt-in, ``run_measured_search(write_calibration=True)``).
 
-        Mirrors ``tools/fit_noise_factors.py``'s least-squares fit (reused
-        directly, not re-implemented) but skips the round-trip through
-        disk: it builds ``FitInput`` rows straight from ``self._measured``
+        Reuses ``magicquant.evolution.fit_noise_factors``'s least-squares
+        fit directly (not re-implemented; ``tools/fit_noise_factors.py`` is
+        now a thin CLI shim over the same module) but skips the round-trip
+        through disk: it builds ``FitInput`` rows straight from ``self._measured``
         and ``self.sensitivity_weights`` instead of re-reading
         ``search_results.json``/``sensitivity.json`` back off disk. The
         output envelope matches the nested ``{"schemes": {...}}`` shape
@@ -2201,23 +2202,17 @@ class MagicQuantOrchestrator:
         otherwise-successful measured search.
         """
         try:
-            try:
-                from tools.fit_noise_factors import (
-                    FitInput, build_calibration_envelope, fit_noise_factors,
-                )
-            except ModuleNotFoundError:
-                # `tools/` lives at the repo root, next to the `magicquant`
-                # package -- importable when running from a checkout, but not
-                # when only the package itself is on sys.path (e.g. a caller
-                # that added `magicquant` via PYTHONPATH or an editable
-                # install). Fall back to the checkout layout explicitly.
-                import sys
-                repo_root = str(Path(__file__).resolve().parents[1])
-                if repo_root not in sys.path:
-                    sys.path.insert(0, repo_root)
-                from tools.fit_noise_factors import (
-                    FitInput, build_calibration_envelope, fit_noise_factors,
-                )
+            # F4 (2026-08 packaging fix): this used to be `from
+            # tools.fit_noise_factors import ...` with a sys.path fallback,
+            # because `tools/` is a bare top-level package with no guaranteed
+            # presence outside a git checkout -- broken for any caller that
+            # only has `magicquant` on its path (e.g. Foundry via PYTHONPATH,
+            # run 3, 2026-07-06). The fitting logic now lives in-package, so
+            # this import needs no fallback: it works wherever `magicquant`
+            # itself is importable.
+            from magicquant.evolution.fit_noise_factors import (
+                FitInput, build_calibration_envelope, fit_noise_factors,
+            )
 
             sensitivity_weights = self.sensitivity_weights or {}
             results_path = str(self.output_dir / "search_results.json")
