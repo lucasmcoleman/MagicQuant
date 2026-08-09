@@ -50,6 +50,14 @@ def group_epsilon_sums(
     return sums
 
 
+def _drop_imatrix(conditions: Dict[str, Any]) -> Dict[str, Any]:
+    """``conditions`` minus the ``imatrix`` key -- used to detect the
+    narrow case where imatrix identity is the ONLY thing that changed, so
+    the imatrix-independent ``__slice_baseline__`` entry can still be
+    reused (see ``run_group_probes``)."""
+    return {k: v for k, v in conditions.items() if k != "imatrix"}
+
+
 def run_group_probes(
     llama_tools,
     source_model_path: str,
@@ -82,6 +90,9 @@ def run_group_probes(
     included), so a re-run/resume skips already-measured groups.
     """
     from magicquant.gguf.writer import create_hybrid_gguf
+    # Function-local import: matches this file's existing convention (see
+    # create_hybrid_gguf above, whose test monkeypatch seam depends on it).
+    from magicquant.v2.sensitivity import _imatrix_identity
 
     if probe_mode not in ("single", "cumulative"):
         raise ValueError(
@@ -101,6 +112,12 @@ def run_group_probes(
         "ctx_size": getattr(llama_tools, "ctx_size", None),
         "probe_mode": probe_mode,
         "keep_scheme": keep_scheme,
+        # Probe GGUFs are built with `imatrix=imatrix` (create_hybrid_gguf,
+        # below), so a changed imatrix identity changes the measured PPL the
+        # same way it changes compute_distortion_table's cache key
+        # (sensitivity.py). Reused rather than duplicated so the two caches
+        # can never define "same imatrix" differently.
+        "imatrix": _imatrix_identity(imatrix),
     }
 
     def _probe_config(group: str) -> Dict[str, Any]:
@@ -114,10 +131,33 @@ def run_group_probes(
     if cache_path.is_file():
         try:
             data = json.loads(cache_path.read_text(encoding="utf-8"))
-            if data.get("conditions") == conditions:
+            stored_conditions = data.get("conditions")
+            if stored_conditions == conditions:
                 cached = data.get("probes", {})
                 log.info(
                     "reusing %d cached v2 probe measurement(s)", len(cached),
+                    stage="calibrate",
+                )
+            elif isinstance(stored_conditions, dict) and _drop_imatrix(
+                stored_conditions
+            ) == _drop_imatrix(conditions):
+                # Only the imatrix fingerprint changed (or a pre-imatrix-key
+                # legacy cache is being upgraded). __slice_baseline__ is
+                # measured directly on the unquantized source model (below)
+                # and does not depend on imatrix, so it is still valid --
+                # reuse just that one entry. Every imatrix-sensitive probe
+                # (built via create_hybrid_gguf(..., imatrix=imatrix)) is
+                # left uncached and will re-measure under the new imatrix.
+                probes = data.get("probes", {})
+                if "__slice_baseline__" in probes:
+                    cached = {"__slice_baseline__": probes["__slice_baseline__"]}
+                log.info(
+                    "v2 probe cache: imatrix fingerprint %s -- "
+                    "re-measuring group probes (reusing cached "
+                    "slice-matched baseline, which does not depend on "
+                    "imatrix)",
+                    "changed" if "imatrix" in stored_conditions
+                    else "absent (cache predates the imatrix key)",
                     stage="calibrate",
                 )
         except (OSError, ValueError):
