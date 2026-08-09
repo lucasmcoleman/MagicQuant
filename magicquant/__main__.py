@@ -396,7 +396,7 @@ def cmd_hybrid(args: argparse.Namespace) -> None:
     output_filename = generate_name(model_name, base_quant, group_overrides)
     output_path = output_dir / output_filename
 
-    print(f"Generating hybrid GGUF:")
+    print("Generating hybrid GGUF:")
     print(f"  Source:    {source_path}")
     print(f"  Base quant:{base_quant}")
     print(f"  Overrides: {group_overrides}")

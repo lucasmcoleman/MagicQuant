@@ -41,7 +41,6 @@ import os
 import json
 import tempfile
 import logging
-import numpy as np
 
 from magicquant.quant import calibration
 from magicquant.quant.schemes import get_scheme_by_name

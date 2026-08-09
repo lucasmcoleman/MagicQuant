@@ -11,7 +11,6 @@ when the row isn't even 32-divisible.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 import magicquant.gguf.source as source_mod
 from magicquant.gguf.writer import create_hybrid_gguf, _block32_fallback

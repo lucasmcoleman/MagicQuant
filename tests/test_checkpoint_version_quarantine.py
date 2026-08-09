@@ -41,7 +41,6 @@ def test_current_writer_stamps_version_2(tmp_path):
 def test_pre_v2_measurements_are_discarded_baseline_kept(tmp_path):
     orch = _orch(tmp_path)
     path = _write_ck(orch, 1, MEASURED)
-    fresh = _orch(tmp_path)
     ck = json.loads(path.read_text())
     assert ck["measured"], "fixture must actually contain a measurement"
     # Mirror the resume branch's version gate.

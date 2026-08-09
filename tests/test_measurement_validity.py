@@ -186,7 +186,6 @@ def test_plausible_measurement_below_baseline_within_noise_is_not_flagged():
     """A tiny, plausible dip (within the ~5% default noise floor) must NOT
     be treated as impossible -- only a clamp beyond eps counts."""
     baseline = 100.0
-    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
 
     # Reuse the real measurement_eps helper to compute what "within noise"
     # means, matching the production code path exactly.

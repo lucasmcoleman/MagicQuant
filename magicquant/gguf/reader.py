@@ -64,9 +64,10 @@ class GGUFReader:
             if magic != self.GGUF_MAGIC:
                 raise ValueError(f"Invalid GGUF magic: {hex(magic)}. Expected {hex(self.GGUF_MAGIC)}")
             
-            # Read version
-            version = struct.unpack('<I', f.read(4))[0]
-            
+            # Read version (unused: advances the file cursor past the field;
+            # GGUF version handling is not implemented by this reader).
+            struct.unpack('<I', f.read(4))
+
             # Read tensor count
             tensor_count = struct.unpack('<Q', f.read(8))[0]
             

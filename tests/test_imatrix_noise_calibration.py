@@ -15,7 +15,6 @@ import pytest
 from magicquant.quant.schemes import (
     IMATRIX_NOISE_SCALE,
     BF16,
-    IQ4_NL,
     MXFP4_MOE,
     Q4_K_M,
     Q8_0,

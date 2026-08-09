@@ -8,7 +8,6 @@ never varied.
 import random
 
 import numpy as np
-import pytest
 
 from magicquant.evolution.predictor import PredictiveScorer
 from magicquant.evolution.survival import EvolutionarySurvivor

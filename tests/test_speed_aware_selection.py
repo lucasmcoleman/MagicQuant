@@ -15,7 +15,6 @@ fallback, speed_aware=False / missing-attribute default-off); and full
 run_measured_search plumbing end-to-end against a faked llama.cpp boundary
 (same faking style as test_orchestrator_measurement.py).
 """
-import pytest
 
 import magicquant.gguf.source as source_mod
 from magicquant.orchestrator import MagicQuantOrchestrator

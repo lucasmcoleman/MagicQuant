@@ -57,7 +57,6 @@ import numpy as np
 from magicquant.quant.schemes import get_scheme_by_name
 from magicquant.quant.tiers import (
     CURRENT_TIER_SCHEME_VERSION,
-    TIER_BOUNDARIES,
     classify_tier,
     tier_scheme_version,
 )

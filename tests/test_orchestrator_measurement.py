@@ -506,7 +506,6 @@ def test_measured_search_overlap_cleans_up_prefetched_build_on_exception(tmp_pat
     # prefetch job, cancel() legitimately wins and no second build happens
     # (Opus review reproduced that ordering ~1 in 8 suite runs). Either way,
     # no unconsumed candidate GGUF may remain on disk.
-    from pathlib import Path as _Path
     assert built_paths, "candidate i itself must have been built"
     leaked = [
         f for f in (tmp_path / "candidates").glob("*.gguf")

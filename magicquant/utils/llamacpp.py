@@ -9,7 +9,7 @@ import subprocess
 import os
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 

@@ -14,9 +14,8 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import struct
 from pathlib import Path
-from typing import List, Tuple
+from typing import Tuple
 
 import numpy as np
 import pytest

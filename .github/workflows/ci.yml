@@ -34,9 +34,50 @@ jobs:
           python -c "import magicquant.logging, magicquant.config"
           python -c "from magicquant.quant.ggml_binding import GGML_TYPE_IDS; print(len(GGML_TYPE_IDS))"
 
-      - name: Lint
-        run: ruff check magicquant/ tests/ || true  # non-blocking until clean
+      - name: "Lint (advisory -- ~1200 pre-existing findings, not yet clean)"
+        run: ruff check magicquant/ tools/ tests/ || true  # non-blocking until clean
+
+      - name: "Lint (blocking -- pyflakes only: undefined names, unused imports/variables, redefinitions)"
+        # F-class findings are zero as of this job's introduction (audit item
+        # M17) -- this step enforces that they STAY zero. It is deliberately
+        # narrower than the advisory step above, which also covers ~1200
+        # pre-existing style findings (E/W/etc.) that are not blocking yet.
+        run: ruff check --select F magicquant/ tools/ tests/
 
       - name: Run tests
         # Encoder-parity skips automatically when llama-quantize is unavailable.
         run: python -m pytest tests/ -q
+
+  qat-tests:
+    # QAT-LoRA tests need the [qat] extra (torch/transformers/peft/accelerate)
+    # and were never exercised in CI before this job -- the `test` job above
+    # installs only `.[dev]`, so every test in these files that needs torch
+    # was silently skipped (audit item M12; ~40 tests). A single Python
+    # version keeps the CPU-torch install cost down.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: "Install (dev + qat extras: CPU-only torch)"
+        run: |
+          python -m pip install --upgrade pip
+          # CPU wheel first, from PyTorch's own CPU index, so `.[qat]`'s
+          # torch>=2.2.0 floor is already satisfied by the time `pip install
+          # -e ".[dev,qat]"` resolves it -- otherwise pip would pull the much
+          # larger default CUDA-enabled build.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[dev,qat]"
+
+      - name: "Run QAT tests (torch-gated files only)"
+        # scipy lives in [dev] (pyproject.toml), and this job installs both
+        # extras together, so any scipy-gated assertions in these files run
+        # for real too, not just the torch-gated ones.
+        run: |
+          python -m pytest tests/test_qat_*.py tests/test_fake_quant.py \
+            tests/test_lora_merged_source_peft_differential.py -q

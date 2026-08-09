@@ -7,7 +7,7 @@ import pytest
 import magicquant.gguf.source as source_mod
 from magicquant.v2.sensitivity import compute_distortion_table
 
-from tests.test_writer import StubSource, _f32_tensor
+from tests.test_writer import StubSource
 
 
 @pytest.fixture(autouse=True)

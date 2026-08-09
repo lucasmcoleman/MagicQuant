@@ -25,7 +25,6 @@ import json
 import struct
 
 import numpy as np
-import pytest
 
 from magicquant.gguf.source import SafetensorsSource, _reorder_v_heads
 

@@ -6,7 +6,6 @@ didn't guard for it — so `GGUFReader(path).get_all_tensors_info()` returned []
 empty one. Accessors now lazily open; open() is idempotent so the `with` /
 explicit-open paths still work and never double-parse.
 """
-import struct
 
 import numpy as np
 import pytest

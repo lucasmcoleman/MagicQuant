@@ -199,7 +199,7 @@ def test_write_noise_calibration_excludes_measurement_invalid_entries(tmp_path):
     orch._write_noise_calibration()
 
     calib_path = orch.output_dir / "noise_calibration.json"
-    envelope = json.loads(calib_path.read_text())
+    json.loads(calib_path.read_text())  # implicit parse check
     for scheme, truth in GROUND_TRUTH_NOISE.items():
         loaded = calibration.calibrated_noise_factor(scheme, str(calib_path))
         assert loaded == pytest.approx(truth, abs=1e-3), (

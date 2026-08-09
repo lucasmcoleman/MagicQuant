@@ -10,7 +10,6 @@ import pytest
 
 from magicquant.gguf.source import ModelSource
 from magicquant.gguf.writer import (
-    GGUFWriter,
     create_hybrid_gguf,
     _write_metadata_value,
     _GGUF_TYPE_UINT32,
