@@ -64,17 +64,37 @@ same perturbation at roughly 79 sigma instead of 0.55.
 
 ### Supported Quantization Schemes
 
-| Scheme | Type | bpw | Noise | Best For |
+The default search pool (what `search` samples from with no extra flags):
+
+| Scheme | Type | bpw | Noise (heuristic) | Best For |
 |--------|------|-----|-------|----------|
 | BF16 | Float | 16.0 | 0.0 | Brain layers (E, H, O) |
 | Q8_0 | Integer | 8.5 | 1.0 | Near-lossless protection |
 | Q6_K | K-quant | 6.56 | 2.2 | High-quality attention |
 | Q5_K | K-quant | 5.5 | 3.0 | Balanced attention |
-| IQ4_NL | Non-linear | 4.5 | 3.8 | Best ~4-bit quality |
+| IQ4_NL | Non-linear | 4.5 | 3.8 | Best ~4-bit quality **with an imatrix** — dropped from the pool without one (see Known Limitations) |
 | **MXFP4** | **FP4 (E2M1)** | **4.25** | **4.0** | **FFN / MoE experts** |
 | Q4_K_M | K-quant | 4.5 | 4.5 | Fallback integer 4-bit |
+| Q3_K | K-quant | 3.44 | 8.0 | Aggressive attention / robust-group compression |
+| Q2_K | K-quant | 2.625 | 15.0 | Most aggressive robust-group compression |
 
 MXFP4 implements the [OCP MX Microscaling](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf) FP4 format (E2M1 values with shared E8M0 exponent). Its non-uniform quantization levels (0, 0.5, 1, 1.5, 2, 3, 4, 6) are denser near zero, naturally matching the Gaussian-like weight distribution of transformers — producing lower noise than integer Q4 at better compression.
+
+`quant/schemes.py`'s registry holds 23 schemes total; the 9 above are the
+default pool. The other 14 are real, working schemes but are **not**
+uniformly "supported" in the same sense — each is gated behind an explicit
+opt-in or a hardware/calibration requirement:
+
+- **`IQ4_XS`, `IQ3_S`, `IQ3_XXS`, `IQ2_S`, `IQ2_XS`, `IQ2_XXS`, `IQ1_M`, `IQ1_S`**
+  — opt-in via `enable_iq` (search's `--enable-iq`). `IQ2_XS`, `IQ2_XXS`, and
+  `IQ1_S` additionally *require* an imatrix to encode at all.
+- **`Q4_0`, `Q4_1`** — legacy block=32 quants, v2-only (`--target-profile
+  q4nx`); excluded from v1's random-config sampling to keep the seed-pinned
+  search fixture stable.
+- **`ROCMFP3`, `ROCMFP4`, `ROCMFP6`, `ROCMFP8`** — AMD-native fork schemes,
+  opt-in via `enable_rocmfpx`. Encoding requires a
+  [ROCmFPX](https://github.com/ciru-ai/ROCmFPX) build of libggml, and the
+  resulting GGUF loads only on that fork, not stock llama.cpp.
 
 > **Note on BF16:** Groups designated `BF16` (brain layers E/H/O) are stored on
 > disk as **F16**, not BF16. llama.cpp's compute graph has incomplete BF16
@@ -96,7 +116,7 @@ For **Quantization-Aware Training** (`magicquant qat`) install the optional
 torch-free):
 
 ```bash
-pip install -e ".[qat]"   # torch, transformers, peft, trl, datasets
+pip install -e ".[qat]"   # torch, transformers, peft, accelerate
 ```
 
 > `torch` must be the build that works on your hardware (the ROCm wheel on AMD,
@@ -121,6 +141,32 @@ magicquant search model-bf16.gguf --output-dir ./output --generations 50
 magicquant generate model-bf16.gguf --output-dir ./output --tiers Q4,Q5,Q6
 ```
 
+### Importance Matrix (imatrix)
+
+`search`/`generate` already capture and apply an importance-weighted imatrix
+automatically by default, from a bundled calibration corpus (see Known
+Limitations below) — most users never need to run this directly.
+`magicquant imatrix` is the manual/advanced entry point: capture one against
+your own corpus once and reuse the result, or produce a file for the Python
+API's `create_hybrid_gguf(..., imatrix=...)`.
+
+```bash
+magicquant imatrix model-bf16.gguf \
+    -f my-corpus.txt \
+    -o model-bf16.imatrix.gguf \
+    --chunks 200 --ctx-size 512
+```
+
+- `model` (positional) — GGUF model to instrument.
+- `-f`/`--corpus` (required) — plain-text calibration corpus (e.g. a
+  wikitext-2 **train** split). Must be a different file than whatever corpus
+  you score perplexity against — calibrating and evaluating on the same text
+  makes every measured loss optimistic with nothing in the output revealing
+  it.
+- `-o`/`--output` — output imatrix GGUF (default: `<model>.imatrix.gguf`).
+- `--chunks` — max corpus chunks to process (default `-1` = all).
+- `--ctx-size` — chunk length in tokens (default `512`).
+
 ### Quantization-Aware Training (QAT-LoRA)
 
 `magicquant qat` fine-tunes a model to be robust to a chosen per-group hybrid
@@ -144,8 +190,28 @@ The per-group hybrid config comes from a prior `search`'s `search_results.json`
 (`--config` + `--tier`); the dataset is a chat JSONL (`{"messages": [...]}` per
 line) trained with completion-only loss. Adapters + a `qat_meta.json` (base model,
 scheme-by-group, hyperparams, config hash) are written to `--out`. Merge the
-adapters, then pack the exact hybrid with `magicquant generate`. In Foundry this
-is surfaced as the **QAT** pipeline stage (toggle + config + live logs).
+adapters with `magicquant qat-merge`, then pack the exact hybrid with
+`magicquant generate`. In Foundry this is surfaced as the **QAT** pipeline
+stage (toggle + config + live logs).
+
+```bash
+# Merge the trained adapters into the base model's safetensors (streamed
+# shard-by-shard; never materializes the full model in memory).
+magicquant qat-merge ./my-model \
+    --adapters ./output/qat_adapters \
+    --out ./output/qat_merged
+```
+
+- `base_model` (positional) — HF model id or local path to the base model
+  whose safetensors get merged (the same model QAT was run against).
+- `--adapters` (required) — adapter directory written by `magicquant qat`
+  (needs `adapter_model.safetensors` + `qat_meta.json`).
+- `--out` (required) — output directory for the merged safetensors model.
+
+Use this rather than a generic PEFT merge — MagicQuant's adapter key naming
+doesn't match PEFT's convention, and a generic merge has silently produced an
+unmodified copy of the base model in the past. `qat-merge` fails loudly
+instead of degrading to a no-op.
 
 > **Budget builds interoperate here too.** `search --algo v2 --budget-gb <N>`
 > now also merges a `BUDGET-<N>GiB` pseudo-tier into `search_results.json`,
@@ -207,6 +273,22 @@ create_hybrid_gguf(
 )
 ```
 
+### Model Card
+
+`magicquant card` writes a HuggingFace-ready model card summarizing a
+finished search's tier results:
+
+```bash
+magicquant card --output-dir ./output --model model-bf16.gguf --base-model org/Model-Name
+```
+
+- `--output-dir` — directory containing `search_results.json` (default `./output`).
+- `--model` — source model path, used to derive the card title.
+- `--base-model` — base model name to show on the card.
+- `--upload` — upload the generated card to HuggingFace (requires
+  `huggingface_hub`, `pip install 'magicquant[hf]'`); needs `--repo`.
+- `--repo` — target HF repo id (`owner/name`) for `--upload`.
+
 ## Architecture
 
 ```
@@ -214,27 +296,54 @@ magicquant/
   gguf/
     reader.py          — GGUF binary parser
     writer.py          — Hybrid GGUF writer (two-pass streaming)
-    tensor_groups.py   — Tensor group classification (E, H, Q, K, O, U, D, X, R)
+    source.py          — ModelSource: GGUF / safetensors / LoRA-merged input abstraction
+    tensor_groups.py   — Tensor group classification (E, H, Q, K, O, U, D, S, N, V, X, R)
   quant/
-    schemes.py         — Quantization scheme definitions
-    converters.py      — Vectorized ggml block encoders (single source of truth)
+    schemes.py         — Quantization scheme registry (single source of truth for scheme metadata)
+    converters.py      — encode_to_ggml_bytes() dispatch (single encoder source of truth)
+    ggml_binding.py    — ctypes binding to libggml (byte-identical to llama-quantize)
+    ggml_facts.py      — Block/type-size tables derived from ggml_binding
+    tiers.py           — Tier (size-band) boundary classification
+    calibration.py     — Optional calibrated noise/speed-multiplier overrides
   evolution/
     probing.py         — Sensitivity measurement (real or heuristic)
     predictor.py       — Loss/size/speed prediction with collapse penalties
     survival.py        — Evolutionary search with Protector/Crusher mutations
+  v2/                  — Budget search (--algo v2, NON-DEFAULT; see docs/redesign.md)
+    sensitivity.py     — Per-tensor x per-scheme distortion table (imatrix-weighted)
+    calibrate.py       — Group-probe kappa fitting (amplification factors)
+    allocate.py        — Multiple-choice knapsack (Lagrangian greedy + polish)
+    resolve.py         — Per-tensor scheme resolution -> writer override map
+    interchange.py     — search_results.json BUDGET-<N>GiB pseudo-tier interop
+    outcome.py         — Frontier/measurement bookkeeping
+    search.py          — v2 orchestration entry point
   qat/                 — Quantization-Aware Training (QAT-LoRA); needs the [qat] extra
     fake_quant.py      — Differentiable per-scheme fake-quant + STE (vs libggml)
     wrap.py            — QATLinear (fake-quants merged base+LoRA) + wrap_model
+    expert_wrap.py     — Fused 3-D MoE expert QAT (per-expert LoRA via parametrization)
     names.py           — HF module -> GGUF tensor name mapping (reuses source.py)
-    config.py          — load_hybrid_config: search_results.json -> {group: ggml_type}
+    config.py          — load_hybrid_config / load_tensor_config (search_results.json -> schemes)
+    diskmap.py         — Base-weight map for adapter-key reconciliation preflight
+    merge.py           — Streaming on-disk base+adapter merge; backs `magicquant qat-merge`
     train.py           — run_qat: the QAT-LoRA loop (completion-only) + adapters
     validate.py        — perplexity comparison (QAT hybrid vs plain hybrid)
   utils/
     llamacpp.py        — llama.cpp integration for perplexity measurement
     naming.py          — Hybrid model filename generation
+    measurement.py     — Shared measurement/statistics helpers
+    model_card.py      — HuggingFace model card generation; backs `magicquant card`
+  imatrix.py           — Importance-matrix capture via llama-imatrix; backs `magicquant imatrix`
+  incumbents.py        — Best-known-config tracking across search rounds
+  pareto.py            — Pareto-frontier utilities
+  config.py            — Settings from env vars / .env (single source of truth for defaults)
+  logging.py           — structlog configuration
   orchestrator.py      — Pipeline coordination
   __main__.py          — CLI entry point
 ```
+
+`v2/` is the 2026-07 budget-search redesign (`--algo v2 --budget-gb`); the v1
+evolutionary path above remains the default. `qat/_ggml_ref.py` (a private
+reference helper, not part of the public API) is omitted from this tree.
 
 ## Configuration via Environment
 
@@ -265,7 +374,7 @@ docker run --rm -v ./output:/app/output magicquant:latest search /data/model.ggu
 ```bash
 pip install -e ".[dev]"
 make test    # Run pytest suite
-make lint    # Syntax check
+make lint    # Ruff lint (magicquant/ + tests/)
 make clean   # Remove build artifacts
 ```
 

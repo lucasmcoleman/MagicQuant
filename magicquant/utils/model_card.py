@@ -6,7 +6,7 @@ scheme map for each tier. Purely local — no network. An optional ``--upload``
 path (huggingface_hub) can be layered on top by the CLI.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION, tier_scheme_version
 

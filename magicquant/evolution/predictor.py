@@ -18,11 +18,17 @@ with an importance matrix), noise factors for imatrix-consuming schemes
 see `magicquant.quant.schemes.effective_noise_factor`.
 """
 
-from typing import Dict, List, Tuple, Optional
-import numpy as np
+from typing import Dict, List, Optional
 
 from magicquant.quant import calibration
 from magicquant.quant.schemes import effective_noise_factor, get_scheme_by_name
+from magicquant.utils.naming import config_key as _naming_config_key
+
+# Default coefficient for the non-linear "collapse" penalty applied when
+# multiple high-sensitivity ("brain") groups are compressed simultaneously.
+# Single home for this value -- tools/fit_noise_factors.py imports it rather
+# than hand-copying the literal.
+DEFAULT_COLLAPSE_PENALTY_BETA = 0.02
 
 
 class PredictiveScorer:
@@ -40,6 +46,13 @@ class PredictiveScorer:
 
     # Scheme attributes (noise_factor, compression_ratio, speed_multiplier)
     # are read from the scheme registry — see magicquant.quant.schemes.
+
+    # "Brain" groups whose compression triggers the collapse penalty in
+    # predict_loss. Single home for this tuple -- tools/fit_noise_factors.py
+    # imports it rather than hand-copying the literal. (survival.py:103's
+    # _HIGH_SENSITIVITY set is a separate, deliberately-uncoupled copy used
+    # for "brain" vs "attention" sampling categories; see the comment there.)
+    HIGH_SENSITIVITY_GROUPS = ('E', 'H', 'O', 'R')
 
     def __init__(
         self,
@@ -75,7 +88,7 @@ class PredictiveScorer:
         # Collapse penalty: when multiple "brain" layers (E, H, O, R) are
         # compressed, quality degrades super-linearly.
         self.collapse_penalty_alpha = 1.5
-        self.collapse_penalty_beta = 0.02
+        self.collapse_penalty_beta = DEFAULT_COLLAPSE_PENALTY_BETA
 
     def predict_loss(self, group_schemes: Dict[str, str]) -> float:
         """
@@ -86,7 +99,7 @@ class PredictiveScorer:
             + collapse penalty if >= 2 brain layers compressed
         """
         total_loss = 0.0
-        high_sensitivity_groups = ['E', 'H', 'O', 'R']
+        high_sensitivity_groups = self.HIGH_SENSITIVITY_GROUPS
 
         for group, scheme in group_schemes.items():
             sens_weight = self.sensitivity_weights.get(
@@ -235,7 +248,13 @@ class PredictiveScorer:
         return self.baseline_size_gb * (avg_bpw / 16.0)
 
     def _make_config_key(self, group_schemes: Dict[str, str]) -> str:
-        return "|".join(f"{g}:{group_schemes[g]}" for g in sorted(group_schemes))
+        # Delegates to magicquant.utils.naming.config_key (search-v1/4).
+        # Unlike MagicQuantOrchestrator._config_key, this instance's key
+        # only feeds the in-memory self.residual_cache (written by
+        # record_residual, read by predict_loss) -- there's no enforced
+        # cross-module contract here, it just happens to share the same
+        # format.
+        return _naming_config_key(group_schemes)
 
     def _noise_factor_for(self, scheme: str) -> float:
         """Prefer an empirically calibrated noise_factor (from
@@ -376,9 +395,3 @@ class PredictiveScorer:
     def record_residual(self, config: Dict[str, str], residual: float):
         key = self._make_config_key(config)
         self.residual_cache[key] = residual
-
-    def get_sensitivity_weights(self) -> Dict[str, float]:
-        return self.sensitivity_weights.copy()
-
-    def update_sensitivity_weights(self, new_weights: Dict[str, float]):
-        self.sensitivity_weights = new_weights

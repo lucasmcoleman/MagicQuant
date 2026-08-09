@@ -7,12 +7,13 @@ QAT run (35B MoE, multi-hour, unattended):
     (_save_adapters, called once training finishes) is untouched and still
     raises on failure.
   - a config-identity guard: each checkpoint records a hash of
-    (model, scheme_by_group, and -- since fused 3-D MoE expert QAT landed --
-    the per-tensor scheme map and the expert rank/alpha/quant-mode).
-    Resuming from a checkpoint whose hash disagrees with the CURRENT run's
-    cfg is refused with a clear error naming --no-resume, rather than
-    silently training LoRA adapters that were initialized against a
-    checkpoint from a different frozen base/quant config.
+    (model, scheme_by_group, base lora_r/lora_alpha, and -- since fused 3-D
+    MoE expert QAT landed -- the per-tensor scheme map and the expert
+    rank/alpha/quant-mode). Resuming from a checkpoint whose hash disagrees
+    with the CURRENT run's cfg is refused with a clear error naming
+    --no-resume, rather than silently training LoRA adapters that were
+    initialized against a checkpoint from a different frozen base/quant
+    config or a different adapter rank/scale.
 """
 
 import json
@@ -209,8 +210,14 @@ _DEFAULT_EXPERT_CONFIG = {
 
 
 def _expected_hash(cfg, expert_config=_DEFAULT_EXPERT_CONFIG):
+    # float(...) matches run_qat's own coercion of lora_alpha (train.py's
+    # _parse_run_cfg) -- _base_cfg sets an int (8), but the hash must be
+    # computed against the resolved float (8.0) or this helper silently
+    # diverges from what run_qat actually hashes.
     return train_mod._config_hash(
-        cfg["model"], cfg["scheme_by_group"], {}, expert_config
+        cfg["model"], cfg["scheme_by_group"],
+        cfg["lora_r"], float(cfg["lora_alpha"]),
+        {}, expert_config,
     )
 
 
@@ -254,10 +261,11 @@ def test_run_qat_meta_records_config_hash(tmp_path, patched_trainer):
 def test_config_hash_is_unchanged_without_expert_or_tensor_config():
     """An old Linear-only checkpoint must stay resumable: with neither a
     per-tensor map nor an expert config, the hash is byte-for-byte what the
-    two-argument form produced before either existed."""
+    four-argument form (model, scheme_by_group, lora_r, lora_alpha) produces
+    when scheme_by_tensor/expert_config are omitted vs. explicit {}/None."""
     schemes = {"U": "MXFP4", "Q": "Q6_K"}
-    assert train_mod._config_hash("m", schemes) == train_mod._config_hash(
-        "m", schemes, {}, None
+    assert train_mod._config_hash("m", schemes, 4, 8.0) == train_mod._config_hash(
+        "m", schemes, 4, 8.0, {}, None
     )
 
 
@@ -272,13 +280,37 @@ def test_config_hash_changes_when_the_expert_config_changes(changed):
     and different semantics; resuming across that change must be refused, which
     only works if the hash moves."""
     schemes = {"U": "MXFP4"}
-    baseline = train_mod._config_hash("m", schemes, {}, _DEFAULT_EXPERT_CONFIG)
+    baseline = train_mod._config_hash("m", schemes, 4, 8.0, {}, _DEFAULT_EXPERT_CONFIG)
     other = dict(_DEFAULT_EXPERT_CONFIG, **changed)
-    assert train_mod._config_hash("m", schemes, {}, other) != baseline
+    assert train_mod._config_hash("m", schemes, 4, 8.0, {}, other) != baseline
 
 
 def test_config_hash_changes_when_the_per_tensor_map_changes():
     schemes = {"X": "Q3_K"}
-    a = train_mod._config_hash("m", schemes, {"blk.0.ffn_gate_exps.weight": "Q2_K"})
-    b = train_mod._config_hash("m", schemes, {"blk.0.ffn_gate_exps.weight": "Q3_K"})
+    a = train_mod._config_hash(
+        "m", schemes, 4, 8.0, {"blk.0.ffn_gate_exps.weight": "Q2_K"}
+    )
+    b = train_mod._config_hash(
+        "m", schemes, 4, 8.0, {"blk.0.ffn_gate_exps.weight": "Q3_K"}
+    )
     assert a != b
+
+
+# ── the hash covers base lora_r/lora_alpha too (E3) ─────────────────────────
+
+@pytest.mark.parametrize("changed_kwargs", [
+    {"lora_r": 8},
+    {"lora_alpha": 16.0},
+])
+def test_config_hash_changes_when_base_lora_r_or_alpha_changes(changed_kwargs):
+    """Resuming with a different base --lora-r/--lora-alpha than the
+    checkpoint was trained with must be refused. lora_r changes the adapter's
+    tensor shape (caught, eventually, by a torch error inside the trainer's
+    checkpoint load) but lora_alpha alone changes only the LoRA scale
+    (lora_alpha / lora_r) with no shape change at all -- nothing but this
+    hash would ever catch that divergence."""
+    schemes = {"U": "MXFP4"}
+    baseline_kwargs = {"lora_r": 4, "lora_alpha": 8.0}
+    baseline = train_mod._config_hash("m", schemes, **baseline_kwargs)
+    other = dict(baseline_kwargs, **changed_kwargs)
+    assert train_mod._config_hash("m", schemes, **other) != baseline

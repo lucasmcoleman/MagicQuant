@@ -24,7 +24,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
-from magicquant.gguf.source import _HF_TO_GGUF_COMPILED, _hf_name_to_gguf
+from magicquant.gguf.source import _hf_name_to_gguf
 
 
 def hf_to_ggml_name(hf_module_name: str) -> Optional[str]:
@@ -34,9 +34,10 @@ def hf_to_ggml_name(hf_module_name: str) -> Optional[str]:
     tensor name (``...q_proj.weight``). Returns the GGUF tensor name (e.g.
     ``blk.0.attn_q.weight``) or ``None`` if it doesn't match a known mapping.
 
-    Unlike the underlying ``_hf_name_to_gguf`` (which falls back to returning the
-    input unchanged), this returns ``None`` for unmatched names so callers can
-    cleanly skip modules that aren't quantizable weights.
+    Thin wrapper over ``_hf_name_to_gguf(..., strict=True)``: strict mode
+    signals "nothing matched" with ``None`` directly, so this no longer needs
+    a second scan of the pattern table to tell that apart from "matched to an
+    identical name" (``output.weight``).
     """
     if not hf_module_name:
         return None
@@ -47,13 +48,7 @@ def hf_to_ggml_name(hf_module_name: str) -> Optional[str]:
     if not name.endswith(".weight"):
         name = name + ".weight"
 
-    mapped = _hf_name_to_gguf(name)
-
-    # _hf_name_to_gguf returns the input unchanged when nothing matched. Detect
-    # that "no match" case so we return None rather than a bogus passthrough.
-    if mapped == name and not _matches_a_pattern(name):
-        return None
-    return mapped
+    return _hf_name_to_gguf(name, strict=True)
 
 
 # ── Fused 3-D MoE expert parameters ──────────────────────────────────────────
@@ -241,18 +236,3 @@ def fused_expert_segments(
     return None
 
 
-def _matches_a_pattern(name: str) -> bool:
-    """True if ``name`` (full tensor name) matches one of the HF->GGUF patterns.
-
-    Mirrors ``_hf_name_to_gguf``'s prefix-stripping so the "did anything match?"
-    check agrees with the actual mapping. ``output.weight``/``lm_head.weight`` are
-    handled directly by ``_hf_name_to_gguf`` and count as matches.
-    """
-    if name in ("output.weight", "lm_head.weight"):
-        return True
-    stripped = name
-    for prefix in ("model.language_model.", "language_model."):
-        if stripped.startswith(prefix):
-            stripped = "model." + stripped[len(prefix):]
-            break
-    return any(pat.match(stripped) for pat, _ in _HF_TO_GGUF_COMPILED)

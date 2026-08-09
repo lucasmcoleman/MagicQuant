@@ -41,7 +41,6 @@ import os
 import json
 import tempfile
 import logging
-import numpy as np
 
 from magicquant.quant import calibration
 from magicquant.quant.schemes import get_scheme_by_name
@@ -491,12 +490,6 @@ class SensitivityProber:
         return {g: max(0, s) / total
                 for g, s in self.sensitivity_results.items()}
 
-    def get_high_sensitivity_groups(self, threshold: float = 0.1) -> List[str]:
-        return [g for g, s in self.sensitivity_results.items() if s > threshold]
-
-    def get_probes(self) -> List[Dict]:
-        return self.probe_models.copy()
-
     def save_results(self, path: str):
         """Persist sensitivity data to *path* as JSON."""
         normalized_weights = self.get_normalized_weights()
@@ -849,40 +842,3 @@ class SensitivityAnalysis:
             reverse=True,
         )
         return sorted_groups[:top_n]
-
-    @staticmethod
-    def identify_robust_groups(
-        sensitivity_results: Dict[str, float],
-        max_sensitivity: float = 0.05,
-    ) -> List[str]:
-        return [g for g, s in sensitivity_results.items() if s <= max_sensitivity]
-
-
-if __name__ == "__main__":
-    print("Sensitivity Probing Demo")
-    print("=" * 50)
-
-    prober = SensitivityProber(
-        base_model_path="dummy.gguf",
-        baseline_perplexity=5.23,
-        perplexity_calculator=None,
-    )
-
-    groups_to_probe = ["E", "H", "Q", "K", "O", "U", "D"]
-
-    sensitivity = prober.probe_all_groups(
-        groups=groups_to_probe,
-        aggressive_scheme="Q4_K_M",
-        verbose=True,
-    )
-
-    print()
-    print("Sensitivity Results:")
-    for group, sens in sensitivity.items():
-        print(f"  {group}: {sens:.4f}")
-
-    print()
-    weights = prober.get_normalized_weights()
-    print("Normalized Weights (sum to 1):")
-    for group, w in weights.items():
-        print(f"  {group}: {w:.4f}")

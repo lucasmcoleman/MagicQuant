@@ -18,7 +18,6 @@ import numpy as np
 import magicquant.gguf.source as source_mod
 from magicquant.gguf.writer import (
     GGUFWriter,
-    create_hybrid_gguf,
     _is_f32_required_ssm_operand,
 )
 

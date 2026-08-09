@@ -6,8 +6,9 @@ that will ship), trains only the LoRA adapters on a chat dataset with
 **completion-only loss** (system/user turns masked), and saves the adapters plus a
 ``qat_meta.json`` describing the run. Returns the output directory.
 
-Heavy deps (transformers/trl/datasets) are imported lazily inside ``run_qat`` so
-``import magicquant.qat`` stays light (only torch).
+Heavy deps (transformers/peft/accelerate, +transitively tokenizers/safetensors/
+huggingface_hub) are imported lazily inside ``run_qat`` so ``import magicquant.qat``
+stays light (only torch).
 
 Offline fallback: if the named HF model can't be downloaded, ``run_qat`` builds a
 tiny ``LlamaForCausalLM`` from a small config (with a minimal byte-level
@@ -234,11 +235,17 @@ def _load_model_and_tokenizer(model_id: str, dtype=None):
         _log.info("Loaded %r with %s (dtype=%s).", model_id, cls_name, dtype)
         return model, _ensure_pad_and_template(tokenizer), model_id
 
-    _log.warning(
-        "Could not load %r with any auto-class (last error: %s); falling back to an "
-        "offline tiny LlamaForCausalLM (smoke/CI path).",
-        model_id, last_exc,
+    msg = (
+        f"Could not load {model_id!r} with any auto-class (last error: {last_exc}); "
+        "falling back to an offline tiny LlamaForCausalLM (smoke/CI path)."
     )
+    # Both _log.warning and print: this is a must-not-be-missed message --
+    # the run silently trains on a 2-layer toy model instead of the requested
+    # one and continues to completion -- and this file echoes those messages
+    # to stdout regardless of log level, since an unattended run's stdout is
+    # what actually gets captured and read.
+    _log.warning(msg)
+    print(f"WARNING: {msg}", flush=True)
     return _build_offline_tiny_model()
 
 
@@ -406,10 +413,30 @@ def _try_load_base_weight_map(
 def _config_hash(
     model_id: str,
     scheme_by_group: Dict[str, str],
+    lora_r: int,
+    lora_alpha: float,
     scheme_by_tensor: Optional[Dict[str, str]] = None,
     expert_config: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Identity of everything a resumed checkpoint's adapters were trained against.
+
+    ``lora_r``/``lora_alpha`` are folded in UNCONDITIONALLY, alongside
+    ``scheme_by_group`` -- unlike ``scheme_by_tensor``/``expert_config``, every
+    run has a base LoRA rank/alpha, so there is no "old checkpoint predates
+    this key" case to preserve. Pass the RESOLVED values (what ``wrap_model``
+    was actually called with), not a raw ``cfg.get(...)`` -- a run that omits
+    the key and one that passes the default explicitly must hash identically.
+    A changed ``lora_r`` fails loudly later inside the trainer's checkpoint
+    load (a torch shape mismatch on ``lora_A``/``lora_B``); a changed
+    ``lora_alpha`` alone changes no tensor shape and would otherwise resume
+    silently under a different effective adapter scale -- exactly the failure
+    class ``_check_config_identity`` exists to stop.
+
+    BEHAVIOR DELTA: because this makes the hash unconditional, any checkpoint
+    already written under a version of this function without ``lora_r``/
+    ``lora_alpha`` in the payload will refuse to resume (its saved hash no
+    longer matches), even if lora_r/lora_alpha are unchanged. Restart it with
+    ``--no-resume``.
 
     ``scheme_by_tensor`` and ``expert_config`` are folded in only when non-empty,
     so a run with neither hashes exactly as it did before they existed (an old
@@ -422,6 +449,8 @@ def _config_hash(
     payload: Dict[str, Any] = {
         "model": model_id,
         "scheme_by_group": scheme_by_group,
+        "lora_r": lora_r,
+        "lora_alpha": lora_alpha,
     }
     if scheme_by_tensor:
         payload["scheme_by_tensor"] = scheme_by_tensor
@@ -625,12 +654,13 @@ def _check_config_identity(checkpoint_dir: str, config_hash: str) -> None:
     A checkpoint with no hash file predates this guard (or its best-effort
     write previously failed) -- resuming from it is unchanged prior behavior,
     not a new risk, so it's allowed through silently. A checkpoint WITH a
-    hash file that disagrees means the model id or per-group quant scheme
-    changed since it was written: resuming those LoRA adapters would train
-    them against a frozen base / fake-quant config that no longer matches
-    what this run is compensating for, silently corrupting the result. That
-    must stop the run outright rather than degrade to a fresh start -- the
-    safe fallback is explicit, named in the error: ``--no-resume``.
+    hash file that disagrees means the model id, per-group/per-tensor quant
+    scheme, base or expert LoRA rank/alpha, or expert config changed since it
+    was written: resuming those LoRA adapters would train them against a
+    frozen base / fake-quant config (or adapter shape/scale) that no longer
+    matches what this run is compensating for, silently corrupting the
+    result. That must stop the run outright rather than degrade to a fresh
+    start -- the safe fallback is explicit, named in the error: ``--no-resume``.
     """
     hash_path = os.path.join(checkpoint_dir, _CONFIG_HASH_FILENAME)
     if not os.path.isfile(hash_path):
@@ -641,11 +671,12 @@ def _check_config_identity(checkpoint_dir: str, config_hash: str) -> None:
         raise RuntimeError(
             f"Refusing to resume from {checkpoint_dir!r}: its config_hash "
             f"({saved_hash}) does not match the current run's config_hash "
-            f"({config_hash}) -- the model or scheme_by_group changed since "
-            f"this checkpoint was written. Resuming LoRA adapters trained "
-            f"against a different frozen base/quant config would silently "
-            f"corrupt the run. Start fresh with --no-resume (or resume=False) "
-            f"if this is intentional."
+            f"({config_hash}) -- the model, scheme_by_group/scheme_by_tensor, "
+            f"lora_r/lora_alpha, or expert_config changed since this "
+            f"checkpoint was written. Resuming LoRA adapters trained against "
+            f"a different frozen base/quant config or adapter rank/scale "
+            f"would silently corrupt the run. Start fresh with --no-resume "
+            f"(or resume=False) if this is intentional."
         )
 
 
@@ -763,6 +794,209 @@ def _resolve_resume_checkpoint(trainer_output_dir: str, resume: bool) -> Optiona
     return None
 
 
+@dataclass
+class _RunConfig:
+    """Resolved run_qat hyperparameters -- see run_qat's docstring for the
+    documented default for each field. Plain data holder for the ~20 locals
+    ``_parse_run_cfg`` resolves out of ``cfg``, threaded through the rest of
+    ``run_qat`` and into ``qat_meta.json``.
+    """
+
+    lora_r: int
+    lora_alpha: float
+    epochs: float
+    max_steps: int
+    lr: float
+    max_seq_len: int
+    warmup_ratio: float
+    weight_decay: float
+    max_grad_norm: float
+    lr_scheduler: str
+    gradient_checkpointing: bool
+    save_steps: int
+    save_total_limit: int
+    resume: bool
+    expert_lora_r: int
+    expert_lora_alpha: float
+    expert_quant_mode: str
+    wrap_experts: bool
+
+
+def _parse_run_cfg(cfg: Dict[str, Any]) -> _RunConfig:
+    """Resolve run_qat's hyperparameters out of ``cfg`` (defaults documented
+    on run_qat itself). Raises ValueError on an invalid ``expert_quant_mode``
+    -- BEFORE the model loads, so a bad config fails in ~1s, not after a
+    multi-minute load on a large model (see run_qat).
+    """
+    lora_r = int(cfg.get("lora_r", 8))
+    lora_alpha = float(cfg.get("lora_alpha", 16))
+    epochs = float(cfg.get("epochs", 1))
+    max_steps = int(cfg.get("max_steps", -1))
+    lr = float(cfg.get("lr", 2e-4))
+    max_seq_len = int(cfg.get("max_seq_len", 512))
+
+    # Training schedule defaults (production-grade, all overridable via cfg).
+    warmup_ratio = float(cfg.get("warmup_ratio", 0.03))
+    weight_decay = float(cfg.get("weight_decay", 0.0))
+    max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
+    lr_scheduler = str(cfg.get("lr_scheduler", "cosine"))
+    gradient_checkpointing = bool(cfg.get("gradient_checkpointing", False))
+
+    # Checkpoint/resume defaults -- see the module-level "checkpoint / resume"
+    # section for why only LoRA params get written to disk.
+    save_steps = int(cfg.get("save_steps", 100))
+    save_total_limit = int(cfg.get("save_total_limit", 3))
+    resume = bool(cfg.get("resume", True))
+
+    expert_lora_r = int(cfg.get("expert_lora_r", 4))
+    expert_lora_alpha = float(cfg.get("expert_lora_alpha", 2 * expert_lora_r))
+    expert_quant_mode = str(cfg.get("expert_quant_mode", MODE_LIVE))
+    wrap_experts = bool(cfg.get("wrap_experts", True))
+    if expert_quant_mode not in EXPERT_QUANT_MODES:
+        raise ValueError(
+            f"expert_quant_mode must be one of {EXPERT_QUANT_MODES}, "
+            f"got {expert_quant_mode!r}"
+        )
+    return _RunConfig(
+        lora_r=lora_r, lora_alpha=lora_alpha, epochs=epochs, max_steps=max_steps,
+        lr=lr, max_seq_len=max_seq_len, warmup_ratio=warmup_ratio,
+        weight_decay=weight_decay, max_grad_norm=max_grad_norm,
+        lr_scheduler=lr_scheduler, gradient_checkpointing=gradient_checkpointing,
+        save_steps=save_steps, save_total_limit=save_total_limit, resume=resume,
+        expert_lora_r=expert_lora_r, expert_lora_alpha=expert_lora_alpha,
+        expert_quant_mode=expert_quant_mode, wrap_experts=wrap_experts,
+    )
+
+
+def _log_expert_cost(
+    expert_cost: Dict[str, Any],
+    expert_lora_r: int,
+    expert_lora_alpha: float,
+    expert_quant_mode: str,
+) -> None:
+    """Log (and print) the fused 3-D expert QAT cost estimate.
+
+    Both _log.info and print, for the same reason the resume message in
+    run_qat does: this module's logger has no handler in a real invocation,
+    and this is the number that decides whether the run can finish at all.
+    """
+    _expert_msg = (
+        f"Fused 3-D expert QAT: {expert_cost['n_expert_tensors']} tensors, "
+        f"{expert_cost['base_elements'] / 1e9:.1f}e9 base elements covered, "
+        f"r={expert_lora_r} alpha={expert_lora_alpha} "
+        f"mode={expert_quant_mode!r}; adapters "
+        f"{expert_cost['lora_params'] / 1e6:.1f}M params "
+        f"(~{expert_cost['train_gib']:.2f} GiB incl. grads + AdamW moments)"
+    )
+    if expert_cost["live_forward_seconds"] > 0:
+        _expert_msg += (
+            f"; estimated live fake-quant cost "
+            f"~{expert_cost['live_forward_seconds']:.0f} s per forward pass"
+        )
+    _log.info(_expert_msg)
+    print(_expert_msg, flush=True)
+    if expert_cost["live_forward_seconds"] > 60:
+        _slow = (
+            f"WARNING: live expert fake-quant is estimated at "
+            f"~{expert_cost['live_forward_seconds'] / 60:.0f} min per forward "
+            f"pass on this model -- a training step costs at least that much. "
+            f"Set expert_quant_mode='frozen' (fake-quantize the expert base "
+            f"once at wrap time) to make the run finish, accepting that the "
+            f"adapter delta is then not re-quantized during training."
+        )
+        _log.warning(_slow)
+        print(_slow, flush=True)
+
+
+def _build_training_args(trainer_output_dir: str, rc: _RunConfig, use_bf16: bool, use_fp16: bool):
+    """Build run_qat's TrainingArguments (schedule/checkpoint defaults are
+    documented on run_qat itself)."""
+    from transformers import TrainingArguments
+
+    return TrainingArguments(
+        output_dir=trainer_output_dir,
+        per_device_train_batch_size=1,
+        num_train_epochs=rc.epochs,
+        max_steps=rc.max_steps,
+        learning_rate=rc.lr,
+        warmup_ratio=rc.warmup_ratio,
+        weight_decay=rc.weight_decay,
+        max_grad_norm=rc.max_grad_norm,
+        lr_scheduler_type=rc.lr_scheduler,
+        logging_steps=1,
+        save_strategy="steps",
+        save_steps=rc.save_steps,
+        save_total_limit=rc.save_total_limit,
+        report_to=[],
+        use_cpu=not torch.cuda.is_available(),
+        bf16=use_bf16,
+        fp16=use_fp16,
+        dataloader_num_workers=0,
+    )
+
+
+def _build_run_meta(
+    cfg: Dict[str, Any],
+    rc: _RunConfig,
+    loaded_from: str,
+    base_weight_map: Optional[Dict[str, str]],
+    scheme_by_group: Dict[str, str],
+    scheme_by_tensor: Dict[str, str],
+    config_hash: str,
+    n_trainable: int,
+    adapter_path: str,
+    resume_from_checkpoint: Optional[str],
+    expert_params: list,
+    expert_cost: Dict[str, Any],
+    model,
+) -> Dict[str, Any]:
+    """Build the ``qat_meta.json`` dict."""
+    meta: Dict[str, Any] = {
+        "model": cfg["model"],
+        "loaded_from": loaded_from,
+        "adapter_keys_reconciled_to_disk": base_weight_map is not None,
+        "scheme_by_group": scheme_by_group,
+        "config_hash": config_hash,
+        "lora_r": rc.lora_r,
+        "lora_alpha": rc.lora_alpha,
+        "epochs": rc.epochs,
+        "max_steps": rc.max_steps,
+        "lr": rc.lr,
+        "max_seq_len": rc.max_seq_len,
+        "warmup_ratio": rc.warmup_ratio,
+        "weight_decay": rc.weight_decay,
+        "max_grad_norm": rc.max_grad_norm,
+        "lr_scheduler": rc.lr_scheduler,
+        "gradient_checkpointing": rc.gradient_checkpointing,
+        "save_steps": rc.save_steps,
+        "save_total_limit": rc.save_total_limit,
+        "resume": rc.resume,
+        "resumed_from_checkpoint": resume_from_checkpoint,
+        "trainable_params": n_trainable,
+        "adapter_file": os.path.basename(adapter_path),
+        # Fused 3-D MoE experts. expert_lora_r/expert_lora_alpha are READ BY
+        # THE MERGE (magicquant.qat.merge computes its 3-D scale from them and
+        # falls back to lora_r/lora_alpha when absent), so they are written
+        # unconditionally -- even when no expert was wrapped -- rather than only
+        # when they differ from the Linear values.
+        "expert_lora_r": rc.expert_lora_r,
+        "expert_lora_alpha": rc.expert_lora_alpha,
+        "expert_quant_mode": rc.expert_quant_mode,
+        "wrap_experts": rc.wrap_experts,
+        "n_expert_tensors": len(expert_params),
+        "expert_adapter_params": expert_cost["lora_params"],
+        "expert_adapters": fused_expert_adapter_meta(model),
+    }
+    if scheme_by_tensor:
+        # The per-tensor map is what actually routed the run; record its size
+        # and a hash rather than 750 entries inline.
+        meta["scheme_by_tensor_count"] = len(scheme_by_tensor)
+        meta["scheme_by_tensor_hash"] = hashlib.sha256(
+            json.dumps(scheme_by_tensor, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+    return meta
+
+
 def run_qat(cfg: Dict[str, Any]) -> str:
     """Run QAT-LoRA per ``cfg`` and return the output adapter directory.
 
@@ -798,53 +1032,28 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     resumed from automatically; a missing or corrupt checkpoint silently falls
     back to a fresh start rather than failing the run.
     """
-    from transformers import Trainer, TrainingArguments
+    from transformers import Trainer
 
     out_dir = cfg["out"]
     os.makedirs(out_dir, exist_ok=True)
 
-    lora_r = int(cfg.get("lora_r", 8))
-    lora_alpha = float(cfg.get("lora_alpha", 16))
-    epochs = float(cfg.get("epochs", 1))
-    max_steps = int(cfg.get("max_steps", -1))
-    lr = float(cfg.get("lr", 2e-4))
-    max_seq_len = int(cfg.get("max_seq_len", 512))
-
-    # Training schedule defaults (production-grade, all overridable via cfg).
-    warmup_ratio = float(cfg.get("warmup_ratio", 0.03))
-    weight_decay = float(cfg.get("weight_decay", 0.0))
-    max_grad_norm = float(cfg.get("max_grad_norm", 1.0))
-    lr_scheduler = str(cfg.get("lr_scheduler", "cosine"))
-    gradient_checkpointing = bool(cfg.get("gradient_checkpointing", False))
-
-    # Checkpoint/resume defaults -- see the module-level "checkpoint / resume"
-    # section for why only LoRA params get written to disk.
-    save_steps = int(cfg.get("save_steps", 100))
-    save_total_limit = int(cfg.get("save_total_limit", 3))
-    resume = bool(cfg.get("resume", True))
-
-    expert_lora_r = int(cfg.get("expert_lora_r", 4))
-    expert_lora_alpha = float(cfg.get("expert_lora_alpha", 2 * expert_lora_r))
-    expert_quant_mode = str(cfg.get("expert_quant_mode", MODE_LIVE))
-    wrap_experts = bool(cfg.get("wrap_experts", True))
-    if expert_quant_mode not in EXPERT_QUANT_MODES:
-        raise ValueError(
-            f"expert_quant_mode must be one of {EXPERT_QUANT_MODES}, "
-            f"got {expert_quant_mode!r}"
-        )
+    rc = _parse_run_cfg(cfg)
 
     scheme_by_group = _resolve_scheme_by_group(cfg)
     scheme_by_tensor = _resolve_scheme_by_tensor(cfg)
     expert_config = {
-        "wrap_experts": wrap_experts,
-        "expert_lora_r": expert_lora_r,
-        "expert_lora_alpha": expert_lora_alpha,
-        "expert_quant_mode": expert_quant_mode,
-    } if wrap_experts else None
+        "wrap_experts": rc.wrap_experts,
+        "expert_lora_r": rc.expert_lora_r,
+        "expert_lora_alpha": rc.expert_lora_alpha,
+        "expert_quant_mode": rc.expert_quant_mode,
+    } if rc.wrap_experts else None
     # Computed once, reused for both the checkpoint config-identity guard
     # (below) and qat_meta.json -- see _check_config_identity's docstring.
+    # lora_r/lora_alpha are the RESOLVED locals from _RunConfig (not a raw
+    # cfg.get), matching what wrap_model below is actually called with.
     config_hash = _config_hash(
-        cfg["model"], scheme_by_group, scheme_by_tensor, expert_config
+        cfg["model"], scheme_by_group, rc.lora_r, rc.lora_alpha,
+        scheme_by_tensor, expert_config,
     )
 
     model, tokenizer, loaded_from = _load_model_and_tokenizer(
@@ -857,13 +1066,13 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         model,
         scheme_by_group,
         TensorGroupClassifier(),
-        lora_r=lora_r,
-        lora_alpha=lora_alpha,
+        lora_r=rc.lora_r,
+        lora_alpha=rc.lora_alpha,
         scheme_by_tensor=scheme_by_tensor,
-        wrap_experts=wrap_experts,
-        expert_lora_r=expert_lora_r,
-        expert_lora_alpha=expert_lora_alpha,
-        expert_quant_mode=expert_quant_mode,
+        wrap_experts=rc.wrap_experts,
+        expert_lora_r=rc.expert_lora_r,
+        expert_lora_alpha=rc.expert_lora_alpha,
+        expert_quant_mode=rc.expert_quant_mode,
     )
     n_qat = sum(1 for m in model.modules() if isinstance(m, QATLinear))
     expert_params = list(iter_expert_parametrizations(model))
@@ -910,41 +1119,15 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         )
 
     if expert_params:
-        # Both _log.info and print, for the same reason the resume message below
-        # does: this module's logger has no handler in a real invocation, and
-        # this is the number that decides whether the run can finish at all.
-        _expert_msg = (
-            f"Fused 3-D expert QAT: {expert_cost['n_expert_tensors']} tensors, "
-            f"{expert_cost['base_elements'] / 1e9:.1f}e9 base elements covered, "
-            f"r={expert_lora_r} alpha={expert_lora_alpha} "
-            f"mode={expert_quant_mode!r}; adapters "
-            f"{expert_cost['lora_params'] / 1e6:.1f}M params "
-            f"(~{expert_cost['train_gib']:.2f} GiB incl. grads + AdamW moments)"
+        _log_expert_cost(
+            expert_cost, rc.expert_lora_r, rc.expert_lora_alpha, rc.expert_quant_mode
         )
-        if expert_cost["live_forward_seconds"] > 0:
-            _expert_msg += (
-                f"; estimated live fake-quant cost "
-                f"~{expert_cost['live_forward_seconds']:.0f} s per forward pass"
-            )
-        _log.info(_expert_msg)
-        print(_expert_msg, flush=True)
-        if expert_cost["live_forward_seconds"] > 60:
-            _slow = (
-                f"WARNING: live expert fake-quant is estimated at "
-                f"~{expert_cost['live_forward_seconds'] / 60:.0f} min per forward "
-                f"pass on this model -- a training step costs at least that much. "
-                f"Set expert_quant_mode='frozen' (fake-quantize the expert base "
-                f"once at wrap time) to make the run finish, accepting that the "
-                f"adapter delta is then not re-quantized during training."
-            )
-            _log.warning(_slow)
-            print(_slow, flush=True)
 
-    if gradient_checkpointing:
+    if rc.gradient_checkpointing:
         _enable_gradient_checkpointing(model)
 
     rows = _read_jsonl(cfg["dataset"])
-    train_examples = _build_dataset(tokenizer, rows, max_seq_len)
+    train_examples = _build_dataset(tokenizer, rows, rc.max_seq_len)
     if not train_examples:
         raise ValueError(
             f"No trainable examples built from {cfg['dataset']!r} "
@@ -970,7 +1153,7 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     # silent in every real invocation. The resume/fresh-start decision is the
     # one thing an unattended overnight run most needs visible in its captured
     # stdout log, so it also goes through print(..., flush=True) here.
-    resume_from_checkpoint = _resolve_resume_checkpoint(trainer_output_dir, resume)
+    resume_from_checkpoint = _resolve_resume_checkpoint(trainer_output_dir, rc.resume)
     if resume_from_checkpoint:
         # Config-identity guard: an incomplete/corrupt checkpoint degrades
         # silently to a fresh start (see _resolve_resume_checkpoint above),
@@ -979,7 +1162,7 @@ def run_qat(cfg: Dict[str, Any]) -> str:
         # _check_config_identity's docstring. This raises, not warns.
         _check_config_identity(resume_from_checkpoint, config_hash)
         _resume_msg = f"Resuming QAT from checkpoint: {resume_from_checkpoint}"
-    elif resume:
+    elif rc.resume:
         _resume_msg = f"No usable checkpoint found in {trainer_output_dir}; starting fresh."
     else:
         _resume_msg = (
@@ -989,26 +1172,7 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     _log.info(_resume_msg)
     print(_resume_msg, flush=True)
 
-    args = TrainingArguments(
-        output_dir=trainer_output_dir,
-        per_device_train_batch_size=1,
-        num_train_epochs=epochs,
-        max_steps=max_steps,
-        learning_rate=lr,
-        warmup_ratio=warmup_ratio,
-        weight_decay=weight_decay,
-        max_grad_norm=max_grad_norm,
-        lr_scheduler_type=lr_scheduler,
-        logging_steps=1,
-        save_strategy="steps",
-        save_steps=save_steps,
-        save_total_limit=save_total_limit,
-        report_to=[],
-        use_cpu=not torch.cuda.is_available(),
-        bf16=use_bf16,
-        fp16=use_fp16,
-        dataloader_num_workers=0,
-    )
+    args = _build_training_args(trainer_output_dir, rc, use_bf16, use_fp16)
 
     trainer = Trainer(
         model=model,
@@ -1025,49 +1189,21 @@ def run_qat(cfg: Dict[str, Any]) -> str:
     # so every saved key is the base checkpoint's real DISK key, not the
     # loaded model's module-graph name. See _save_adapters's docstring.
     adapter_path = _save_adapters(model, out_dir, weight_map=base_weight_map)
-    meta = {
-        "model": cfg["model"],
-        "loaded_from": loaded_from,
-        "adapter_keys_reconciled_to_disk": base_weight_map is not None,
-        "scheme_by_group": scheme_by_group,
-        "config_hash": config_hash,
-        "lora_r": lora_r,
-        "lora_alpha": lora_alpha,
-        "epochs": epochs,
-        "max_steps": max_steps,
-        "lr": lr,
-        "max_seq_len": max_seq_len,
-        "warmup_ratio": warmup_ratio,
-        "weight_decay": weight_decay,
-        "max_grad_norm": max_grad_norm,
-        "lr_scheduler": lr_scheduler,
-        "gradient_checkpointing": gradient_checkpointing,
-        "save_steps": save_steps,
-        "save_total_limit": save_total_limit,
-        "resume": resume,
-        "resumed_from_checkpoint": resume_from_checkpoint,
-        "trainable_params": n_trainable,
-        "adapter_file": os.path.basename(adapter_path),
-        # Fused 3-D MoE experts. expert_lora_r/expert_lora_alpha are READ BY
-        # THE MERGE (magicquant.qat.merge computes its 3-D scale from them and
-        # falls back to lora_r/lora_alpha when absent), so they are written
-        # unconditionally -- even when no expert was wrapped -- rather than only
-        # when they differ from the Linear values.
-        "expert_lora_r": expert_lora_r,
-        "expert_lora_alpha": expert_lora_alpha,
-        "expert_quant_mode": expert_quant_mode,
-        "wrap_experts": wrap_experts,
-        "n_expert_tensors": len(expert_params),
-        "expert_adapter_params": expert_cost["lora_params"],
-        "expert_adapters": fused_expert_adapter_meta(model),
-    }
-    if scheme_by_tensor:
-        # The per-tensor map is what actually routed the run; record its size
-        # and a hash rather than 750 entries inline.
-        meta["scheme_by_tensor_count"] = len(scheme_by_tensor)
-        meta["scheme_by_tensor_hash"] = hashlib.sha256(
-            json.dumps(scheme_by_tensor, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:16]
+    meta = _build_run_meta(
+        cfg=cfg,
+        rc=rc,
+        loaded_from=loaded_from,
+        base_weight_map=base_weight_map,
+        scheme_by_group=scheme_by_group,
+        scheme_by_tensor=scheme_by_tensor,
+        config_hash=config_hash,
+        n_trainable=n_trainable,
+        adapter_path=adapter_path,
+        resume_from_checkpoint=resume_from_checkpoint,
+        expert_params=expert_params,
+        expert_cost=expert_cost,
+        model=model,
+    )
     with open(os.path.join(out_dir, "qat_meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 

@@ -9,7 +9,7 @@ import subprocess
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -36,6 +36,25 @@ def _env_int(name: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def _find_tool_in_dirs(possible_names: List[str], search_dirs: List[Path]) -> Optional[str]:
+    """Search *search_dirs* (outer) x *possible_names* (inner) for the first
+    existing path, returning it as a string, or None if none exist.
+
+    Dirs-outer, names-inner is LOAD-BEARING: a legacy root binary (e.g.
+    ``<llamacpp_path>/quantize``) must keep winning over a modern
+    build/bin one (e.g. ``<llamacpp_path>/build/bin/llama-quantize``) when
+    both exist -- flipping the nesting order would silently change which
+    binary gets selected. Matches on ``.exists()`` (not ``.is_file()``), so
+    a same-named directory also counts, same as before this was extracted.
+    """
+    for d in search_dirs:
+        for name in possible_names:
+            candidate = d / name
+            if candidate.exists():
+                return str(candidate)
+    return None
 
 
 class LlamaCppTools:
@@ -155,7 +174,15 @@ class LlamaCppTools:
             )
 
     def _find_quantize_tool(self) -> str:
-        """Find the quantize executable."""
+        """Find the quantize executable.
+
+        MagicQuant does not quantize through this binary -- encoding goes
+        through magicquant.quant.ggml_binding.ggml_encode (byte-identical to
+        llama.cpp, see tests/integration/test_encoder_parity.py). It is kept
+        as a llama.cpp-location anchor (construction fails fast if a build
+        dir is missing llama-quantize) and for cmd_dry_run's diagnostic log
+        line (self.quantize_tool), not as MagicQuant's own quantization path.
+        """
         possible_names = ["llama-quantize.exe", "llama-quantize", "quantize.exe", "quantize"]
         base = Path(self.llamacpp_path)
         search_dirs = [
@@ -165,13 +192,10 @@ class LlamaCppTools:
             base / "bin",
         ]
 
-        for d in search_dirs:
-            for name in possible_names:
-                candidate = d / name
-                if candidate.exists():
-                    return str(candidate)
-
-        raise FileNotFoundError(f"Could not find quantize tool in {self.llamacpp_path}")
+        found = _find_tool_in_dirs(possible_names, search_dirs)
+        if found is None:
+            raise FileNotFoundError(f"Could not find quantize tool in {self.llamacpp_path}")
+        return found
 
     def _find_perplexity_tool(self) -> str:
         """Find the perplexity executable."""
@@ -184,13 +208,10 @@ class LlamaCppTools:
             base / "bin",
         ]
 
-        for d in search_dirs:
-            for name in possible_names:
-                candidate = d / name
-                if candidate.exists():
-                    return str(candidate)
-
-        raise FileNotFoundError(f"Could not find perplexity tool in {self.llamacpp_path}")
+        found = _find_tool_in_dirs(possible_names, search_dirs)
+        if found is None:
+            raise FileNotFoundError(f"Could not find perplexity tool in {self.llamacpp_path}")
+        return found
 
     def _resolve_data_file(self, data_file: Optional[str] = None) -> Optional[str]:
         """Resolve the dataset file for perplexity evaluation, PINNED after
@@ -300,61 +321,6 @@ class LlamaCppTools:
         )
         return None
 
-    def quantize_model(
-        self,
-        input_path: str,
-        output_path: str,
-        quant_type: str,
-        verbose: bool = True,
-    ) -> bool:
-        """
-        Quantize a model using llama.cpp.
-
-        Args:
-            input_path: Source model (BF16/F16)
-            output_path: Output quantized model
-            quant_type: Quantization type (Q4_K_M, Q6_K, IQ4_NL, etc.)
-            verbose: Print output
-
-        Returns:
-            True if successful
-        """
-        cmd = [
-            self.quantize_tool,
-            input_path,
-            output_path,
-            quant_type,
-        ]
-        # llama-quantize has no -ngl (quantization doesn't run inference);
-        # nthreads is a trailing positional, not a flag.
-        threads = getattr(self, "threads", None)
-        if threads is not None:
-            cmd.append(str(threads))
-
-        if verbose:
-            print(f"Running: {' '.join(cmd)}")
-
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=_QUANTIZE_TIMEOUT,
-            )
-
-            if verbose:
-                print(result.stdout)
-
-            return True
-
-        except subprocess.CalledProcessError as e:
-            print(f"Quantization failed: {e.stderr}")
-            return False
-        except subprocess.TimeoutExpired:
-            print(f"Quantization timed out after {_QUANTIZE_TIMEOUT}s")
-            return False
-
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(min=1, max=10),
@@ -378,6 +344,48 @@ class LlamaCppTools:
             check=True,
             timeout=timeout,
         )
+
+    def _effective_chunks(self, chunks: int) -> str:
+        """``--chunks`` value shared by ``save_base_logits`` and
+        ``calculate_kl_divergence``: the caller's explicit *chunks* if given
+        (!= -1), else this instance's ``MAGICQUANT_PPL_CHUNKS`` cap, else -1
+        (whole corpus).
+
+        Uses ``getattr(self, "ppl_chunks", None)`` rather than
+        ``self.ppl_chunks`` -- several tests construct a bare instance via
+        ``LlamaCppTools.__new__`` without setting ``ppl_chunks``, and this
+        must keep degrading to "no cap" instead of raising AttributeError.
+        The ``or -1`` falsy-collapse is preserved verbatim (``ppl_chunks ==
+        0`` still yields -1).
+        """
+        return str(chunks if chunks != -1 else (getattr(self, "ppl_chunks", None) or -1))
+
+    def _run_subprocess_or_none(
+        self, cmd: List[str], timeout: int, label: str
+    ) -> Optional[subprocess.CompletedProcess]:
+        """Run *cmd* via ``_run_perplexity_subprocess``, printing
+        ``"<label> failed: <stderr>"`` / ``"<label> timed out"`` and
+        returning None instead of propagating on the two subprocess-failure
+        exceptions every measurement call site handles the same way.
+
+        Catches EXACTLY ``subprocess.CalledProcessError`` and
+        ``subprocess.TimeoutExpired`` -- never a broader ``OSError`` or
+        ``Exception``. A missing/wrong-arch binary raises OSError/
+        FileNotFoundError from ``subprocess.run`` itself, and that must keep
+        propagating OUT of this helper: the orchestrator's measured-search
+        loop depends on it to fail a candidate rather than the call site
+        silently recording "no measurement" (see
+        tests/test_orchestrator_measurement.py::
+        test_measured_search_survives_kl_and_bench_raising_oserror).
+        """
+        try:
+            return self._run_perplexity_subprocess(cmd, timeout=timeout)
+        except subprocess.CalledProcessError as e:
+            print(f"{label} failed: {e.stderr}")
+            return None
+        except subprocess.TimeoutExpired:
+            print(f"{label} timed out")
+            return None
 
     def calculate_perplexity(
         self,
@@ -410,6 +418,9 @@ class LlamaCppTools:
             "-f", resolved_data_file,
             "--ctx-size", str(effective_ctx),
         ] + self._perplexity_batch_flags() + self._gpu_flags()
+        # Deliberately NOT _effective_chunks(): this site omits --chunks
+        # entirely when ppl_chunks is None, whereas the KL/logits sites always
+        # pass a value (-1 sentinel). Do not "finish the fold".
         ppl_chunks = getattr(self, "ppl_chunks", None)
         if ppl_chunks is not None:
             cmd += ["--chunks", str(ppl_chunks)]
@@ -417,30 +428,22 @@ class LlamaCppTools:
         if verbose:
             print(f"Calculating perplexity for {Path(model_path).name}...")
 
-        try:
-            result = self._run_perplexity_subprocess(
-                cmd, timeout=_SUBPROCESS_TIMEOUT,
-            )
-
-            # Parse perplexity from output. llama-perplexity prints the
-            # "Final estimate: PPL = ..." line to STDERR, not stdout, so scan
-            # both streams (matches tools/calibrate_noise_factors.py). Parsing
-            # stdout only silently returned None here — collapsing the entire
-            # measured search + QAT validation to prediction-only.
-            ppl = _parse_perplexity_output(
-                (result.stdout or "") + "\n" + (result.stderr or "")
-            )
-
-            if ppl is not None and verbose:
-                print(f"  Perplexity: {ppl:.4f}")
-            return ppl
-
-        except subprocess.CalledProcessError as e:
-            print(f"Perplexity calculation failed: {e.stderr}")
+        result = self._run_subprocess_or_none(cmd, _SUBPROCESS_TIMEOUT, "Perplexity calculation")
+        if result is None:
             return None
-        except subprocess.TimeoutExpired:
-            print("Perplexity calculation timed out")
-            return None
+
+        # Parse perplexity from output. llama-perplexity prints the
+        # "Final estimate: PPL = ..." line to STDERR, not stdout, so scan
+        # both streams (matches tools/calibrate_noise_factors.py). Parsing
+        # stdout only silently returned None here — collapsing the entire
+        # measured search + QAT validation to prediction-only.
+        ppl = _parse_perplexity_output(
+            (result.stdout or "") + "\n" + (result.stderr or "")
+        )
+
+        if ppl is not None and verbose:
+            print(f"  Perplexity: {ppl:.4f}")
+        return ppl
 
     def bench(
         self,
@@ -500,13 +503,8 @@ class LlamaCppTools:
             "-o", "json",
         ] + self._gpu_flags()
 
-        try:
-            result = self._run_perplexity_subprocess(cmd, timeout=timeout)
-        except subprocess.CalledProcessError as e:
-            print(f"llama-bench failed: {e.stderr}")
-            return None
-        except subprocess.TimeoutExpired:
-            print("llama-bench timed out")
+        result = self._run_subprocess_or_none(cmd, timeout, "llama-bench")
+        if result is None:
             return None
 
         parsed = _parse_bench_json(result.stdout or "")
@@ -565,16 +563,11 @@ class LlamaCppTools:
             "-f", corpus_path,
             "--kl-divergence-base", out_logits_path,
             "--ctx-size", str(ctx_size),
-            "--chunks", str(chunks if chunks != -1 else (getattr(self, "ppl_chunks", None) or -1)),
+            "--chunks", self._effective_chunks(chunks),
         ] + self._perplexity_batch_flags() + self._gpu_flags()
 
-        try:
-            result = self._run_perplexity_subprocess(cmd, timeout=timeout)
-        except subprocess.CalledProcessError as e:
-            print(f"Saving base logits failed: {e.stderr}")
-            return None
-        except subprocess.TimeoutExpired:
-            print("Saving base logits timed out")
+        result = self._run_subprocess_or_none(cmd, timeout, "Saving base logits")
+        if result is None:
             return None
 
         # llama-perplexity exits 0 even when it can't actually run (e.g. the
@@ -641,16 +634,11 @@ class LlamaCppTools:
             "--kl-divergence",
             "--kl-divergence-base", base_logits_path,
             "--ctx-size", str(ctx_size),
-            "--chunks", str(chunks if chunks != -1 else (getattr(self, "ppl_chunks", None) or -1)),
+            "--chunks", self._effective_chunks(chunks),
         ] + self._perplexity_batch_flags() + self._gpu_flags()
 
-        try:
-            result = self._run_perplexity_subprocess(cmd, timeout=timeout)
-        except subprocess.CalledProcessError as e:
-            print(f"KL divergence calculation failed: {e.stderr}")
-            return None
-        except subprocess.TimeoutExpired:
-            print("KL divergence calculation timed out")
+        result = self._run_subprocess_or_none(cmd, timeout, "KL divergence calculation")
+        if result is None:
             return None
 
         parsed = _parse_kl_output((result.stdout or "") + "\n" + (result.stderr or ""))
@@ -918,10 +906,9 @@ def _find_bench_tool(perplexity_tool_path: str) -> Optional[str]:
     possible_names = ["llama-bench.exe", "llama-bench"]
     base = Path(perplexity_tool_path).parent
 
-    for name in possible_names:
-        candidate = base / name
-        if candidate.exists():
-            return str(candidate)
+    found = _find_tool_in_dirs(possible_names, [base])
+    if found is not None:
+        return found
 
     # Fall back to PATH
     which_cmd = "where" if os.name == "nt" else "which"
@@ -937,20 +924,3 @@ def _find_bench_tool(perplexity_tool_path: str) -> Optional[str]:
         return found[0] if found else None
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return None
-
-
-# Quantization type mapping from MagicQuant to llama.cpp
-QUANT_TYPE_MAP: Dict[str, str] = {
-    "BF16": "BF16",  # Keep as-is
-    "Q8_0": "Q8_0",
-    "Q6_K": "Q6_K",
-    "Q5_K": "Q5_K",
-    "Q4_K_M": "Q4_K_M",
-    "IQ4_NL": "IQ4_NL",
-    "MXFP4_MOE": "MXFP4",  # native ggml type 39 (GGML_TYPE_MXFP4)
-}
-
-
-def get_llamacpp_quant_type(magicquant_type: str) -> str:
-    """Convert MagicQuant scheme name to llama.cpp type."""
-    return QUANT_TYPE_MAP.get(magicquant_type, "Q4_K_M")

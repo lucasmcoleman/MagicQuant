@@ -17,7 +17,27 @@ Example: Qwen3-4B-MXFP4-EH-B16-QKO-IQ4NL.gguf
 
 from typing import Dict, Optional
 
-from magicquant.quant.schemes import get_scheme_by_name
+
+def config_key(config: Dict[str, str]) -> str:
+    """Canonical ``group:scheme`` key for a per-group hybrid config, groups
+    sorted -- e.g. ``{"D": "Q4_K_M", "E": "Q6_K"}`` -> ``"D:Q4_K_M|E:Q6_K"``.
+
+    CONTRACT: this format is a PERSISTED interchange format, not just an
+    in-memory key. These strings become the keys of the orchestrator's
+    ``self._measured``, which are serialized as the "measurements" dict
+    keys in search_results.json AND into the measured-search checkpoint
+    (magicquant.orchestrator's ``_write_measured_checkpoint`` /
+    ``_config_key``), and are parsed back by ``tools/reselect_tiers.py``'s
+    ``_parse_key`` (split on "|" then ":"). Do NOT change the separator,
+    the sort, or add a prefix here -- that would silently break checkpoint
+    resume (stale keys stop matching freshly-computed ones) and break
+    reselect_tiers parsing. This is a pure move of the one-liner that used
+    to be hand-duplicated in orchestrator.py, pareto.py, and
+    evolution/predictor.py; it is unrelated to the SPACE-separated
+    human-display variant used elsewhere (e.g. utils/model_card.py's
+    ``_format_scheme_map``).
+    """
+    return "|".join(f"{g}:{config[g]}" for g in sorted(config))
 
 
 # Group code definitions
@@ -89,69 +109,3 @@ def generate_name(
 def get_group_names() -> Dict[str, str]:
     """Get the mapping of group codes to full names."""
     return GROUP_CODES.copy()
-
-
-def generate_config_for_quant(
-    model_name: str,
-    base_quant: str,
-    overrides: Dict[str, str]
-) -> Dict:
-    """
-    Generate a configuration dictionary for hybrid quant creation.
-    
-    This can be used to create the config.yaml needed by the hybrid generator.
-    
-    Args:
-        model_name: Base model name
-        base_quant: Base quantization scheme
-        overrides: Which groups get different quantization
-        
-    Returns:
-        Configuration dictionary in format:
-        {
-            "model": {...},
-            "quantization": {
-                "base": "...",
-                "groups": {
-                    "...": "..."
-                }
-            }
-        }
-    """
-    return {
-        "model": {"name": model_name, "source": None},  # source will be set by user
-        "quantization": {
-            "base": base_quant,
-            "groups": overrides
-        }
-    }
-
-
-def get_scheme_bits(scheme_name: str) -> float:
-    """Get the bits per weight for a quantization scheme."""
-    try:
-        return get_scheme_by_name(scheme_name).bits_per_weight
-    except ValueError:
-        return 8.0
-
-
-if __name__ == "__main__":
-    # Demonstrate the naming scheme
-    print("Testing MagicQuant Naming Scheme")
-    print("=" * 50)
-
-    # Example 1: tier suffix expands to an HF-recognized quant label
-    name1 = generate_name(
-        model_name="Qwen3-4B-Instruct-Q5",
-        base_quant="MXFP4_MOE",
-        overrides={"E": "BF16", "H": "BF16"},
-    )
-    print(f"Example 1: {name1}")
-
-    # Example 2: Q2 tier now also expands (was a gap before)
-    name2 = generate_name(
-        model_name="Qwen3-30B-A3B-Q2",
-        base_quant="Q2_K",
-        overrides={"Q": "Q6_K", "K": "Q6_K", "O": "Q8_0"},
-    )
-    print(f"Example 2: {name2}")

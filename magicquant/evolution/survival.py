@@ -68,8 +68,6 @@ class EvolutionarySurvivor:
           Routing around it keeps the ladder connected while never landing on
           a scheme that has lost every measured comparison uncalibrated.
         """
-        from magicquant.quant.schemes import IMATRIX_DEPENDENT_SCHEME_NAMES
-
         seen = {scheme}
         current = scheme
         while True:
@@ -100,6 +98,12 @@ class EvolutionarySurvivor:
         return self._walk(scheme, "downgrade_neighbor")
 
     # Groups that are sensitive to quantization ("brain" layers)
+    # Cross-reference: magicquant.evolution.predictor.PredictiveScorer.HIGH_SENSITIVITY_GROUPS
+    # is the canonical home for this same {E,H,O,R} set (collapse-penalty
+    # use); this copy is intentionally left uncoupled for now -- it feeds
+    # sampling-category bucketing and floor-clamp logic that CLAUDE.md names
+    # as a seed-pinned regression-fixture trigger. Full unification is
+    # logged future work, not part of this cleanup.
     _HIGH_SENSITIVITY = {'E', 'H', 'O', 'R'}
 
     # Streamed matmul groups: their full weight is read every generated token
@@ -198,7 +202,6 @@ class EvolutionarySurvivor:
         # byte-identical historical scoring.
         self.use_bytes_tps = use_bytes_tps
 
-        self.history: List[Dict] = []
         self.tier_winners: Dict[str, Dict] = {}
 
     def run_evolution(
@@ -818,6 +821,3 @@ class EvolutionarySurvivor:
 
     def get_best_config_per_tier(self) -> Dict[str, Dict[str, str]]:
         return self.tier_winners.copy()
-
-    def get_discovered_configs(self, limit: int = 20) -> List[Dict]:
-        return self.history[:limit]

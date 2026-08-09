@@ -32,7 +32,6 @@ def test_value_error_propagates(tmp_path, monkeypatch, caplog):
     prober = _prober(tmp_path)
 
     # Make the reader step succeed but create_hybrid_gguf raise ValueError.
-    import magicquant.evolution.probing as probing_mod
 
     class _FakeReader:
         def open(self): pass

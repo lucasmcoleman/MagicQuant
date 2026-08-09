@@ -12,7 +12,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from magicquant.qat.fake_quant import fake_quant, FakeQuantSTE, SCHEME_FAKE_QUANT
+from magicquant.qat.fake_quant import fake_quant, SCHEME_FAKE_QUANT
 from magicquant.qat._ggml_ref import ggml_quant_dequant
 
 

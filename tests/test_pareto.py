@@ -12,7 +12,6 @@ real search_results.json shape.
 """
 import json
 
-import pytest
 
 from magicquant.pareto import (
     format_pareto_report,

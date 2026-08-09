@@ -3,7 +3,6 @@ ProbeMeasurementError instead of substituting fabricated heuristics, and
 the measured search runs its prober strict. Non-strict (prediction-only)
 behavior is unchanged."""
 
-import numpy as np
 import pytest
 
 import magicquant.gguf.writer as writer_mod

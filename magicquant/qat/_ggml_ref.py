@@ -17,6 +17,7 @@ import ctypes
 
 import numpy as np
 
+from magicquant.quant.converters import _encode_f32_to_bf16
 from magicquant.quant.ggml_binding import get_handle, ggml_encode
 
 
@@ -25,10 +26,6 @@ from magicquant.quant.ggml_binding import get_handle, ggml_encode
 # These are exported (T) symbols in libggml-base.so. Map the ggml type name to
 # the exported symbol. Float passthroughs are handled separately below.
 _DEQUANT_SYMBOL = {
-    "Q4_0": "dequantize_row_q4_0",
-    "Q4_1": "dequantize_row_q4_1",
-    "Q5_0": "dequantize_row_q5_0",
-    "Q5_1": "dequantize_row_q5_1",
     "Q8_0": "dequantize_row_q8_0",
     "Q2_K": "dequantize_row_q2_K",
     "Q3_K": "dequantize_row_q3_K",
@@ -36,7 +33,6 @@ _DEQUANT_SYMBOL = {
     "Q5_K": "dequantize_row_q5_K",
     "Q6_K": "dequantize_row_q6_K",
     "IQ4_NL": "dequantize_row_iq4_nl",
-    "IQ4_XS": "dequantize_row_iq4_xs",
     "MXFP4": "dequantize_row_mxfp4",
 }
 
@@ -61,13 +57,17 @@ def _get_dequant_fn(ggml_type: str):
 
 
 def _bf16_roundtrip(w: np.ndarray) -> np.ndarray:
-    """f32 -> bf16 (round-to-nearest-even) -> f32, matching converters.py."""
+    """f32 -> bf16 (round-to-nearest-even) -> f32.
+
+    The encode step is ``converters._encode_f32_to_bf16`` -- the GGUF writer's
+    own encoder -- rather than a second copy of its RNE rounding bit-math; this
+    function only widens the resulting bf16 bytes back to f32 (bf16 is the
+    high 16 bits of an f32).
+    """
     f32 = np.ascontiguousarray(w, dtype=np.float32)
-    u32 = f32.view(np.uint32)
-    rounding = np.uint32(0x7FFF) + ((u32 >> 16) & 1)
-    bf16_bits = ((u32 + rounding) >> 16).astype(np.uint16)
-    # widen back: bf16 is the high 16 bits of the f32
-    up = (bf16_bits.astype(np.uint32) << 16)
+    bf16_bytes = _encode_f32_to_bf16(f32)
+    bf16_bits = np.frombuffer(bf16_bytes, dtype=np.uint16)
+    up = bf16_bits.astype(np.uint32) << 16
     return up.view(np.float32).reshape(w.shape)
 
 

@@ -6,7 +6,6 @@ PPLs + the delta (plain - qat; positive = QAT improved). The test stubs the
 line, so it runs offline without llama.cpp or real models.
 """
 
-import os
 import stat
 
 import pytest

@@ -245,6 +245,12 @@ def compute_distortion_table(
                         )
                         m_full = None
 
+            # Stacked MoE experts with a per-expert imatrix (encode/decode
+            # below routes through the full-tensor 3-D branch for this).
+            stacked_moe_imatrix = (
+                w.ndim == 3 and m_full is not None and m_full.size == w.shape[0] * cols
+            )
+
             sq = np.square(w2d_s.astype(np.float32)).sum(axis=0, dtype=np.float64)
             entry["wnorm"] = float(
                 (sq * m.astype(np.float64)).sum() if m is not None else sq.sum()
@@ -267,17 +273,11 @@ def compute_distortion_table(
                     w_hat = w2d_s.astype(np.float16).astype(np.float32)
                     per_actual_err[actual] = _weighted_sq_err(w2d_s, w_hat, m)
                     continue
-                if actual == "BF16":
-                    u = w2d_s.view(np.uint32) if w2d_s.flags.c_contiguous else np.ascontiguousarray(w2d_s).view(np.uint32)
-                    # round-to-nearest-even bf16 truncation
-                    rounded = ((u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000).view(np.float32)
-                    per_actual_err[actual] = _weighted_sq_err(w2d_s, rounded, m)
-                    continue
                 if not supports_decode(actual):
                     per_actual_err[actual] = None
                     continue
                 try:
-                    if w.ndim == 3 and m_full is not None and m_full.size == w.shape[0] * cols:
+                    if stacked_moe_imatrix:
                         # Stacked MoE experts with per-expert imatrix: encode
                         # the full tensor (encoder slices the imatrix per
                         # expert), decode, and weight per expert.

@@ -8,7 +8,6 @@ presence of the bundled default corpus.
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from magicquant import imatrix
 

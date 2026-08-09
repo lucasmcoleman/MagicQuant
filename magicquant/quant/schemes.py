@@ -40,7 +40,6 @@ class QuantizationScheme:
     noise_factor: float               # relative quantization noise (lower = better quality)
     speed_multiplier: float = 1.0     # relative inference speed vs BF16
     category: SchemeCategory = "k_quant"
-    is_moe_optimized: bool = False
     requires_imatrix: bool = False    # IQ-quants benefit from importance matrices
     # Whether ggml's `quantize_<type>` function actually reads the imatrix
     # pointer when one is passed to `ggml_quantize_chunk` -- distinct from
@@ -120,8 +119,13 @@ Q5_K = QuantizationScheme(
 )
 
 # IQ4_NL: Non-linear lookup table optimized for weight distributions.
-# Lower noise than Q4_K_M despite same bpw because the 16 levels are
-# learned to minimize quantization error on real weight distributions.
+# WITH an imatrix active, this genuinely has lower noise than Q4_K_M despite
+# the same bpw, because the 16 levels are learned to minimize quantization
+# error on real weight distributions -- backing noise_factor=3.8 below.
+# WITHOUT calibration this claim does not hold: see the
+# IMATRIX_DEPENDENT_SCHEME_NAMES section later in this file, where the same
+# lookup table -- optimal for unweighted reconstruction error -- loses every
+# measured unweighted comparison against Q5_K/Q6_K/MXFP4_MOE.
 #
 # speed_multiplier=3.2 (near-parity with Q4_K_M's 3.4) does NOT match real
 # hardware: llama-bench on this box (fork, -ngl 99, pp512/tg64, from the
@@ -162,7 +166,6 @@ MXFP4_MOE = QuantizationScheme(
     noise_factor=4.0,
     speed_multiplier=3.8,
     category="mxfp4",
-    is_moe_optimized=True,
     upgrade_neighbor="IQ4_NL",
     downgrade_neighbor="Q4_K_M",
 )
@@ -325,7 +328,6 @@ ROCMFP4 = QuantizationScheme(
     noise_factor=4.2,           # ~Q4_K_M / MXFP4 band
     speed_multiplier=3.8,       # AMD-native FP4 kernel is the fork's fast path
     category="rocmfpx",
-    is_moe_optimized=True,
     upgrade_neighbor="ROCMFP6",
     downgrade_neighbor="ROCMFP3",
 )
@@ -565,9 +567,10 @@ IQ_SCHEME_NAMES = frozenset({
 # Cause: its non-linear lookup places levels to minimise UNWEIGHTED error when
 # no imatrix is supplied. In isolation that wins the metric it optimises --
 # IQ4_NL round-trips real ffn_up weights at 0.051 relative RMS vs MXFP4's
-# 0.101 -- and loses badly on the one that matters. This contradicts the
-# "Lower noise than Q4_K_M" comment above the IQ4_NL definition and its
-# noise_factor=3.8, both of which silently assume calibration.
+# 0.101 -- and loses badly on the one that matters. The "Lower noise than
+# Q4_K_M" comment above the IQ4_NL definition and its noise_factor=3.8 now
+# carry an explicit imatrix qualifier for exactly this reason -- both were
+# silently assuming calibration before that qualifier was added.
 IMATRIX_DEPENDENT_SCHEME_NAMES = frozenset({"IQ4_NL"})
 
 # Group-class floors: minimum acceptable scheme per group class.

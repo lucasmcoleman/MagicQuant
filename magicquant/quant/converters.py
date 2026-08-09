@@ -6,11 +6,11 @@ Quantized formats route through magicquant.quant.ggml_binding (libggml
 ctypes binding); float passthroughs (BF16/F16/F32) stay native.
 
 Public API:
-    encode_to_ggml_bytes(weights, ggml_type_name, imatrix=None) -> bytes
+    encode_to_ggml_bytes(weights, ggml_type_name, imatrix=None, n_per_row=None) -> bytes
     ggml_tensor_data_size(ggml_type_name, n_elements) -> int
 """
 
-from typing import Dict, Optional
+from typing import Optional
 import numpy as np
 
 from magicquant.quant.ggml_binding import ggml_encode, GGML_TYPE_IDS
@@ -30,16 +30,24 @@ from magicquant.quant import ggml_facts
 # stock table too, since the `gguf` package publishes them directly.
 # ---------------------------------------------------------------------------
 
+# NOTE: these two tables are re-exports kept for backward-compatible direct
+# imports (e.g. `from converters import GGML_BLOCK_SIZE`) -- they no longer
+# feed ggml_tensor_data_size's arithmetic below, which now goes straight
+# through ggml_facts.expected_size (reading ggml_facts.BLOCK_SIZE/TYPE_SIZE
+# directly). Any overlay/correction belongs in ggml_facts, never bolted onto
+# these local copies: a hand-edit here would be silently ignored by
+# ggml_tensor_data_size.
 GGML_BLOCK_SIZE = dict(ggml_facts.BLOCK_SIZE)
 GGML_TYPE_SIZE = dict(ggml_facts.TYPE_SIZE)
 
 
 def ggml_tensor_data_size(ggml_type_name: str, n_elements: int) -> int:
-    """Return the byte-size of tensor data for a given ggml type and element count."""
-    block_size = GGML_BLOCK_SIZE.get(ggml_type_name, 1)
-    type_size = GGML_TYPE_SIZE.get(ggml_type_name, 2)
-    n_blocks = (n_elements + block_size - 1) // block_size
-    return n_blocks * type_size
+    """Return the byte-size of tensor data for a given ggml type and element count.
+
+    Thin delegate to ggml_facts.expected_size -- see that function's
+    docstring for the shared arithmetic and fallback-default rationale.
+    """
+    return ggml_facts.expected_size(ggml_type_name, n_elements)
 
 
 # ── Float-format encoders (native; no ggml needed) ──────────────────
@@ -80,7 +88,14 @@ def encode_to_ggml_bytes(
         weights: Float32 numpy array (any shape — will be flattened).
             Must be a floating-point dtype.
         ggml_type_name: Target ggml type (e.g. "Q8_0", "Q4_K", "BF16").
-        imatrix: Optional importance matrix (used by IQ-quants in PR4).
+        imatrix: Optional per-column importance matrix. Consumed by the
+            K-quants and the IQ family; ignored by MXFP4/ROCmFPX/float/
+            legacy Q8_0 (ggml design — absmax/E8M0 scaling has no
+            importance input).
+        n_per_row: The tensor's row width. Conditionally required: only
+            when imatrix is given AND weights is 1-D (weights.ndim < 2)
+            — otherwise it's inferred from weights.shape[-1]. Ignored
+            when imatrix is None.
 
     Returns:
         Raw bytes in the on-disk ggml block layout.
@@ -95,7 +110,7 @@ def encode_to_ggml_bytes(
             f"got dtype={weights.dtype}. Integer or pre-quantized tensors "
             f"cannot be re-quantized — use a BF16/F16/F32 source model."
         )
-    flat = weights.astype(np.float32).flatten()
+    flat = weights.astype(np.float32).ravel()
 
     if ggml_type_name == "BF16":
         return _encode_f32_to_bf16(flat)

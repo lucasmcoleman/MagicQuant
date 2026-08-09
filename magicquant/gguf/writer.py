@@ -27,6 +27,7 @@ from typing import Dict, List, Any, Optional
 from pathlib import Path
 import collections
 import concurrent.futures
+import json
 import re
 import struct
 import os
@@ -63,8 +64,6 @@ _GGML_NAME_TO_BPW: Dict[str, float] = {
 # compatibility (external references, e.g. tests/test_writer_tensor_overrides.py).
 GGML_TYPE = dict(ggml_facts.NAME_TO_ID)
 
-_GGML_TYPE_NAME = dict(ggml_facts.ID_TO_NAME)
-
 # GGUF metadata value-type tags. Derived from the installed `gguf` package's
 # own GGUFValueType enum (gguf.constants) rather than hand-typed ints — same
 # "facts come from upstream, never drift" policy as ggml_facts.py's
@@ -99,6 +98,46 @@ ALIGNMENT = _gguf_constants.GGUF_DEFAULT_ALIGNMENT
 SCHEME_TO_GGML: Dict[str, str] = {s.name: s.ggml_type_name for s in get_all_schemes()}
 SCHEME_TO_GGML["F16"] = "F16"
 SCHEME_TO_GGML["F32"] = "F32"
+
+# Map MagicQuant scheme/ggml names to the general.file_type value llama.cpp
+# and HuggingFace use to report a GGUF's quantization type. Consulted by
+# GGUFWriter._build_metadata, which determines the dominant scheme by
+# counting actual parameter elements per scheme across all tensors (after
+# Pass 1) and looks it up here. Aligned to llama.cpp's LLAMA_FTYPE enum.
+# This is a cosmetic, human-readable badge only (each tensor carries its own
+# ggml_type, so inference is unaffected). Generic "Q4_K"/"Q5_K" map to the
+# _M variant. Values come from gguf.constants.LlamaFileType BY MEMBER NAME
+# (not hand-typed ints) -- same "facts come from upstream, never drift"
+# policy as the _GGUF_TYPE_*/GGML_TYPE tables above. This table's own
+# hand-typed predecessor already drifted once (Q4_K->12, Q5_K->16,
+# IQ4_NL->20 were wrong: 12=MOSTLY_Q4_1_SOME_F16-era, 16=Q5_K_S,
+# 20=MOSTLY_IQ2_XS) -- deriving from the enum closes that class of bug.
+# NOTE: the key set here is deliberate and load-bearing for
+# _build_metadata's membership filter and fallback lookup -- do not add or
+# remove keys based on the enum's full membership.
+# Hoisted to module level (built once at import, not per create_hybrid_gguf
+# call) so a renamed/removed upstream LlamaFileType member surfaces as an
+# AttributeError at import time rather than mid-build; see
+# tests/test_writer_gguf_constants.py for the drift-tripwire tests.
+_LlamaFileType = _gguf_constants.LlamaFileType
+_ftype_map: Dict[str, int] = {
+    "F32": int(_LlamaFileType.ALL_F32),
+    "F16": int(_LlamaFileType.MOSTLY_F16),
+    "BF16": int(_LlamaFileType.MOSTLY_BF16),
+    "Q8_0": int(_LlamaFileType.MOSTLY_Q8_0),
+    "Q6_K": int(_LlamaFileType.MOSTLY_Q6_K),
+    "Q5_K": int(_LlamaFileType.MOSTLY_Q5_K_M),
+    "Q5_K_M": int(_LlamaFileType.MOSTLY_Q5_K_M),
+    "Q5_K_S": int(_LlamaFileType.MOSTLY_Q5_K_S),
+    "Q4_K": int(_LlamaFileType.MOSTLY_Q4_K_M),
+    "Q4_K_M": int(_LlamaFileType.MOSTLY_Q4_K_M),
+    "Q4_K_S": int(_LlamaFileType.MOSTLY_Q4_K_S),
+    "Q3_K": int(_LlamaFileType.MOSTLY_Q3_K_M),
+    "Q3_K_M": int(_LlamaFileType.MOSTLY_Q3_K_M),
+    "Q2_K": int(_LlamaFileType.MOSTLY_Q2_K),
+    "IQ4_NL": int(_LlamaFileType.MOSTLY_IQ4_NL),
+    "IQ4_XS": int(_LlamaFileType.MOSTLY_IQ4_XS),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +249,6 @@ def _write_metadata_value(f, value: Any):
                 for item in norm:
                     _write_string(f, str(item))
     elif isinstance(value, dict):
-        import json
         f.write(struct.pack("<I", _GGUF_TYPE_STRING))
         _write_string(f, json.dumps(value))
     else:
@@ -308,10 +346,7 @@ def _encode_entry(source, entry, imatrix=None) -> bytes:
         # Passthrough: the bad_tensors gate in Pass 1 already confirmed the
         # desired type equals the source type, so there's nothing to decode
         # or re-encode -- just copy the tensor's exact on-disk bytes.
-        # getattr-guarded for duck-typed sources in tests that predate the
-        # read_tensor_raw() contract.
-        _read_raw_fn = getattr(source, "read_tensor_raw", None)
-        raw = _read_raw_fn(name) if _read_raw_fn is not None else None
+        raw = source.read_tensor_raw(name)
         if raw is None:
             raise RuntimeError(
                 f"Tensor {name}: passthrough (source type "
@@ -718,23 +753,7 @@ class GGUFWriter:
             group_schemes = quant_config.get("groups", {})
             tensor_overrides: Dict[str, str] = quant_config.get("tensors", {})
 
-            # STRICT validation up front: every override scheme name must be
-            # a key of the writer's scheme map. This is always a
-            # configuration bug (unlike an override that names no tensor in
-            # the source, handled below once tensor names are known) --
-            # raise immediately, before any tensor is even classified.
-            if tensor_overrides:
-                unknown_scheme_entries = sorted(
-                    (name, sch) for name, sch in tensor_overrides.items()
-                    if sch not in scheme_map
-                )
-                if unknown_scheme_entries:
-                    listing = ", ".join(f"{n!r}: {s!r}" for n, s in unknown_scheme_entries)
-                    raise ValueError(
-                        f"quant_config['tensors'] references unknown scheme "
-                        f"name(s): {listing}. Available schemes: "
-                        f"{sorted(scheme_map.keys())}"
-                    )
+            self._validate_overrides(tensor_overrides, scheme_map)
 
             if verbose:
                 print(f"Base quantization: {base_quant}")
@@ -747,495 +766,565 @@ class GGUFWriter:
             source_metadata = source.get_metadata()
             all_tensors_info = source.get_all_tensors_info()
 
-            # A "tensors" override that matches NO tensor in the source is
-            # never an error (the writer doesn't know the model's tensor
-            # names until now) -- but a typo'd tensor name must not silently
-            # no-op, so it's surfaced as a warning either way.
-            if tensor_overrides:
-                _source_tensor_names = {t["name"] for t in all_tensors_info}
-                unmatched_overrides = [
-                    n for n in tensor_overrides if n not in _source_tensor_names
-                ]
-                if unmatched_overrides:
-                    shown = unmatched_overrides[:5]
-                    more = (f" (+{len(unmatched_overrides) - 5} more)"
-                            if len(unmatched_overrides) > 5 else "")
-                    msg = (f"{len(unmatched_overrides)} tensor override name(s) in "
-                           f"quant_config['tensors'] matched no tensor in the "
-                           f"source (possible typo): {shown}{more}")
-                    logger.warning(msg)
-                    if verbose:
-                        print(f"  WARNING: {msg}")
+            self._warn_unmatched_overrides(tensor_overrides, all_tensors_info, verbose)
+            self._prescan_unknown_tensors(all_tensors_info, classifier, verbose)
 
-            # Pre-scan for UNKNOWN tensors so the user sees issues upfront
-            unknown_tensors = [t["name"] for t in all_tensors_info
-                               if classifier.classify_tensor(t["name"]) == "UNKNOWN"]
-            if unknown_tensors and verbose:
-                print(f"  WARNING: {len(unknown_tensors)} tensor(s) have no group classification "
-                      f"(will use base quant): {unknown_tensors[:5]}"
-                      + (f" ... and {len(unknown_tensors)-5} more" if len(unknown_tensors) > 5 else ""))
+            tensor_entries = self._resolve_pass1_entries(
+                all_tensors_info, tensor_overrides, group_schemes, base_quant,
+                scheme_map, source, classifier, verbose,
+            )
 
-            # ==============================================================
-            # Pass 1: Compute target types and offsets (no data reading)
-            # ==============================================================
-            tensor_entries: List[Dict[str, Any]] = []
-            data_offset = 0
-            # Reset per-call so re-using a writer instance for a second
-            # create_hybrid_gguf() call doesn't carry stale entries forward.
-            self._fallbacks = []
-            n_tensor_overrides_applied = 0
+            self._validate_tensor_entries(tensor_entries, imatrix)
 
-            for tinfo in all_tensors_info:
-                name = tinfo["name"]
-                shape = tinfo["shape"]
-                n_dims = tinfo["n_dims"]
+            filtered_meta = self._build_metadata(
+                source_metadata, base_quant, group_schemes, tensor_entries,
+            )
 
-                group = classifier.classify_tensor(name)
-                # Resolution order: tensors[name] > groups[group] > base.
-                # Everything downstream (SSM F32 force, 1D F32, BF16->F16,
-                # block-size fallback) treats this exactly like a
-                # group-resolved scheme -- it only ever sees the resolved
-                # name, never how it was resolved.
-                if name in tensor_overrides:
-                    scheme = tensor_overrides[name]
-                    n_tensor_overrides_applied += 1
-                else:
-                    scheme = group_schemes.get(group, base_quant)
-                target_ggml_name = scheme_map.get(scheme, "Q4_0")
-                target_ggml_id = GGML_TYPE.get(target_ggml_name, GGML_TYPE["Q4_0"])
-
-                # SSM conv-weight operands (ssm_conv1d / ssm_conv1d_{q,k,v})
-                # must be F32 no matter what scheme group S was configured
-                # with -- see _is_f32_required_ssm_operand. This has to run
-                # BEFORE the block-size fallback below: a float scheme (BF16/
-                # F16) has block_size==1, so that check is skipped entirely
-                # and would otherwise let a BF16-designated conv weight
-                # through untouched (the real bug this guards against).
-                if group == "S" and target_ggml_name != "F32" and _is_f32_required_ssm_operand(name):
-                    if verbose:
-                        print(f"  [COMPAT] {name}: SSM conv operand requires F32 "
-                              f"(llama.cpp kernel constraint), overriding {target_ggml_name}")
-                    self._fallbacks.append({
-                        "tensor": name,
-                        "group": group,
-                        "requested": target_ggml_name,
-                        "actual": "F32",
-                        "reason": "f32-required-operand",
-                    })
-                    target_ggml_name = "F32"
-                    target_ggml_id = GGML_TYPE["F32"]
-
-                # 1D tensors (norms, biases) must stay at F32.  llama.cpp
-                # uses f32 binary ops (e.g. element-wise mul in RMSNorm) and
-                # does not support quantised or BF16 operands.  These tensors
-                # are tiny so keeping them at F32 has negligible size impact.
-                if n_dims <= 1 and target_ggml_name != "F32":
-                    if verbose:
-                        print(f"  [COMPAT] {name}: 1D tensor (norm/bias), keeping at F32")
-                    target_ggml_name = "F32"
-                    target_ggml_id = GGML_TYPE["F32"]
-
-                # BF16 → F16 conversion: llama.cpp has incomplete BF16
-                # support in its compute graph (binary ops, some matmuls
-                # assert sizeof(float) stride).  F16 is universally supported.
-                # This is a deliberate compatibility tradeoff.
-                #
-                # CHOSEN BEHAVIOR (2026-07 incident fix -- see probing.py's
-                # clamp guard and llamacpp.py's parser fix from the same
-                # investigation): this used to warn ONCE and proceed
-                # unconditionally, even though BF16 has ~8 more exponent
-                # bits than F16 -- any source value with |v| > 65504 (F16's
-                # max finite) or in F16's subnormal-underflow range becomes
-                # Inf/0 on disk with nothing downstream reacting. Silently
-                # Inf/0-poisoned tensors (typically embeddings/lm_head,
-                # since those are the groups most often left at BF16) then
-                # measure as NaN perplexity -- which is exactly the
-                # degenerate input the parser/clamp fixes exist to catch,
-                # but catching it downstream is strictly worse than not
-                # producing it here.
-                #
-                # Detection is a single max-abs reduction over the
-                # tensor's REAL values -- read
-                # via source.read_tensor_f32 only when a downgrade is
-                # actually happening (every other tensor in this header-only
-                # pass never pays this cost; see the "Pass 1: ... (no data
-                # reading)" comment above this loop).
-                #
-                # On detection: SUBSTITUTE Q8_0 for this one tensor rather
-                # than raising. A raise would abort an otherwise-fine
-                # multi-hour hybrid build over a single outlier tensor
-                # (embeddings in particular routinely have some large
-                # magnitude rows); Q8_0 keeps real dynamic range for exactly
-                # this tensor at ~1/4 the size of F32/BF16, instead of
-                # writing Inf/0 for it. If a future caller needs "abort
-                # instead", it's a one-line change here.
-                if target_ggml_name == "BF16":
-                    out_of_range = _bf16_to_f16_would_corrupt(source, name)
-
-                    if out_of_range:
-                        logger.warning(
-                            "%s: BF16->F16 downgrade would produce Inf/0 "
-                            "(value(s) outside F16's finite/normal range) -- "
-                            "substituting Q8_0 for this tensor instead of "
-                            "writing corrupted data",
-                            name,
-                        )
-                        self._fallbacks.append({
-                            "tensor": name,
-                            "group": group,
-                            "requested": "BF16",
-                            "actual": "Q8_0",
-                            "reason": "bf16-f16-out-of-range",
-                        })
-                        target_ggml_name = "Q8_0"
-                        target_ggml_id = GGML_TYPE["Q8_0"]
-                    else:
-                        if not self._bf16_downgrade_warned:
-                            logger.warning(
-                                "BF16-designated group(s) written as F16 on disk "
-                                "(llama.cpp BF16 compute-graph limitation). Out-of-F16-"
-                                "range values may become Inf/0."
-                            )
-                            self._bf16_downgrade_warned = True
-                        target_ggml_name = "F16"
-                        target_ggml_id = GGML_TYPE["F16"]
-
-                # Block-size compatibility check: quantized types require the
-                # contiguous row dimension (ne[0] in GGUF) to be a multiple of
-                # the block size.  The writer stores shapes in row-major order
-                # and reverses when writing, so ne[0] = shape[-1].  K-quants use
-                # a 256-block; rows that don't fit fall back to a block-32 quant
-                # (MXFP4/Q8_0) rather than F32 — F32 is lossless but enormous for
-                # big tensors like MoE experts (it once turned a ~14 GB pack into
-                # 39 GB).  F32 is kept only where required (SSM conv operands) or
-                # for rows that aren't 32-divisible either.
-                row_size = shape[-1] if len(shape) >= 1 else 1
-                block_size = GGML_BLOCK_SIZE.get(target_ggml_name, 1)
-                if block_size > 1 and row_size % block_size != 0:
-                    requested_ggml_name = target_ggml_name
-                    fallback = _block32_fallback(target_ggml_name, row_size, group)
-                    if fallback != requested_ggml_name:
-                        # Record the deviation so it's auditable even when
-                        # verbose=False (data-integrity notice, not a
-                        # progress message) — see the summary log below.
-                        self._fallbacks.append({
-                            "tensor": name,
-                            "group": group,
-                            "requested": requested_ggml_name,
-                            "actual": fallback,
-                            "reason": "block-size",
-                        })
-                    if verbose:
-                        print(f"  [COMPAT] {name}: row_size={row_size} not divisible by "
-                              f"{target_ggml_name} block_size={block_size}, "
-                              f"falling back to {fallback}")
-                    target_ggml_name = fallback
-                    target_ggml_id = GGML_TYPE[fallback]
-
-                n_elems = _tensor_n_elements(shape)
-
-                source_type_name = source.get_source_type_name(name)
-                # Ask the source rather than testing the type name here: a
-                # GGUFSource opened with dequant enabled can also decode
-                # quantized types via libggml's dequantize_row_* kernels.
-                # getattr-guarded for duck-typed sources in tests that predate
-                # the can_decode() contract.
-                _can_decode_fn = getattr(source, "can_decode", None)
-                if _can_decode_fn is not None:
-                    can_decode = _can_decode_fn(name)
-                else:
-                    can_decode = source_type_name in ("F32", "F16", "BF16")
-                if (
-                    can_decode
-                    and source_type_name not in ("F32", "F16", "BF16")
-                    and scheme_map.get(scheme, "Q4_0") == source_type_name
-                    and target_ggml_name == source_type_name
-                ):
-                    # Dequant-enabled source, but the requested type IS the
-                    # source type: a verbatim byte copy is exact and free,
-                    # while a dequant->re-encode round-trip costs CPU and can
-                    # at best equal it. Route through the passthrough path
-                    # (this also keeps the DOUBLE-QUANTIZATION warning's
-                    # count honest -- such tensors aren't re-quantized).
-                    # Both equality checks matter: the scheme_map one mirrors
-                    # the bad_tensors gate's own derivation (so passthrough
-                    # never trips it), and the target one keeps the compat
-                    # mutations above (SSM/1D F32 forcing, block fallback)
-                    # authoritative -- a compat-mutated tensor still decodes
-                    # and re-encodes to its required type.
-                    can_decode = False
-                if not can_decode:
-                    # The source tensor is not decodable to F32 (pre-quantized
-                    # or an unrecognized type). We pass it through verbatim, so
-                    # the target ggml type IS the source type. UNKNOWN source
-                    # types are a hard error (caught in the bad_tensors pass
-                    # below); never silently default to F32 (id 0), which would
-                    # produce a zero-filled blob masquerading as valid F32.
-                    target_ggml_name = source_type_name
-                    if source_type_name in GGML_TYPE:
-                        target_ggml_id = GGML_TYPE[source_type_name]
-                    else:
-                        # Unknown / undecodable source type — flag with a
-                        # sentinel id; the bad_tensors pass raises before any
-                        # data is written.
-                        target_ggml_id = -1
-
-                expected_size = ggml_tensor_data_size(target_ggml_name, n_elems)
-                aligned_offset = _align(data_offset)
-
-                tensor_entries.append({
-                    "name": name,
-                    "n_dims": n_dims,
-                    "shape": shape,
-                    "ggml_type": target_ggml_id,
-                    "offset": aligned_offset,
-                    "_target_ggml_name": target_ggml_name,
-                    "_n_elems": n_elems,
-                    "_expected_size": expected_size,
-                    "_can_decode": can_decode,
-                    "_group": group,
-                    "_source_type_name": source_type_name,
-                })
-
-                data_offset = aligned_offset + expected_size
-
-            # Pass-1's tensor loop drives classify_tensor() name-by-name
-            # (not classify_tensors(), which would fire this automatically)
-            # -- so this instance's unclassified-tensor summary warning must
-            # be triggered explicitly once the pass completes. See
-            # TensorGroupClassifier.warn_unclassified_once()'s docstring.
-            classifier.warn_unclassified_once()
-
-            if tensor_overrides and verbose:
-                print(f"  Tensor overrides applied: "
-                      f"{n_tensor_overrides_applied}/{len(tensor_overrides)}")
-
-            # ── Validate: detect pre-quantized / undecodable sources ──
-            # Two distinct failure modes:
-            #   1. UNKNOWN source type — the source could not even identify the
-            #      tensor's format. This is ALWAYS a hard error (it would
-            #      otherwise produce a zero-filled blob with a bogus type id).
-            #   2. A recognized pre-quantized type (e.g. Q4_K) that the user
-            #      asked to re-quantize to a different scheme — also an error,
-            #      since MagicQuant requires high-precision source weights.
-            bad_tensors = []
-            unknown_tensors = []
-            for entry in tensor_entries:
-                if not entry["_can_decode"]:
-                    source_type = entry["_source_type_name"]
-                    if source_type.startswith("UNKNOWN"):
-                        unknown_tensors.append((entry["name"], source_type))
-                        continue
-                    # Recognized but pre-quantized: error only if the user
-                    # wanted a different type than the source already is.
-                    # Same resolution order as Pass 1 (tensors[name] >
-                    # groups[group] > base) so an override doesn't get
-                    # silently ignored by this second, independent
-                    # re-derivation of "what scheme did the user actually ask
-                    # for".
-                    group = entry["_group"]
-                    if entry["name"] in tensor_overrides:
-                        scheme = tensor_overrides[entry["name"]]
-                    else:
-                        scheme = group_schemes.get(group, base_quant)
-                    desired_ggml_name = scheme_map.get(scheme, "Q4_0")
-                    if desired_ggml_name != source_type:
-                        bad_tensors.append((entry["name"], source_type, desired_ggml_name))
-
-            if unknown_tensors:
-                count = len(unknown_tensors)
-                first_name, first_type = unknown_tensors[0]
-                raise ValueError(
-                    f"Cannot encode {count} tensor(s) with an UNKNOWN/undecodable "
-                    f"source type. First: '{first_name}' (source type '{first_type}'). "
-                    f"The source model has tensors whose ggml type could not be "
-                    f"identified or decoded to F32. MagicQuant requires BF16, F16, "
-                    f"or F32 source weights."
-                )
-
-            if bad_tensors:
-                count = len(bad_tensors)
-                source_type = bad_tensors[0][1]
-                raise ValueError(
-                    f"Cannot re-quantize {count} tensors: source is already quantized "
-                    f"({source_type}). MagicQuant requires BF16, F16, or F32 source weights. "
-                    f"Use a high-precision source model. If no high-precision "
-                    f"release exists for this model, you can opt into "
-                    f"dequantize-then-requantize by setting "
-                    f"MAGICQUANT_ALLOW_DEQUANT_SOURCE=1 (or passing "
-                    f"allow_dequant=True to open_model_source) -- the output is "
-                    f"then DOUBLE-quantized and strictly worse than one built "
-                    f"from source weights."
-                )
-
-            # ── Warn: re-quantizing from an already-quantized source ──
-            # Reachable only with dequant explicitly enabled (otherwise the
-            # bad_tensors guard above raised). Loud and unconditional: this
-            # output is double-quantized, and nothing downstream -- model card,
-            # search result, filename -- would otherwise say so.
-            dequant_sources: Dict[str, int] = {}
-            for entry in tensor_entries:
-                st = entry["_source_type_name"]
-                if entry["_can_decode"] and st not in ("F32", "F16", "BF16"):
-                    dequant_sources[st] = dequant_sources.get(st, 0) + 1
-            if dequant_sources:
-                breakdown = ", ".join(
-                    f"{n}x {t}" for t, n in sorted(dequant_sources.items())
-                )
-                logger.warning(
-                    "DOUBLE-QUANTIZATION: %d tensors are being dequantized from "
-                    "an already-quantized source and re-quantized (%s). Quality "
-                    "is bounded by the source quant's error floor -- a tier at or "
-                    "above the source precision cannot improve on it. Only use "
-                    "this when no BF16/F16/F32 release of the model exists, and "
-                    "say so on the model card.",
-                    sum(dequant_sources.values()), breakdown,
-                )
-
-            # ── Gate: imatrix-REQUIRING types must have an imatrix entry ──
-            # IQ1/IQ2-family quantizers produce unusable output without an
-            # importance matrix; fail fast in Pass 1 (before any bytes are
-            # written) instead of silently shipping garbage. Only consulted
-            # for quantized targets so float-only writes never load libggml.
-            _FLOAT_TARGETS = ("F32", "F16", "BF16")
-            missing_imatrix = [
-                entry["name"] for entry in tensor_entries
-                if entry["_can_decode"]
-                and entry["_target_ggml_name"] not in _FLOAT_TARGETS
-                and _requires_imatrix(entry["_target_ggml_name"])
-                and (imatrix is None or entry["name"] not in imatrix)
-            ]
-            if missing_imatrix:
-                first = ", ".join(missing_imatrix[:3])
-                more = (f" (+{len(missing_imatrix) - 3} more)"
-                        if len(missing_imatrix) > 3 else "")
-                raise ValueError(
-                    f"{len(missing_imatrix)} tensor(s) target an imatrix-"
-                    f"REQUIRING quantization type but no imatrix entry was "
-                    f"provided: {first}{more}. Capture one with "
-                    f"magicquant.imatrix.capture_imatrix (or llama-imatrix) "
-                    f"and pass imatrix=load_imatrix(path), or choose a type "
-                    f"that does not require an importance matrix."
-                )
-
-            # ── Prepare metadata ──
-            self.metadata = {}
-            for k, v in source_metadata.items():
-                self.metadata[k] = v
-            self.metadata["magicquant.hybrid"] = True
-            self.metadata["magicquant.base_quant"] = base_quant
-            import json
-            self.metadata["magicquant.group_schemes"] = json.dumps(group_schemes)
-
-            # Set general.file_type for llama.cpp compatibility.
-            # llama.cpp and HuggingFace use this to report the quantization type.
-            # For hybrid models, determine the dominant scheme by counting actual
-            # parameter elements per scheme across all tensors (after Pass 1).
-            # Aligned to llama.cpp's LLAMA_FTYPE enum. This is a cosmetic,
-            # human-readable badge only (each tensor carries its own ggml_type,
-            # so inference is unaffected). Generic "Q4_K"/"Q5_K" map to the _M
-            # variant. Previous values (Q4_K->12, Q5_K->16, IQ4_NL->20) were
-            # wrong (12=MOSTLY_Q4_1_SOME_F16-era, 16=Q5_K_S, 20=MOSTLY_IQ2_XS).
-            _ftype_map = {
-                "F32": 0, "F16": 1, "BF16": 32,
-                "Q8_0": 7,
-                "Q6_K": 18,
-                "Q5_K": 17, "Q5_K_M": 17, "Q5_K_S": 16,
-                "Q4_K": 15, "Q4_K_M": 15, "Q4_K_S": 14,
-                "Q3_K": 12, "Q3_K_M": 12,
-                "Q2_K": 10,
-                "IQ4_NL": 25, "IQ4_XS": 30,
-            }
-            from collections import Counter
-            # Count elements per actual target ggml type from tensor_entries
-            scheme_elements = Counter()
-            for entry in tensor_entries:
-                scheme_elements[entry["_target_ggml_name"]] += entry["_n_elems"]
-            # Pick the scheme with the most parameters, preferring quantized
-            # types over uncompressed (F16/F32/BF16) for display purposes
-            quantized_types = {s for s in scheme_elements if s in _ftype_map and s not in ("F16", "F32", "BF16")}
-            if quantized_types:
-                dominant = max(quantized_types, key=lambda s: scheme_elements[s])
-            elif scheme_elements:
-                dominant = scheme_elements.most_common(1)[0][0]
-            else:
-                dominant = base_quant
-            ftype = _ftype_map.get(dominant, _ftype_map.get(base_quant, 1))
-            self.metadata["general.file_type"] = ftype
-
-            # llama.cpp/convert_hf_to_gguf always emits this for a quantized
-            # GGUF; the safetensors source path never did (its metadata
-            # comes straight from config.json, which has no such key). Not
-            # load-bearing for inference, but every reference-converted GGUF
-            # carries it -- setdefault so a GGUF-source repack keeps its own
-            # value if it already has one.
-            self.metadata.setdefault("general.quantization_version", 2)
-
-            filtered_meta = {k: v for k, v in self.metadata.items() if v is not None}
-
-            # ==============================================================
-            # Write header
-            # ==============================================================
-            if verbose:
-                print(f"\nWriting output: {self.output_path}")
-                print(f"Tensors: {len(tensor_entries)}")
-
-            Path(self.output_path).resolve().parent.mkdir(parents=True, exist_ok=True)
-
-            t_start = time.monotonic()
-
-            # Crash-safety: write to a sibling temp file and atomically rename
-            # only after a fully-successful write. A worker exception (dtype
-            # guard, size mismatch, OOM) or a hung encoder thread must leave NO
-            # file at output_path and NO stray .partial behind.
-            tmp_path = self.output_path + ".partial"
-            try:
-                self._write_gguf_body(
-                    tmp_path, filtered_meta, tensor_entries, source,
-                    t_start, verbose, imatrix=imatrix,
-                )
-            except BaseException:
-                # Remove the partially-written temp file before propagating.
-                try:
-                    Path(tmp_path).unlink(missing_ok=True)
-                except OSError:
-                    pass
-                raise
-
-            # Atomic publish (same directory -> os.replace is atomic).
-            os.replace(tmp_path, self.output_path)
-
-            elapsed = time.monotonic() - t_start
-            output_size_mb = Path(self.output_path).stat().st_size / (1024 * 1024)
-            if verbose:
-                print(f"Done. {output_size_mb:.1f} MB in {elapsed:.1f}s "
-                      f"({output_size_mb / max(elapsed, 0.001):.0f} MB/s)")
-
-            # Data-integrity notice: surface fallbacks even when
-            # verbose=False. self._fallbacks now carries more than one
-            # reason (block-size, f32-required-operand, and
-            # bf16-f16-out-of-range) -- a single line hardcoding
-            # "due to block-size" misattributed every non-block-size
-            # fallback observed live. Group by reason and summarize each
-            # group with one example, instead of blaming them all on the
-            # same cause. Per-tensor detail always lives in self._fallbacks.
-            if self._fallbacks:
-                by_reason: Dict[str, List[Dict[str, str]]] = collections.defaultdict(list)
-                for entry in self._fallbacks:
-                    by_reason[entry.get("reason", "unknown")].append(entry)
-                for reason, entries in by_reason.items():
-                    first = entries[0]
-                    logger.warning(
-                        "%d tensor(s) fell back from their requested quant "
-                        "due to %s (e.g. %s: %s->%s)",
-                        len(entries), reason, first["tensor"],
-                        first["requested"], first["actual"],
-                    )
-
-            return self.output_path
+            return self._publish(
+                filtered_meta, tensor_entries, source, verbose, imatrix,
+            )
 
         finally:
             source.close()
+
+    def _validate_overrides(self, tensor_overrides, scheme_map):
+        """Raise if any quant_config['tensors'] scheme name is unknown.
+
+        Extracted verbatim from create_hybrid_gguf's up-front override
+        validation; see that method's docstring for the tensors/groups/base
+        resolution order this guards.
+        """
+        # STRICT validation up front: every override scheme name must be
+        # a key of the writer's scheme map. This is always a
+        # configuration bug (unlike an override that names no tensor in
+        # the source, handled below once tensor names are known) --
+        # raise immediately, before any tensor is even classified.
+        if tensor_overrides:
+            unknown_scheme_entries = sorted(
+                (name, sch) for name, sch in tensor_overrides.items()
+                if sch not in scheme_map
+            )
+            if unknown_scheme_entries:
+                listing = ", ".join(f"{n!r}: {s!r}" for n, s in unknown_scheme_entries)
+                raise ValueError(
+                    f"quant_config['tensors'] references unknown scheme "
+                    f"name(s): {listing}. Available schemes: "
+                    f"{sorted(scheme_map.keys())}"
+                )
+
+    def _warn_unmatched_overrides(self, tensor_overrides, all_tensors_info, verbose):
+        """Warn (never raise) if a "tensors" override name matches no
+        tensor in the source -- extracted verbatim from create_hybrid_gguf.
+        """
+        # A "tensors" override that matches NO tensor in the source is
+        # never an error (the writer doesn't know the model's tensor
+        # names until now) -- but a typo'd tensor name must not silently
+        # no-op, so it's surfaced as a warning either way.
+        if tensor_overrides:
+            _source_tensor_names = {t["name"] for t in all_tensors_info}
+            unmatched_overrides = [
+                n for n in tensor_overrides if n not in _source_tensor_names
+            ]
+            if unmatched_overrides:
+                shown = unmatched_overrides[:5]
+                more = (f" (+{len(unmatched_overrides) - 5} more)"
+                        if len(unmatched_overrides) > 5 else "")
+                msg = (f"{len(unmatched_overrides)} tensor override name(s) in "
+                       f"quant_config['tensors'] matched no tensor in the "
+                       f"source (possible typo): {shown}{more}")
+                logger.warning(msg)
+                if verbose:
+                    print(f"  WARNING: {msg}")
+
+    def _prescan_unknown_tensors(self, all_tensors_info, classifier, verbose):
+        """Cosmetic pre-scan: warn (verbose only) about tensors with no
+        group classification. Extracted verbatim from create_hybrid_gguf;
+        distinct from the hard-error undecodable-source-type gate in
+        _validate_tensor_entries -- do not conflate the two.
+        """
+        # Pre-scan for UNKNOWN tensors so the user sees issues upfront
+        unknown_tensors = [t["name"] for t in all_tensors_info
+                           if classifier.classify_tensor(t["name"]) == "UNKNOWN"]
+        if unknown_tensors and verbose:
+            print(f"  WARNING: {len(unknown_tensors)} tensor(s) have no group classification "
+                  f"(will use base quant): {unknown_tensors[:5]}"
+                  + (f" ... and {len(unknown_tensors)-5} more" if len(unknown_tensors) > 5 else ""))
+
+    def _resolve_pass1_entries(self, all_tensors_info, tensor_overrides, group_schemes, base_quant, scheme_map, source, classifier, verbose):
+        """Pass 1: compute target ggml types and offsets for every tensor,
+        no data reading. Extracted verbatim from create_hybrid_gguf's Pass-1
+        loop -- see the module docstring and the inline [COMPAT] comments
+        for the five-stage type-mutation pipeline (SSM-F32, 1D-F32,
+        BF16->F16/Q8_0, block-32 fallback, can_decode passthrough) this
+        loop runs in strict order for every tensor.
+        """
+        tensor_entries: List[Dict[str, Any]] = []
+        data_offset = 0
+        # Reset per-call so re-using a writer instance for a second
+        # create_hybrid_gguf() call doesn't carry stale entries forward.
+        self._fallbacks = []
+        n_tensor_overrides_applied = 0
+
+        for tinfo in all_tensors_info:
+            name = tinfo["name"]
+            shape = tinfo["shape"]
+            n_dims = tinfo["n_dims"]
+
+            group = classifier.classify_tensor(name)
+            # Resolution order: tensors[name] > groups[group] > base.
+            # Everything downstream (SSM F32 force, 1D F32, BF16->F16,
+            # block-size fallback) treats this exactly like a
+            # group-resolved scheme -- it only ever sees the resolved
+            # name, never how it was resolved.
+            if name in tensor_overrides:
+                scheme = tensor_overrides[name]
+                n_tensor_overrides_applied += 1
+            else:
+                scheme = group_schemes.get(group, base_quant)
+            target_ggml_name = scheme_map.get(scheme, "Q4_0")
+            target_ggml_id = GGML_TYPE.get(target_ggml_name, GGML_TYPE["Q4_0"])
+            # Captured BEFORE the compat-mutation chain below (SSM-F32
+            # force, 1D-F32, BF16->F16/Q8_0, block-32 fallback, the
+            # can_decode passthrough overwrite) so the bad_tensors gate
+            # further down can read the tensor's PRE-compat desired type
+            # directly off the entry instead of re-deriving scheme
+            # resolution from tensor_overrides/group_schemes/base_quant a
+            # second time. Do not move this past any of the mutations
+            # below -- see the bad_tensors gate's comment for why the
+            # post-compat value would silently disable that check.
+            desired_ggml_name = target_ggml_name
+
+            # SSM conv-weight operands (ssm_conv1d / ssm_conv1d_{q,k,v})
+            # must be F32 no matter what scheme group S was configured
+            # with -- see _is_f32_required_ssm_operand. This has to run
+            # BEFORE the block-size fallback below: a float scheme (BF16/
+            # F16) has block_size==1, so that check is skipped entirely
+            # and would otherwise let a BF16-designated conv weight
+            # through untouched (the real bug this guards against).
+            if group == "S" and target_ggml_name != "F32" and _is_f32_required_ssm_operand(name):
+                if verbose:
+                    print(f"  [COMPAT] {name}: SSM conv operand requires F32 "
+                          f"(llama.cpp kernel constraint), overriding {target_ggml_name}")
+                self._fallbacks.append({
+                    "tensor": name,
+                    "group": group,
+                    "requested": target_ggml_name,
+                    "actual": "F32",
+                    "reason": "f32-required-operand",
+                })
+                target_ggml_name = "F32"
+                target_ggml_id = GGML_TYPE["F32"]
+
+            # 1D tensors (norms, biases) must stay at F32.  llama.cpp
+            # uses f32 binary ops (e.g. element-wise mul in RMSNorm) and
+            # does not support quantised or BF16 operands.  These tensors
+            # are tiny so keeping them at F32 has negligible size impact.
+            if n_dims <= 1 and target_ggml_name != "F32":
+                if verbose:
+                    print(f"  [COMPAT] {name}: 1D tensor (norm/bias), keeping at F32")
+                target_ggml_name = "F32"
+                target_ggml_id = GGML_TYPE["F32"]
+
+            # BF16 → F16 conversion: llama.cpp has incomplete BF16
+            # support in its compute graph (binary ops, some matmuls
+            # assert sizeof(float) stride).  F16 is universally supported.
+            # This is a deliberate compatibility tradeoff.
+            #
+            # CHOSEN BEHAVIOR (2026-07 incident fix -- see probing.py's
+            # clamp guard and llamacpp.py's parser fix from the same
+            # investigation): this used to warn ONCE and proceed
+            # unconditionally, even though BF16 has ~8 more exponent
+            # bits than F16 -- any source value with |v| > 65504 (F16's
+            # max finite) or in F16's subnormal-underflow range becomes
+            # Inf/0 on disk with nothing downstream reacting. Silently
+            # Inf/0-poisoned tensors (typically embeddings/lm_head,
+            # since those are the groups most often left at BF16) then
+            # measure as NaN perplexity -- which is exactly the
+            # degenerate input the parser/clamp fixes exist to catch,
+            # but catching it downstream is strictly worse than not
+            # producing it here.
+            #
+            # Detection is a single max-abs reduction over the
+            # tensor's REAL values -- read
+            # via source.read_tensor_f32 only when a downgrade is
+            # actually happening (every other tensor in this header-only
+            # pass never pays this cost; see the "Pass 1: ... (no data
+            # reading)" comment above this loop).
+            #
+            # On detection: SUBSTITUTE Q8_0 for this one tensor rather
+            # than raising. A raise would abort an otherwise-fine
+            # multi-hour hybrid build over a single outlier tensor
+            # (embeddings in particular routinely have some large
+            # magnitude rows); Q8_0 keeps real dynamic range for exactly
+            # this tensor at ~1/4 the size of F32/BF16, instead of
+            # writing Inf/0 for it. If a future caller needs "abort
+            # instead", it's a one-line change here.
+            if target_ggml_name == "BF16":
+                out_of_range = _bf16_to_f16_would_corrupt(source, name)
+
+                if out_of_range:
+                    logger.warning(
+                        "%s: BF16->F16 downgrade would produce Inf/0 "
+                        "(value(s) outside F16's finite/normal range) -- "
+                        "substituting Q8_0 for this tensor instead of "
+                        "writing corrupted data",
+                        name,
+                    )
+                    self._fallbacks.append({
+                        "tensor": name,
+                        "group": group,
+                        "requested": "BF16",
+                        "actual": "Q8_0",
+                        "reason": "bf16-f16-out-of-range",
+                    })
+                    target_ggml_name = "Q8_0"
+                    target_ggml_id = GGML_TYPE["Q8_0"]
+                else:
+                    if not self._bf16_downgrade_warned:
+                        logger.warning(
+                            "BF16-designated group(s) written as F16 on disk "
+                            "(llama.cpp BF16 compute-graph limitation). Out-of-F16-"
+                            "range values may become Inf/0."
+                        )
+                        self._bf16_downgrade_warned = True
+                    target_ggml_name = "F16"
+                    target_ggml_id = GGML_TYPE["F16"]
+
+            # Block-size compatibility check: quantized types require the
+            # contiguous row dimension (ne[0] in GGUF) to be a multiple of
+            # the block size.  The writer stores shapes in row-major order
+            # and reverses when writing, so ne[0] = shape[-1].  K-quants use
+            # a 256-block; rows that don't fit fall back to a block-32 quant
+            # (MXFP4/Q8_0) rather than F32 — F32 is lossless but enormous for
+            # big tensors like MoE experts (it once turned a ~14 GB pack into
+            # 39 GB).  F32 is kept only where required (SSM conv operands) or
+            # for rows that aren't 32-divisible either.
+            row_size = shape[-1] if len(shape) >= 1 else 1
+            block_size = GGML_BLOCK_SIZE.get(target_ggml_name, 1)
+            if block_size > 1 and row_size % block_size != 0:
+                requested_ggml_name = target_ggml_name
+                fallback = _block32_fallback(target_ggml_name, row_size, group)
+                if fallback != requested_ggml_name:
+                    # Record the deviation so it's auditable even when
+                    # verbose=False (data-integrity notice, not a
+                    # progress message) — see the summary log below.
+                    self._fallbacks.append({
+                        "tensor": name,
+                        "group": group,
+                        "requested": requested_ggml_name,
+                        "actual": fallback,
+                        "reason": "block-size",
+                    })
+                if verbose:
+                    print(f"  [COMPAT] {name}: row_size={row_size} not divisible by "
+                          f"{target_ggml_name} block_size={block_size}, "
+                          f"falling back to {fallback}")
+                target_ggml_name = fallback
+                target_ggml_id = GGML_TYPE[fallback]
+
+            n_elems = _tensor_n_elements(shape)
+
+            source_type_name = source.get_source_type_name(name)
+            # Ask the source rather than testing the type name here: a
+            # GGUFSource opened with dequant enabled can also decode
+            # quantized types via libggml's dequantize_row_* kernels.
+            can_decode = source.can_decode(name)
+            if (
+                can_decode
+                and source_type_name not in ("F32", "F16", "BF16")
+                and scheme_map.get(scheme, "Q4_0") == source_type_name
+                and target_ggml_name == source_type_name
+            ):
+                # Dequant-enabled source, but the requested type IS the
+                # source type: a verbatim byte copy is exact and free,
+                # while a dequant->re-encode round-trip costs CPU and can
+                # at best equal it. Route through the passthrough path
+                # (this also keeps the DOUBLE-QUANTIZATION warning's
+                # count honest -- such tensors aren't re-quantized).
+                # Both equality checks matter: the scheme_map one mirrors
+                # the bad_tensors gate's own derivation (so passthrough
+                # never trips it), and the target one keeps the compat
+                # mutations above (SSM/1D F32 forcing, block fallback)
+                # authoritative -- a compat-mutated tensor still decodes
+                # and re-encodes to its required type.
+                can_decode = False
+            if not can_decode:
+                # The source tensor is not decodable to F32 (pre-quantized
+                # or an unrecognized type). We pass it through verbatim, so
+                # the target ggml type IS the source type. UNKNOWN source
+                # types are a hard error (caught in the bad_tensors pass
+                # below); never silently default to F32 (id 0), which would
+                # produce a zero-filled blob masquerading as valid F32.
+                target_ggml_name = source_type_name
+                if source_type_name in GGML_TYPE:
+                    target_ggml_id = GGML_TYPE[source_type_name]
+                else:
+                    # Unknown / undecodable source type — flag with a
+                    # sentinel id; the bad_tensors pass raises before any
+                    # data is written.
+                    target_ggml_id = -1
+
+            expected_size = ggml_tensor_data_size(target_ggml_name, n_elems)
+            aligned_offset = _align(data_offset)
+
+            tensor_entries.append({
+                "name": name,
+                "n_dims": n_dims,
+                "shape": shape,
+                "ggml_type": target_ggml_id,
+                "offset": aligned_offset,
+                "_target_ggml_name": target_ggml_name,
+                "_n_elems": n_elems,
+                "_expected_size": expected_size,
+                "_can_decode": can_decode,
+                "_group": group,
+                "_source_type_name": source_type_name,
+                "_desired_ggml_name": desired_ggml_name,
+            })
+
+            data_offset = aligned_offset + expected_size
+
+        # Pass-1's tensor loop drives classify_tensor() name-by-name
+        # (not classify_tensors(), which would fire this automatically)
+        # -- so this instance's unclassified-tensor summary warning must
+        # be triggered explicitly once the pass completes. See
+        # TensorGroupClassifier.warn_unclassified_once()'s docstring.
+        classifier.warn_unclassified_once()
+
+        if tensor_overrides and verbose:
+            print(f"  Tensor overrides applied: "
+                  f"{n_tensor_overrides_applied}/{len(tensor_overrides)}")
+        return tensor_entries
+
+    def _validate_tensor_entries(self, tensor_entries, imatrix):
+        """Post-hoc validation over Pass-1's tensor_entries: the
+        undecodable/pre-quantized-source gate, the double-quantization
+        warning, and the imatrix-required gate. Extracted verbatim from
+        create_hybrid_gguf.
+        """
+        # ── Validate: detect pre-quantized / undecodable sources ──
+        # Two distinct failure modes:
+        #   1. UNKNOWN source type — the source could not even identify the
+        #      tensor's format. This is ALWAYS a hard error (it would
+        #      otherwise produce a zero-filled blob with a bogus type id).
+        #   2. A recognized pre-quantized type (e.g. Q4_K) that the user
+        #      asked to re-quantize to a different scheme — also an error,
+        #      since MagicQuant requires high-precision source weights.
+        bad_tensors = []
+        undecodable_source_tensors = []
+        for entry in tensor_entries:
+            if not entry["_can_decode"]:
+                source_type = entry["_source_type_name"]
+                if source_type.startswith("UNKNOWN"):
+                    undecodable_source_tensors.append((entry["name"], source_type))
+                    continue
+                # Recognized but pre-quantized: error only if the user
+                # wanted a different type than the source already is.
+                # Reads the PRE-compat desired type captured in Pass 1
+                # (entry["_desired_ggml_name"], set before the SSM-F32/
+                # 1D-F32/BF16->F16/block-32/can_decode compat mutations)
+                # rather than re-deriving scheme resolution from
+                # tensor_overrides/group_schemes/base_quant a second
+                # time -- so an override can't get silently ignored by
+                # two independent copies of "what scheme did the user
+                # actually ask for" drifting apart. The entry's
+                # POST-compat "_target_ggml_name" is unusable here: on
+                # the not-can_decode path it has already been overwritten
+                # to the source type, which would make this comparison
+                # always false and disable the gate silently.
+                desired_ggml_name = entry["_desired_ggml_name"]
+                if desired_ggml_name != source_type:
+                    bad_tensors.append((entry["name"], source_type, desired_ggml_name))
+
+        if undecodable_source_tensors:
+            count = len(undecodable_source_tensors)
+            first_name, first_type = undecodable_source_tensors[0]
+            raise ValueError(
+                f"Cannot encode {count} tensor(s) with an UNKNOWN/undecodable "
+                f"source type. First: '{first_name}' (source type '{first_type}'). "
+                f"The source model has tensors whose ggml type could not be "
+                f"identified or decoded to F32. MagicQuant requires BF16, F16, "
+                f"or F32 source weights."
+            )
+
+        if bad_tensors:
+            count = len(bad_tensors)
+            source_type = bad_tensors[0][1]
+            raise ValueError(
+                f"Cannot re-quantize {count} tensors: source is already quantized "
+                f"({source_type}). MagicQuant requires BF16, F16, or F32 source weights. "
+                f"Use a high-precision source model. If no high-precision "
+                f"release exists for this model, you can opt into "
+                f"dequantize-then-requantize by setting "
+                f"MAGICQUANT_ALLOW_DEQUANT_SOURCE=1 (or passing "
+                f"allow_dequant=True to open_model_source) -- the output is "
+                f"then DOUBLE-quantized and strictly worse than one built "
+                f"from source weights."
+            )
+
+        # ── Warn: re-quantizing from an already-quantized source ──
+        # Reachable only with dequant explicitly enabled (otherwise the
+        # bad_tensors guard above raised). Loud and unconditional: this
+        # output is double-quantized, and nothing downstream -- model card,
+        # search result, filename -- would otherwise say so.
+        dequant_sources: Dict[str, int] = {}
+        for entry in tensor_entries:
+            st = entry["_source_type_name"]
+            if entry["_can_decode"] and st not in ("F32", "F16", "BF16"):
+                dequant_sources[st] = dequant_sources.get(st, 0) + 1
+        if dequant_sources:
+            breakdown = ", ".join(
+                f"{n}x {t}" for t, n in sorted(dequant_sources.items())
+            )
+            logger.warning(
+                "DOUBLE-QUANTIZATION: %d tensors are being dequantized from "
+                "an already-quantized source and re-quantized (%s). Quality "
+                "is bounded by the source quant's error floor -- a tier at or "
+                "above the source precision cannot improve on it. Only use "
+                "this when no BF16/F16/F32 release of the model exists, and "
+                "say so on the model card.",
+                sum(dequant_sources.values()), breakdown,
+            )
+
+        # ── Gate: imatrix-REQUIRING types must have an imatrix entry ──
+        # IQ1/IQ2-family quantizers produce unusable output without an
+        # importance matrix; fail fast in Pass 1 (before any bytes are
+        # written) instead of silently shipping garbage. Only consulted
+        # for quantized targets so float-only writes never load libggml.
+        _FLOAT_TARGETS = ("F32", "F16", "BF16")
+        missing_imatrix = [
+            entry["name"] for entry in tensor_entries
+            if entry["_can_decode"]
+            and entry["_target_ggml_name"] not in _FLOAT_TARGETS
+            and _requires_imatrix(entry["_target_ggml_name"])
+            and (imatrix is None or entry["name"] not in imatrix)
+        ]
+        if missing_imatrix:
+            first = ", ".join(missing_imatrix[:3])
+            more = (f" (+{len(missing_imatrix) - 3} more)"
+                    if len(missing_imatrix) > 3 else "")
+            raise ValueError(
+                f"{len(missing_imatrix)} tensor(s) target an imatrix-"
+                f"REQUIRING quantization type but no imatrix entry was "
+                f"provided: {first}{more}. Capture one with "
+                f"magicquant.imatrix.capture_imatrix (or llama-imatrix) "
+                f"and pass imatrix=load_imatrix(path), or choose a type "
+                f"that does not require an importance matrix."
+            )
+
+    def _build_metadata(self, source_metadata, base_quant, group_schemes, tensor_entries):
+        """Build self.metadata (WIPES any caller-set metadata -- existing
+        behavior) and return the filtered dict ready for
+        _write_gguf_body. Extracted verbatim from create_hybrid_gguf; KV
+        insertion order here is output-byte load-bearing (_write_gguf_body
+        writes filtered_meta.items() in dict order) -- do not reorder.
+        """
+        self.metadata = {}
+        for k, v in source_metadata.items():
+            self.metadata[k] = v
+        self.metadata["magicquant.hybrid"] = True
+        self.metadata["magicquant.base_quant"] = base_quant
+        self.metadata["magicquant.group_schemes"] = json.dumps(group_schemes)
+
+        # Set general.file_type for llama.cpp compatibility. Determine the
+        # dominant scheme by counting actual parameter elements per scheme
+        # across all tensors (after Pass 1) and look it up in the
+        # module-level _ftype_map (see that table's comment for the
+        # enum-derivation rationale and the historical drift incident it
+        # closes).
+        from collections import Counter
+        # Count elements per actual target ggml type from tensor_entries
+        scheme_elements = Counter()
+        for entry in tensor_entries:
+            scheme_elements[entry["_target_ggml_name"]] += entry["_n_elems"]
+        # Pick the scheme with the most parameters, preferring quantized
+        # types over uncompressed (F16/F32/BF16) for display purposes
+        quantized_types = {s for s in scheme_elements if s in _ftype_map and s not in ("F16", "F32", "BF16")}
+        if quantized_types:
+            dominant = max(quantized_types, key=lambda s: scheme_elements[s])
+        elif scheme_elements:
+            dominant = scheme_elements.most_common(1)[0][0]
+        else:
+            dominant = base_quant
+        ftype = _ftype_map.get(dominant, _ftype_map.get(base_quant, 1))
+        self.metadata["general.file_type"] = ftype
+
+        # llama.cpp/convert_hf_to_gguf always emits this for a quantized
+        # GGUF; the safetensors source path never did (its metadata
+        # comes straight from config.json, which has no such key). Not
+        # load-bearing for inference, but every reference-converted GGUF
+        # carries it -- setdefault so a GGUF-source repack keeps its own
+        # value if it already has one.
+        self.metadata.setdefault("general.quantization_version", 2)
+
+        filtered_meta = {k: v for k, v in self.metadata.items() if v is not None}
+        return filtered_meta
+
+    def _publish(self, filtered_meta, tensor_entries, source, verbose, imatrix=None):
+        """Write the header+body via _write_gguf_body under crash-safe
+        .partial/os.replace semantics, then log the grouped fallback
+        summary. Extracted verbatim from create_hybrid_gguf.
+        """
+        # ==============================================================
+        # Write header
+        # ==============================================================
+        if verbose:
+            print(f"\nWriting output: {self.output_path}")
+            print(f"Tensors: {len(tensor_entries)}")
+
+        Path(self.output_path).resolve().parent.mkdir(parents=True, exist_ok=True)
+
+        t_start = time.monotonic()
+
+        # Crash-safety: write to a sibling temp file and atomically rename
+        # only after a fully-successful write. A worker exception (dtype
+        # guard, size mismatch, OOM) or a hung encoder thread must leave NO
+        # file at output_path and NO stray .partial behind.
+        tmp_path = self.output_path + ".partial"
+        try:
+            self._write_gguf_body(
+                tmp_path, filtered_meta, tensor_entries, source,
+                t_start, verbose, imatrix=imatrix,
+            )
+        except BaseException:
+            # Remove the partially-written temp file before propagating.
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+        # Atomic publish (same directory -> os.replace is atomic).
+        os.replace(tmp_path, self.output_path)
+
+        elapsed = time.monotonic() - t_start
+        output_size_mb = Path(self.output_path).stat().st_size / (1024 * 1024)
+        if verbose:
+            print(f"Done. {output_size_mb:.1f} MB in {elapsed:.1f}s "
+                  f"({output_size_mb / max(elapsed, 0.001):.0f} MB/s)")
+
+        # Data-integrity notice: surface fallbacks even when
+        # verbose=False. self._fallbacks now carries more than one
+        # reason (block-size, f32-required-operand, and
+        # bf16-f16-out-of-range) -- a single line hardcoding
+        # "due to block-size" misattributed every non-block-size
+        # fallback observed live. Group by reason and summarize each
+        # group with one example, instead of blaming them all on the
+        # same cause. Per-tensor detail always lives in self._fallbacks.
+        if self._fallbacks:
+            by_reason: Dict[str, List[Dict[str, str]]] = collections.defaultdict(list)
+            for entry in self._fallbacks:
+                by_reason[entry.get("reason", "unknown")].append(entry)
+            for reason, entries in by_reason.items():
+                first = entries[0]
+                logger.warning(
+                    "%d tensor(s) fell back from their requested quant "
+                    "due to %s (e.g. %s: %s->%s)",
+                    len(entries), reason, first["tensor"],
+                    first["requested"], first["actual"],
+                )
+
+        return self.output_path
 
     def _write_gguf_body(
         self, tmp_path, filtered_meta, tensor_entries, source, t_start, verbose,
@@ -1331,11 +1420,10 @@ class GGUFWriter:
                         break
                     if isinstance(item, Exception):
                         # Drain queue so worker thread can finish
-                        import queue as _queue_mod
                         while True:
                             try:
                                 result_q.get_nowait()
-                            except _queue_mod.Empty:
+                            except queue.Empty:
                                 break
                         worker.join(timeout=5)
                         raise item
@@ -1371,12 +1459,6 @@ class GGUFWriter:
                     # needed -- release lets _parallel_encode_iter admit
                     # the next one under the byte cap.
                     budget.release(footprint)
-
-    def set_metadata(self, key: str, value: Any):
-        self.metadata[key] = value
-
-    def get_metadata(self) -> Dict[str, Any]:
-        return self.metadata.copy()
 
 
 def create_hybrid_gguf(

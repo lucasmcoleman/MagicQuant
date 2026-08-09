@@ -10,11 +10,10 @@ from typing import Optional
 import structlog
 
 
-def configure_logging(*, verbose: bool = True, json_output: bool = False) -> None:
+def configure_logging(*, json_output: bool = False) -> None:
     """Configure structlog for MagicQuant.
 
     Args:
-        verbose: If True, set log level to DEBUG; otherwise INFO.
         json_output: If True, render logs as JSON; otherwise human-readable.
     """
     processors: list[structlog.types.Processor] = [

@@ -11,7 +11,7 @@ MagicQuant creates hybrid GGUF files with per-tensor-group quantization. Differe
 ```bash
 pip install -e .                    # Install (editable)
 pip install -e ".[yaml,dev]"        # With optional deps (yaml + pytest + gguf)
-pip install -e ".[qat]"             # QAT training stack (torch/transformers/peft/trl/datasets)
+pip install -e ".[qat]"             # QAT training stack (torch/transformers/peft/accelerate)
 magicquant analyze model.gguf       # Inspect tensor groups
 magicquant search model.gguf --rounds 3  # Measured evolutionary search
 magicquant generate model.gguf --tiers Q4,Q5,Q6  # Generate hybrids
@@ -117,7 +117,8 @@ libggml within a tolerance, NOT byte-exact), wraps routed `nn.Linear`s with
 completion-only loss. The per-group config is loaded by `qat.config.load_hybrid_config`
 (search_results.json tier → `{group: ggml_type_name}`); HF→GGUF name mapping reuses
 `gguf/source.py`'s `_HF_TO_GGUF_PATTERNS` via `qat.names.hf_to_ggml_name`. Heavy
-training deps (torch/transformers/peft/trl/datasets) live in the `[qat]` extra;
+training deps (torch/transformers/peft/accelerate, +transitively tokenizers/
+safetensors/huggingface_hub) live in the `[qat]` extra;
 the package `__init__` keeps `run_qat` lazily imported (from `qat.train`) so the
 light surface only needs torch. Surfaced as Foundry's **QAT** pipeline stage.
 
@@ -206,8 +207,8 @@ SafetensorsSource strips `model.language_model.` prefix for multimodal models, t
   threads per-tensor importance vectors to the encoder with the true row width,
   and Pass 1 hard-errors if a target type REQUIRES an imatrix (IQ1/IQ2 family,
   once PR3 registers them) but none was provided. Weighting is USED by the
-  K-quants (Q2_K–Q6_K) and IQ4_NL; **MXFP4 and Q8_0 ignore it by ggml design**
-  (absmax/E8M0 scaling has no importance input). A row whose width isn't a
+  K-quants and the IQ family; **MXFP4/ROCmFPX/float/legacy Q8_0 ignore it by
+  ggml design** (absmax/E8M0 scaling has no importance input). A row whose width isn't a
   multiple of the requested K-quant's 256-block falls back to a block-32
   quant (MXFP4 for low-bit targets, Q8_0 for high-bit) rather than F32; F32
   is used only for SSM/linear-attention operands (group `S`, which llama.cpp

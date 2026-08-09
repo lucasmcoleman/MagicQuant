@@ -20,7 +20,6 @@ test_detector_does_not_flag_a_realistic_weight_tensor below. Underflow to
 source values) are real hazards.
 """
 import numpy as np
-import pytest
 
 from magicquant.gguf.source import ModelSource
 from magicquant.gguf.writer import create_hybrid_gguf, _bf16_to_f16_would_corrupt

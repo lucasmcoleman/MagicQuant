@@ -1,7 +1,6 @@
 """Regression: a checkpoint with a baseline but null sensitivity_weights must
 fall through to probing, not restore the null and crash the predictor."""
-import json, pathlib, tempfile
-import pytest
+import json
 from magicquant.orchestrator import MagicQuantOrchestrator
 
 

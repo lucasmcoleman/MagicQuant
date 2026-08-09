@@ -166,3 +166,328 @@ def test_invalid_probe_mode_rejected():
     with pytest.raises(ValueError):
         cal.run_group_probes(_Tools(), "m.gguf", "/tmp/x", ["E"], 18.0,
                              probe_mode="bogus")
+
+
+# --- failure-path coverage for the shared build/measure/retry/cleanup core
+# extracted into calibrate._measure_probe (used by both the base-aggressive
+# probe and each per-group probe in run_group_probes) ---
+
+def test_group_probe_retries_then_succeeds():
+    """A build that raises on the first attempt and succeeds on the second:
+    attempts is recorded correctly, and the probe GGUF from the failed
+    attempt (and the successful one, once measured) is cleaned up — the
+    ``finally: unlink`` runs on every attempt."""
+    import tempfile
+    import magicquant.v2.calibrate as cal
+    from pathlib import Path as _P
+
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+        def calculate_perplexity(self, path, verbose=True, **kw):
+            return 18.0
+
+    calls = {"n": 0}
+
+    def _flaky_create(output_path, base_model_path, quant_config, verbose=False, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated build failure")
+        _P(output_path).write_bytes(b"x")
+        return output_path
+
+    import magicquant.gguf.writer as wmod
+    orig = wmod.create_hybrid_gguf
+    wmod.create_hybrid_gguf = _flaky_create
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            outcomes = cal.run_group_probes(
+                _Tools(), "m.gguf", d, ["E"], 18.0,
+                probe_mode="single", retries=1,
+            )
+            assert outcomes["E"].ok
+            assert outcomes["E"].attempts == 2
+            # unlinked on both the failed and the successful attempt
+            assert not list(_P(d).glob("_v2_probes/*.gguf"))
+    finally:
+        wmod.create_hybrid_gguf = orig
+
+
+def test_group_probe_exhausts_retries_records_failure_with_allow_partial():
+    """A PPL that never parses: attempts == retries + 1, the failure is
+    recorded (not raised) under --allow-partial-probes, and the probe file
+    is cleaned up."""
+    import tempfile
+    import magicquant.v2.calibrate as cal
+    from pathlib import Path as _P
+
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+        def calculate_perplexity(self, path, verbose=True, **kw):
+            # slice-baseline (measured against source_model_path) succeeds;
+            # the per-group probe GGUF never parses.
+            if str(path) == "m.gguf":
+                return 18.0
+            return None  # unparsable PPL, every attempt
+
+    def _fake_create(output_path, base_model_path, quant_config, verbose=False, **kw):
+        _P(output_path).write_bytes(b"x")
+        return output_path
+
+    import magicquant.gguf.writer as wmod
+    orig = wmod.create_hybrid_gguf
+    wmod.create_hybrid_gguf = _fake_create
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            outcomes = cal.run_group_probes(
+                _Tools(), "m.gguf", d, ["E"], 18.0,
+                probe_mode="single", retries=1, allow_partial=True,
+            )
+            assert outcomes["E"].status == "failed"
+            assert outcomes["E"].attempts == 2
+            assert outcomes["E"].error == "llama-perplexity produced no parseable PPL"
+            assert not list(_P(d).glob("_v2_probes/*.gguf"))
+    finally:
+        wmod.create_hybrid_gguf = orig
+
+
+def test_group_probe_failure_without_allow_partial_raises():
+    """Per-group failure defers to the aggregate check at the end of
+    run_group_probes, which raises ProbeMeasurementError when
+    allow_partial is False."""
+    import tempfile
+    import pytest
+    import magicquant.v2.calibrate as cal
+    from magicquant.v2.outcome import ProbeMeasurementError
+    from pathlib import Path as _P
+
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+        def calculate_perplexity(self, path, verbose=True, **kw):
+            if str(path) == "m.gguf":
+                return 18.0
+            return None
+
+    def _fake_create(output_path, base_model_path, quant_config, verbose=False, **kw):
+        _P(output_path).write_bytes(b"x")
+        return output_path
+
+    import magicquant.gguf.writer as wmod
+    orig = wmod.create_hybrid_gguf
+    wmod.create_hybrid_gguf = _fake_create
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            with pytest.raises(ProbeMeasurementError):
+                cal.run_group_probes(
+                    _Tools(), "m.gguf", d, ["E"], 18.0,
+                    probe_mode="single", retries=0, allow_partial=False,
+                )
+    finally:
+        wmod.create_hybrid_gguf = orig
+
+
+def test_base_aggressive_failure_raises_and_persists_cache_before_raise():
+    """Base-aggressive probe failure (cumulative mode) raises
+    ProbeMeasurementError immediately when allow_partial is False — every
+    leave-one-group kappa is measured against that base — and the failure
+    is written to v2_probes.json BEFORE the raise, so a resumed run sees
+    it."""
+    import tempfile
+    import json
+    import pytest
+    import magicquant.v2.calibrate as cal
+    from magicquant.v2.outcome import ProbeMeasurementError
+    from pathlib import Path as _P
+
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+        def calculate_perplexity(self, path, verbose=True, **kw):
+            # slice-baseline (measured against source_model_path) succeeds;
+            # the base-aggressive probe GGUF never parses.
+            if "base_aggressive" in str(path):
+                return None
+            return 18.0
+
+    def _fake_create(output_path, base_model_path, quant_config, verbose=False, **kw):
+        _P(output_path).write_bytes(b"x")
+        return output_path
+
+    import magicquant.gguf.writer as wmod
+    orig = wmod.create_hybrid_gguf
+    wmod.create_hybrid_gguf = _fake_create
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            with pytest.raises(ProbeMeasurementError, match="base-aggressive"):
+                cal.run_group_probes(
+                    _Tools(), "m.gguf", d, ["E"], 18.0,
+                    probe_mode="cumulative", retries=0, allow_partial=False,
+                )
+            cache = json.loads((_P(d) / "v2_probes.json").read_text())
+            assert cache["probes"]["__base_aggressive__"]["status"] == "failed"
+            assert not list(_P(d).glob("_v2_probes/*.gguf"))
+    finally:
+        wmod.create_hybrid_gguf = orig
+
+
+# --- imatrix identity in run_group_probes' cache key (v2-budget-search
+# finding item 2): the probe cache must invalidate when imatrix changes,
+# like the sibling compute_distortion_table cache already does, but must
+# still reuse __slice_baseline__ across an imatrix-only change since that
+# entry is measured on the unquantized source model. ---
+
+def test_probe_cache_hit_when_imatrix_unchanged():
+    """Two run_group_probes calls into the SAME output dir with an
+    IDENTICAL imatrix: the second call is a full cache hit -- no group
+    probe is rebuilt."""
+    import tempfile
+    import numpy as np
+    import magicquant.v2.calibrate as cal
+    from pathlib import Path as _P
+
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+        def calculate_perplexity(self, path, verbose=True, **kw):
+            return 18.0
+
+    build_calls = []
+    def _fake_create(output_path, base_model_path, quant_config, verbose=False, **kw):
+        build_calls.append(output_path)
+        _P(output_path).write_bytes(b"x")
+        return output_path
+
+    imatrix = {"blk.0.weight": np.ones(4, dtype=np.float32)}
+
+    import magicquant.gguf.writer as wmod
+    orig = wmod.create_hybrid_gguf
+    wmod.create_hybrid_gguf = _fake_create
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            cal.run_group_probes(_Tools(), "m.gguf", d, ["E", "D"], 18.0,
+                                 probe_mode="single", allow_partial=True,
+                                 imatrix=imatrix)
+            n_after_first = len(build_calls)
+            assert n_after_first == 2  # E and D each built once
+
+            cal.run_group_probes(_Tools(), "m.gguf", d, ["E", "D"], 18.0,
+                                 probe_mode="single", allow_partial=True,
+                                 imatrix=imatrix)
+            assert len(build_calls) == n_after_first  # full cache hit
+    finally:
+        wmod.create_hybrid_gguf = orig
+
+
+def test_probe_cache_stale_when_imatrix_differs_but_slice_baseline_reused():
+    """A second run_group_probes call with a DIFFERENT imatrix must
+    re-measure every group probe (the cache is stale for imatrix-sensitive
+    measurements), but should still reuse the cached __slice_baseline__
+    entry -- it is measured directly against the unquantized source model
+    and does not depend on imatrix."""
+    import tempfile
+    import numpy as np
+    import magicquant.v2.calibrate as cal
+    from pathlib import Path as _P
+
+    ppl_calls = []
+
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+        def calculate_perplexity(self, path, verbose=True, **kw):
+            ppl_calls.append(path)
+            return 18.0
+
+    build_calls = []
+    def _fake_create(output_path, base_model_path, quant_config, verbose=False, **kw):
+        build_calls.append(output_path)
+        _P(output_path).write_bytes(b"x")
+        return output_path
+
+    imatrix_a = {"blk.0.weight": np.ones(4, dtype=np.float32)}
+    imatrix_b = {"blk.0.weight": np.full(4, 2.0, dtype=np.float32)}
+
+    import magicquant.gguf.writer as wmod
+    orig = wmod.create_hybrid_gguf
+    wmod.create_hybrid_gguf = _fake_create
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            cal.run_group_probes(_Tools(), "m.gguf", d, ["E", "D"], 18.0,
+                                 probe_mode="single", allow_partial=True,
+                                 imatrix=imatrix_a)
+            n_builds_first = len(build_calls)
+            assert n_builds_first == 2
+            assert ppl_calls.count("m.gguf") == 1  # slice baseline measured once
+
+            build_calls.clear()
+            cal.run_group_probes(_Tools(), "m.gguf", d, ["E", "D"], 18.0,
+                                 probe_mode="single", allow_partial=True,
+                                 imatrix=imatrix_b)
+            # stale cache under the new imatrix: both groups rebuilt
+            assert len(build_calls) == n_builds_first
+            # slice baseline is imatrix-independent: not remeasured
+            assert ppl_calls.count("m.gguf") == 1
+    finally:
+        wmod.create_hybrid_gguf = orig
+
+
+def test_probe_cache_legacy_without_imatrix_key_re_measures_probes():
+    """A v2_probes.json written BEFORE the imatrix cache key existed must be
+    treated as stale for every imatrix-sensitive probe (its PPLs were measured
+    under an UNKNOWN imatrix) while still reusing __slice_baseline__. Locks the
+    documented one-time re-measure migration so a future _drop_imatrix
+    normalization can't silently flip legacy caches back to a full hit."""
+    import json
+    import tempfile
+    import numpy as np
+    import magicquant.v2.calibrate as cal
+    from pathlib import Path as _P
+
+    ppl_paths = []
+
+    class _Tools:
+        ppl_chunks = None
+        ctx_size = 512
+        def calculate_perplexity(self, path, verbose=True, **kw):
+            ppl_paths.append(str(path))
+            return 18.0
+
+    build_calls = []
+    def _fake_create(output_path, base_model_path, quant_config, verbose=False, **kw):
+        build_calls.append(output_path)
+        _P(output_path).write_bytes(b"x")
+        return output_path
+
+    imatrix = {"blk.0.weight": np.ones(4, dtype=np.float32)}
+
+    import magicquant.gguf.writer as wmod
+    orig = wmod.create_hybrid_gguf
+    wmod.create_hybrid_gguf = _fake_create
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            cal.run_group_probes(_Tools(), "m.gguf", d, ["E", "D"], 18.0,
+                                 probe_mode="single", allow_partial=True,
+                                 imatrix=imatrix)
+            n_first_builds = len(build_calls)
+            assert n_first_builds == 2
+
+            # Rewrite the cache as a LEGACY one: drop the imatrix key.
+            cache_path = _P(d) / "v2_probes.json"
+            data = json.loads(cache_path.read_text())
+            assert "imatrix" in data["conditions"]
+            del data["conditions"]["imatrix"]
+            cache_path.write_text(json.dumps(data))
+
+            ppl_paths.clear()
+            cal.run_group_probes(_Tools(), "m.gguf", d, ["E", "D"], 18.0,
+                                 probe_mode="single", allow_partial=True,
+                                 imatrix=imatrix)
+            # Group probes re-built (legacy cache stale for probes)...
+            assert len(build_calls) == n_first_builds + 2
+            # ...but the slice baseline was reused: no PPL call against the
+            # unquantized source model itself.
+            assert "m.gguf" not in ppl_paths
+    finally:
+        wmod.create_hybrid_gguf = orig

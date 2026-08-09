@@ -65,6 +65,7 @@ whether the fake-quant happens per forward or once at wrap.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import warnings
@@ -211,7 +212,26 @@ class _ExpertWeightCache:
 _WEIGHT_CACHE = _ExpertWeightCache()
 
 
-class expert_cache_disabled:
+@contextlib.contextmanager
+def _expert_cache_state(enabled: bool):
+    """Temporarily force the expert-weight cache to ``enabled``.
+
+    Shared body for ``expert_cache_enabled``/``expert_cache_disabled``: save
+    the previous state, set + clear on entry, restore + clear on exit, never
+    suppress an exception. See those two functions for the two separate
+    rationales that justify having both named entry points.
+    """
+    prev = _WEIGHT_CACHE.enabled
+    _WEIGHT_CACHE.enabled = enabled
+    _WEIGHT_CACHE.clear()
+    try:
+        yield
+    finally:
+        _WEIGHT_CACHE.enabled = prev
+        _WEIGHT_CACHE.clear()
+
+
+def expert_cache_disabled():
     """Context manager turning the expert-weight cache off (tests/debugging).
 
     A no-op in terms of *behavior* now that the cache is off by default --
@@ -219,20 +239,10 @@ class expert_cache_disabled:
     of the env var or a surrounding ``expert_cache_enabled()``" still need a
     way to say so.
     """
-
-    def __enter__(self):
-        self._prev = _WEIGHT_CACHE.enabled
-        _WEIGHT_CACHE.enabled = False
-        _WEIGHT_CACHE.clear()
-        return self
-
-    def __exit__(self, *exc):
-        _WEIGHT_CACHE.enabled = self._prev
-        _WEIGHT_CACHE.clear()
-        return False
+    return _expert_cache_state(False)
 
 
-class expert_cache_enabled:
+def expert_cache_enabled():
     """Context manager turning the expert-weight cache ON (opt-in).
 
     For a genuinely eager per-expert-loop MoE architecture that does NOT use
@@ -241,17 +251,7 @@ class expert_cache_enabled:
     anything that also sets ``gradient_checkpointing=True``: the combination is
     the exact ``CheckpointError`` this cache's default flipped to avoid.
     """
-
-    def __enter__(self):
-        self._prev = _WEIGHT_CACHE.enabled
-        _WEIGHT_CACHE.enabled = True
-        _WEIGHT_CACHE.clear()
-        return self
-
-    def __exit__(self, *exc):
-        _WEIGHT_CACHE.enabled = self._prev
-        _WEIGHT_CACHE.clear()
-        return False
+    return _expert_cache_state(True)
 
 
 def _chunk_size(d1: int, d2: int) -> int:

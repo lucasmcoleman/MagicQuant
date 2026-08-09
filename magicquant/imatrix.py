@@ -248,6 +248,37 @@ def _imatrix_cache_key(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def resolve_imatrix_bin(tools: object) -> Optional[str]:
+    """Resolve ``llama-imatrix`` as the SIBLING of ``tools``' already-resolved
+    perplexity binary, instead of leaving capture to a bare PATH lookup.
+
+    A bare ``shutil.which("llama-imatrix")`` (``capture_imatrix``'s own
+    fallback) can silently resolve to a DIFFERENT llama.cpp build than the
+    one a caller configured -- e.g. a stock PATH install that can't load an
+    architecture only a configured fork build supports (this bit for real on
+    a qwen35 MTP model, 2026-07-04; see orchestrator.enable_imatrix). Every
+    caller that already resolved an ``LlamaCppTools`` instance should prefer
+    the sibling of ITS perplexity tool so imatrix capture uses the same
+    build as every other measurement pass.
+
+    Args:
+        tools: an ``LlamaCppTools`` instance (or ``None``/anything exposing
+            ``perplexity_tool``). Untyped to avoid importing
+            ``magicquant.utils.llamacpp`` here (avoids a needless import for
+            callers that only want the resolution logic).
+
+    Returns:
+        The sibling path as a string if it exists on disk, else ``None`` --
+        callers should leave ``imatrix_bin`` unset in that case so
+        ``capture_imatrix``'s own PATH fallback applies (today's behavior).
+    """
+    perplexity = getattr(tools, "perplexity_tool", None)
+    if not perplexity:
+        return None
+    sibling = Path(perplexity).parent / "llama-imatrix"
+    return str(sibling) if sibling.exists() else None
+
+
 def ensure_imatrix(
     source_model_path: Union[str, Path],
     *,

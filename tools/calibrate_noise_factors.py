@@ -28,7 +28,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 # Make magicquant importable when running this script directly
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

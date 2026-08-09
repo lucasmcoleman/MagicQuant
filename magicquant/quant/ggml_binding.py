@@ -7,10 +7,14 @@ Discovery order (first match wins):
     3. llama-cpp-python's bundled libs (always available since it's a hard dep)
 
 Public API:
-    ggml_encode(weights, ggml_type, imatrix=None) -> bytes
+    ggml_encode(weights, ggml_type, imatrix=None, n_per_row=None) -> bytes
+        (n_per_row is required whenever imatrix is not None; imatrix itself
+        is consumed by the K-quants and the IQ family, ignored by
+        MXFP4/ROCmFPX/float/legacy Q8_0)
     ggml_decode(data, ggml_type, n_elements) -> np.ndarray (float32)
     supports_decode(ggml_type) -> bool
-    GGML_TYPE_IDS  (mapping name -> numeric ggml type enum, synced from ggml.h)
+    GGML_TYPE_IDS  (mapping name -> numeric ggml type enum, derived from
+        magicquant.quant.ggml_facts / the installed gguf package)
     LibggmlNotFound  (exception)
 """
 
@@ -155,20 +159,29 @@ def _check_dir(d: Path) -> Optional[Tuple[Path, Path]]:
 
 
 # ── Block format size tables ────────────────────────────────────────
-# Used to compute output buffer size for ctypes calls. Derived from
-# magicquant.quant.ggml_facts (stock from the `gguf` package, fork overlay
-# from ggml_facts.FORK_TYPES) — see that module's docstring. Names kept
-# here as aliases since this module's tests reference them directly.
+# Used by _cross_check_block_type_sizes (below) to validate the loaded
+# libggml against ggml_facts, and kept as re-exports for backward-compatible
+# direct imports (this module's own tests read _GGML_BLOCK_SIZE/
+# _GGML_TYPE_SIZE by name). They no longer feed _expected_size's arithmetic
+# below, which now goes straight through ggml_facts.expected_size (reading
+# ggml_facts.BLOCK_SIZE/TYPE_SIZE directly). Any overlay/correction belongs
+# in ggml_facts, never bolted onto these local copies: a hand-edit here
+# would be silently ignored by _expected_size.
 _GGML_BLOCK_SIZE = dict(ggml_facts.BLOCK_SIZE)
 _GGML_TYPE_SIZE = dict(ggml_facts.TYPE_SIZE)
 
 
 def _expected_size(ggml_type: str, n_elements: int) -> int:
-    """Return expected output byte count for a quantized tensor."""
-    block = _GGML_BLOCK_SIZE.get(ggml_type, 1)
-    type_sz = _GGML_TYPE_SIZE.get(ggml_type, 2)
-    n_blocks = (n_elements + block - 1) // block
-    return n_blocks * type_sz
+    """Return expected output byte count for a quantized tensor.
+
+    Thin delegate to ggml_facts.expected_size. Kept as a real module-level
+    function -- not inlined at its call sites, not bound as a default arg,
+    not a staticmethod/closure -- because tests/test_security_bounds.py
+    monkeypatches ``ggml_binding._expected_size`` by name; the call sites
+    below resolve this name via a bare global lookup at call time, which is
+    what makes that monkeypatch work.
+    """
+    return ggml_facts.expected_size(ggml_type, n_elements)
 
 
 # ── Dequantize row symbol table (synced with ggml/src/ggml-quants.h /
@@ -210,6 +223,7 @@ class _LibggmlHandle:
         self.rocmfpx_supported: frozenset = self._probe_rocmfpx()
         self._verify_type_ids()
         self._cross_check_block_type_sizes()
+        self._cross_check_requires_imatrix()
         self._dequant_fn_cache: dict = {}
         # Initialize all type tables (-1 = init all). Required for IQ-quants
         # which use precomputed grid tables.
@@ -287,42 +301,15 @@ class _LibggmlHandle:
         targets -- see the load_bearing union below), plus supported ROCmFPX
         fork types.
 
-        HISTORICAL NOTE on Q8_1 (id=9), why it was excluded from this scope
-        and no longer needs to be: this scoping was originally forced by a
-        confirmed, narrow discrepancy -- the installed `gguf` pip package
-        (0.18.0) reports Q8_1 as 40 bytes/block (a stale
-        "float d; float s; qs[32]" formula), while every real libggml build
-        checked (four independent builds, cross-probed 2026-07-28) reports
-        36 bytes/block (the current "ggml_fp16_t d; ggml_fp16_t s; qs[32]"
-        struct). Q8_1 is an ephemeral CPU dot-product intermediate type,
-        never written into an on-disk GGUF and not offered by any
-        MagicQuant scheme, so at the time this exclusion was written, one
-        stale gguf-py constant for a type nothing here ever quantizes into
-        was kept from blocking every other type's construction-time safety
-        net by excluding Q8_1 from load_bearing rather than overriding the
-        upstream fact.
-
-        ggml_facts.py has SINCE added a documented override
-        (``TYPE_SIZE["Q8_1"] = 36``) correcting this at the source, so the
-        value this method would see for Q8_1 is now the real-libggml-
-        verified 36, not gguf-py's stale 40 -- the original reason for
-        excluding it no longer applies, but Q8_1 remains excluded here
-        anyway because it's still not a real quantization target for any
-        scheme (the scoping's actual, ongoing rationale). The discrepancy
-        this exclusion once had to route around is no longer swallowed
-        upstream of this method either way: it's still surfaced, non-fatally,
-        by _cross_check_block_type_sizes below (which scans every type in
-        GGML_TYPE_IDS, scoped or not) -- though post-override that check now
-        finds agreement (36 == 36) rather than a mismatch. Anything actually
-        dispatched to ggml_quantize_chunk with a wrong TYPE_SIZE would
-        additionally be caught the moment it's used for real, by encode()'s
-        own actual-bytes-written-vs-expected-size check.
-
-        See tests/test_ggml_facts_snapshot.py's
-        test_q8_1_known_upstream_staleness, which pins both the corrected
-        exported value (36) and the still-stale raw gguf-py constant (40),
-        and fails the moment upstream fixes the latter -- the signal to
-        revisit this note and the override together.
+        Q8_1 (id=9) is deliberately excluded from this scope: it's an
+        ephemeral CPU dot-product intermediate, never written to an on-disk
+        GGUF and not dispatched to by any MagicQuant scheme, so it isn't a
+        real quantization target and doesn't need this hard construction-
+        time gate. For the full upstream-gguf-vs-real-libggml discrepancy
+        this type is involved in, and the documented TYPE_SIZE override
+        that corrects it, see magicquant/quant/ggml_facts.py -- that module
+        owns the narrative and the fix; this docstring only records the
+        scoping decision.
         """
         from magicquant.quant.schemes import get_all_schemes
 
@@ -407,15 +394,166 @@ class _LibggmlHandle:
                     name, type_id, expected_size, self._base_path, actual_size,
                 )
 
+    def _cross_check_requires_imatrix(self) -> None:
+        """One-time, LOG-ONLY cross-check of each registered scheme's static
+        ``requires_imatrix`` field (magicquant.quant.schemes) against this
+        handle's LIVE ``requires_imatrix()`` answer (the real
+        ggml_quantize_requires_imatrix call).
+
+        Deliberately soft, same rationale as ``_cross_check_block_type_sizes``
+        above: a requires_imatrix mismatch cannot corrupt output bytes --
+        writer.py's hard error gate already reads the LIVE value (via
+        ``requires_imatrix`` below), so it stays correct by construction even
+        under drift. The only consequence of drift is an over- or under-
+        inclusive search pool, since survival.py / v2/search.py filter their
+        candidate pool on the STATIC field. A hard raise here, mirroring
+        ``_verify_type_ids``, would kill ALL encoding -- including every
+        scheme with no imatrix relationship at all -- over what is at worst a
+        search-pool-quality issue, so this follows the log-only pattern
+        instead.
+
+        Compared per SCHEME, not per ggml type: several schemes share a
+        ggml_type_name (e.g. MXFP4_MOE -> MXFP4, Q4_K_M -> Q4_K), and each
+        scheme's static field is an independently-settable fact that could be
+        wrong on its own.
+
+        ROCmFPX fork types are safe to include unconditionally here: this
+        handle's own ``requires_imatrix()`` method already short-circuits to
+        False for a fork type the loaded libggml doesn't support, so an
+        out-of-range id is never forwarded to ggml_quantize_requires_imatrix.
+        """
+        from magicquant.quant.schemes import get_all_schemes
+
+        for scheme in get_all_schemes():
+            static = scheme.requires_imatrix
+            live = self.requires_imatrix(scheme.ggml_type_name)
+            if static != live:
+                logger.warning(
+                    "requires_imatrix drift: scheme '%s' (ggml_type=%s) has "
+                    "static requires_imatrix=%s in schemes.py, but the "
+                    "loaded libggml (%s) reports %s. The search's exclusion "
+                    "list (survival.py / v2/search.py, which trust the "
+                    "static field) may now disagree with the writer's real "
+                    "hard gate (which trusts the live value and stays "
+                    "correct regardless of this drift). Investigate before "
+                    "trusting the static field for this scheme.",
+                    scheme.name, scheme.ggml_type_name, static,
+                    self._base_path, live,
+                )
+
     def supports(self, ggml_type: str) -> bool:
         """True if the loaded libggml can encode this type.
 
         Non-fork types are assumed supported (stock ggml has them all);
         ROCmFPX fork types require the fork's libggml (probed at load).
+
+        Intentional public API surface: no in-repo caller today (name-checked
+        by CLAUDE.md and docs/redesign.md as the intended v2 ROCmFPX-support
+        probe), and external fork tooling may call it directly. Not dead code.
         """
         if ggml_type in ROCMFPX_TYPE_NAMES:
             return ggml_type in self.rocmfpx_supported
         return ggml_type in GGML_TYPE_IDS
+
+    def _resolve_quantize_shape(self, flat_size, imatrix, n_per_row):
+        """Derive (n_per_row, nrows, n_slices, imat_check) for encode().
+
+        Pure extraction of encode()'s imatrix-shape-derivation block: raises
+        the identical ValueErrors, with identical messages, for a missing
+        n_per_row, a shape-mismatched flat/n_per_row pair, a malformed
+        imatrix, or a per-expert-slice/row-count mismatch.
+
+        CONTRACTUAL: when ``imatrix`` is None, any caller-supplied
+        ``n_per_row`` is DISCARDED and overridden to ``flat_size`` with
+        ``nrows=1`` -- see encode()'s docstring ("ignored otherwise -- the
+        unweighted path quantizes the flat buffer as a single row"). Do not
+        change this to honor a caller-supplied n_per_row in the no-imatrix
+        case: it is byte-identical only for block-aligned row widths and
+        silently changes output bytes/size for the block32-fallback case.
+        """
+        n_slices = 1
+        imat_check = None
+        if imatrix is not None:
+            if n_per_row is None:
+                raise ValueError(
+                    "imatrix-weighted encoding requires n_per_row (the "
+                    "tensor's row width); importance is applied per column."
+                )
+            if n_per_row <= 0 or flat_size % n_per_row != 0:
+                raise ValueError(
+                    f"tensor size {flat_size} is not a multiple of "
+                    f"n_per_row={n_per_row}"
+                )
+            nrows = flat_size // n_per_row
+            imat_check = np.ascontiguousarray(imatrix, dtype=np.float32).reshape(-1)
+            if imat_check.size == 0 or imat_check.size % n_per_row != 0:
+                raise ValueError(
+                    f"imatrix length {imat_check.size} is not a multiple of "
+                    f"row width {n_per_row}. Each weight tensor needs one "
+                    f"([n_per_row]) or, for stacked MoE experts, several "
+                    f"([n_experts * n_per_row], expert-major) importance "
+                    f"vectors."
+                )
+            n_slices = imat_check.size // n_per_row
+            if n_slices > 1 and nrows % n_slices != 0:
+                raise ValueError(
+                    f"imatrix has {n_slices} per-expert slices but the "
+                    f"tensor's {nrows} rows don't divide evenly by that — "
+                    f"shape mismatch between the captured imatrix and this "
+                    f"weight tensor."
+                )
+        else:
+            # Historical fast path: one row spanning the whole buffer.
+            n_per_row = flat_size
+            nrows = 1
+        return n_per_row, nrows, n_slices, imat_check
+
+    def _quantize_chunk_or_raise(
+        self,
+        type_id,
+        src_ptr,
+        dst_ptr,
+        nrows,
+        n_per_row,
+        imat_ptr,
+        expected_bytes,
+        ggml_type,
+        context="",
+        detail="",
+    ):
+        """Call ggml_quantize_chunk once and raise on a byte-count mismatch.
+
+        Shared by encode()'s single-chunk dispatch and its per-expert MoE
+        loop -- the two call+verify blocks were identical except for which
+        pointer forms and RuntimeError text they used. ``context`` supplies
+        the optional " for expert slice N/M" mid-message insertion; ``detail``
+        supplies the optional ", n_elements=N" suffix inside the
+        "(type=...)" parenthetical. Together they reproduce both original
+        RuntimeError messages exactly:
+          single-chunk: context="", detail=", n_elements={n_per_row}"
+          per-expert:   context=" for expert slice {i}/{n}", detail=""
+
+        Caller builds src_ptr/dst_ptr/imat_ptr (keeping the underlying numpy
+        arrays alive as named locals for the duration of this call) and
+        passes them in; this helper does not derive offsets or pointers.
+        Returns the actual byte count written.
+        """
+        actual = self._base.ggml_quantize_chunk(
+            type_id,
+            src_ptr,
+            dst_ptr,
+            ctypes.c_int64(0),
+            ctypes.c_int64(nrows),
+            ctypes.c_int64(n_per_row),
+            imat_ptr if imat_ptr is not None else ctypes.POINTER(ctypes.c_float)(),
+        )
+        if actual != expected_bytes:
+            raise RuntimeError(
+                f"ggml_quantize_chunk wrote {actual} bytes{context}, expected "
+                f"{expected_bytes} (type={ggml_type}{detail}). Likely cause: "
+                f"wrong type_id or block-size mismatch."
+            )
+        return actual
 
     def encode(
         self,
@@ -466,41 +604,9 @@ class _LibggmlHandle:
 
         flat = np.ascontiguousarray(weights, dtype=np.float32).reshape(-1)
 
-        n_slices = 1
-        imat_check = None
-        if imatrix is not None:
-            if n_per_row is None:
-                raise ValueError(
-                    "imatrix-weighted encoding requires n_per_row (the "
-                    "tensor's row width); importance is applied per column."
-                )
-            if n_per_row <= 0 or flat.size % n_per_row != 0:
-                raise ValueError(
-                    f"tensor size {flat.size} is not a multiple of "
-                    f"n_per_row={n_per_row}"
-                )
-            nrows = flat.size // n_per_row
-            imat_check = np.ascontiguousarray(imatrix, dtype=np.float32).reshape(-1)
-            if imat_check.size == 0 or imat_check.size % n_per_row != 0:
-                raise ValueError(
-                    f"imatrix length {imat_check.size} is not a multiple of "
-                    f"row width {n_per_row}. Each weight tensor needs one "
-                    f"([n_per_row]) or, for stacked MoE experts, several "
-                    f"([n_experts * n_per_row], expert-major) importance "
-                    f"vectors."
-                )
-            n_slices = imat_check.size // n_per_row
-            if n_slices > 1 and nrows % n_slices != 0:
-                raise ValueError(
-                    f"imatrix has {n_slices} per-expert slices but the "
-                    f"tensor's {nrows} rows don't divide evenly by that — "
-                    f"shape mismatch between the captured imatrix and this "
-                    f"weight tensor."
-                )
-        else:
-            # Historical fast path: one row spanning the whole buffer.
-            n_per_row = flat.size
-            nrows = 1
+        n_per_row, nrows, n_slices, imat_check = self._resolve_quantize_shape(
+            flat.size, imatrix, n_per_row
+        )
 
         type_id = GGML_TYPE_IDS[ggml_type]
         out_size = _expected_size(ggml_type, flat.size)
@@ -523,21 +629,17 @@ class _LibggmlHandle:
             if imat_check is not None:
                 imat_ptr = imat_check.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-            actual = self._base.ggml_quantize_chunk(
+            self._quantize_chunk_or_raise(
                 type_id,
                 flat.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 ctypes.cast(dst_buf, ctypes.c_void_p),
-                ctypes.c_int64(0),
-                ctypes.c_int64(nrows),
-                ctypes.c_int64(n_per_row),
-                imat_ptr if imat_ptr is not None else ctypes.POINTER(ctypes.c_float)(),
+                nrows,
+                n_per_row,
+                imat_ptr,
+                out_size,
+                ggml_type,
+                detail=f", n_elements={n_per_row}",
             )
-            if actual != out_size:
-                raise RuntimeError(
-                    f"ggml_quantize_chunk wrote {actual} bytes, expected {out_size} "
-                    f"(type={ggml_type}, n_elements={n_per_row}). "
-                    f"Likely cause: wrong type_id or block-size mismatch."
-                )
             return bytes(dst_buf)
 
         # Per-expert MoE tensor: quantize each expert's slice separately with
@@ -556,22 +658,17 @@ class _LibggmlHandle:
             imat_slice = imat_check[slice_idx * n_per_row: (slice_idx + 1) * n_per_row]
             dst_ptr = ctypes.c_void_p(dst_base + slice_idx * slice_bytes)
 
-            actual = self._base.ggml_quantize_chunk(
+            actual = self._quantize_chunk_or_raise(
                 type_id,
                 src_slice.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
                 dst_ptr,
-                ctypes.c_int64(0),
-                ctypes.c_int64(rows_per_slice),
-                ctypes.c_int64(n_per_row),
+                rows_per_slice,
+                n_per_row,
                 imat_slice.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                slice_bytes,
+                ggml_type,
+                context=f" for expert slice {slice_idx}/{n_slices}",
             )
-            if actual != slice_bytes:
-                raise RuntimeError(
-                    f"ggml_quantize_chunk wrote {actual} bytes for expert "
-                    f"slice {slice_idx}/{n_slices}, expected {slice_bytes} "
-                    f"(type={ggml_type}). Likely cause: wrong type_id or "
-                    f"block-size mismatch."
-                )
             total_written += actual
 
         if total_written != out_size:

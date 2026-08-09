@@ -59,3 +59,36 @@ def test_cross_check_skips_unsupported_fork_types(monkeypatch):
         pytest.skip("this handle's libggml supports ROCmFPX -- nothing to skip here")
     # Should complete without touching any fork id.
     handle._cross_check_block_type_sizes()
+
+
+def test_requires_imatrix_cross_check_logs_on_static_live_mismatch(monkeypatch, caplog):
+    """Injecting a scheme whose static requires_imatrix field disagrees with
+    this handle's live requires_imatrix() answer must produce a warning log
+    line naming the scheme -- not raise. Regression for the requires_imatrix
+    drift guard: schemes.py's static field and the live
+    ggml_quantize_requires_imatrix answer are two independent sources of
+    truth with no runtime check tying them together otherwise. Handle
+    construction itself already exercises the no-mismatch, no-raise path
+    (get_handle() in the autouse fixture above would already fail loudly if
+    _cross_check_requires_imatrix raised)."""
+    import dataclasses
+
+    import magicquant.quant.schemes as schemes_mod
+
+    handle = get_handle()
+    real_scheme = schemes_mod.get_scheme_by_name("Q8_0")
+    assert real_scheme.requires_imatrix is False
+    assert handle.requires_imatrix("Q8_0") is False  # sanity: no real drift today
+    fake_scheme = dataclasses.replace(real_scheme, requires_imatrix=True)
+    monkeypatch.setattr(schemes_mod, "get_all_schemes", lambda: [fake_scheme])
+
+    with caplog.at_level(logging.WARNING, logger=ggml_binding.__name__):
+        handle._cross_check_requires_imatrix()  # must not raise
+
+    assert any(
+        "Q8_0" in rec.message and "requires_imatrix" in rec.message
+        for rec in caplog.records
+    ), (
+        "expected a requires_imatrix drift warning naming Q8_0, got: "
+        f"{[r.message for r in caplog.records]}"
+    )

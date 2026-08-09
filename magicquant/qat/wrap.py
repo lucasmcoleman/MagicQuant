@@ -30,7 +30,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from magicquant.qat.expert_wrap import MODE_LIVE, wrap_fused_experts
+from magicquant.qat.expert_wrap import (
+    MODE_LIVE,
+    _get_submodule,
+    _split_param_path,
+    wrap_fused_experts,
+)
 from magicquant.qat.fake_quant import fake_quant
 from magicquant.qat.names import hf_to_ggml_name
 
@@ -301,15 +306,15 @@ def merge_qat_adapters(model: nn.Module) -> nn.Module:
 
 
 def _set_submodule(root: nn.Module, dotted_name: str, new_module: nn.Module) -> None:
-    """Set ``root.<dotted_name>`` to ``new_module`` (handles ModuleList indices)."""
-    parts = dotted_name.split(".")
-    parent = root
-    for p in parts[:-1]:
-        if p.isdigit():
-            parent = parent[int(p)]
-        else:
-            parent = getattr(parent, p)
-    last = parts[-1]
+    """Set ``root.<dotted_name>`` to ``new_module`` (handles ModuleList indices).
+
+    The parent walk is ``expert_wrap``'s ``_split_param_path``/``_get_submodule``
+    (the same dotted-path traversal, already used there for the 3-D expert
+    parametrizations); only the final digit-vs-attr write has no equivalent
+    there and stays here.
+    """
+    parent_path, last = _split_param_path(dotted_name)
+    parent = _get_submodule(root, parent_path)
     if last.isdigit():
         parent[int(last)] = new_module
     else:

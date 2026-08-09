@@ -13,7 +13,6 @@ The core loop:
 import concurrent.futures
 import json
 import os
-import time
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 from collections import defaultdict
@@ -22,9 +21,9 @@ from magicquant.evolution.predictor import PredictiveScorer
 from magicquant.evolution.survival import EvolutionarySurvivor
 from magicquant.evolution.probing import SensitivityProber
 from magicquant.gguf.tensor_groups import TensorGroupClassifier
-from magicquant.utils.naming import generate_name
-from magicquant.utils.llamacpp import LlamaCppTools, get_llamacpp_quant_type
-from magicquant.utils.measurement import measurement_eps
+from magicquant.utils.naming import generate_name, config_key as _naming_config_key
+from magicquant.utils.llamacpp import LlamaCppTools
+from magicquant.utils.measurement import measurement_eps, predictor_is_tracking
 from magicquant.logging import get_logger
 from magicquant.quant.schemes import get_scheme_by_name
 
@@ -174,6 +173,13 @@ class MagicQuantOrchestrator:
         # measurement noise (see run_measured_search's speed_epsilon
         # docstring for the ThinkingCap numbers that motivated this).
         self._speed_epsilon: Optional[float] = None
+        # Metric _speed_aware_pick re-ranks near-tied candidates by: "bytes"
+        # (size_gb, default) or "bench" (measured tg throughput). Overridden
+        # by run_measured_search's speed_metric param. See the getattr
+        # fallback at _select_final_survivors, which intentionally keeps a
+        # DIFFERENT default ("bytes") for bare-__new__ test doubles that never
+        # ran __init__ -- both defaults agree, so this is purely additive.
+        self._speed_metric: str = "bytes"
 
     def _apply_seed(self, seed: Optional[int]) -> None:
         """Seed the RNGs once for a reproducible search.
@@ -353,7 +359,7 @@ class MagicQuantOrchestrator:
         isn't GGUF, or capture/load failed -- logged as a warning, never
         raised: this must never block the pipeline).
         """
-        from magicquant.imatrix import ensure_imatrix
+        from magicquant.imatrix import ensure_imatrix, resolve_imatrix_bin
 
         # Default llama-imatrix to the sibling of the discovered perplexity
         # binary: ensure_imatrix's own fallback is a PATH lookup, which can
@@ -361,11 +367,9 @@ class MagicQuantOrchestrator:
         # stock brew install that can't load an arch only the configured fork
         # supports (bit for real on a qwen35 MTP model, 2026-07-04).
         if "imatrix_bin" not in kwargs:
-            perplexity = getattr(self.llama_tools, "perplexity_tool", None)
-            if perplexity:
-                sibling = Path(perplexity).parent / "llama-imatrix"
-                if sibling.exists():
-                    kwargs["imatrix_bin"] = str(sibling)
+            resolved = resolve_imatrix_bin(self.llama_tools)
+            if resolved:
+                kwargs["imatrix_bin"] = resolved
 
         # Never calibrate on the text the run is SCORED against. Doing so
         # tunes quantization to the eval set and every measured_loss comes
@@ -883,28 +887,7 @@ class MagicQuantOrchestrator:
         # Group detection is cheap tensor-name classification (no
         # measurement calls), so it always runs regardless of resume --
         # only the expensive probe_all_groups() below is skippable.
-        groups = ["E", "H", "Q", "K", "O", "U", "D"]
-        # Add MoE/SSM groups if present in the model
-        classifier = TensorGroupClassifier()
-        from magicquant.gguf.source import open_model_source
-        _src = open_model_source(self.source_model_path)
-        try:
-            tensor_names = _src.get_tensor_names()
-        finally:
-            _src.close()
-        if any(classifier.classify_tensor(t) in ("X", "R") for t in tensor_names):
-            groups.extend(["X", "R"])
-        if any(classifier.classify_tensor(t) == "S" for t in tensor_names):
-            groups.append("S")
-        # This loop drove classify_tensor() one name at a time (not
-        # classify_tensors(), which fires the summary automatically) across
-        # the full model's tensor_names -- surface the unclassified-tensor
-        # summary now that the pass is complete. See
-        # TensorGroupClassifier.warn_unclassified_once()'s docstring.
-        classifier.warn_unclassified_once()
-        # Remember the full detected group set so run_evolution actually
-        # varies X/R/S (otherwise it falls back to DEFAULT_GROUPS).
-        self._search_groups = groups
+        groups = self._detect_search_groups()
 
         # A checkpoint can legitimately carry a baseline but NO sensitivities:
         # a run killed between the baseline measurement and probing, or a
@@ -986,14 +969,7 @@ class MagicQuantOrchestrator:
         # (_estimate_model_size also populates self._param_counts per group.)
         baseline_size_gb = self._estimate_model_size(self.source_model_path)
 
-        self.predictor = PredictiveScorer(
-            sensitivity_weights=self.sensitivity_weights,
-            parameter_counts=self._param_counts,
-            baseline_size_gb=baseline_size_gb,
-            baseline_tps=360,
-            imatrix_active=self._imatrix is not None,
-            calibration_source=calibration_source,
-        )
+        self.predictor = self._build_predictor(calibration_source, baseline_size_gb)
 
         # ── Step 3b: incumbent seeding ──
         # Build llama.cpp's own Q4_K_M/Q5_K_M/Q6_K mixtures (restricted to the
@@ -1184,154 +1160,10 @@ class MagicQuantOrchestrator:
                     if path is None:
                         continue
 
-                    # Measure perplexity, fusing in the KL pass when active: a
-                    # --kl-divergence run against saved base logits ALSO
-                    # prints this candidate's own perplexity (Mean PPL(Q)), so
-                    # when KL scoring is active we get both signals from ONE
-                    # llama-perplexity invocation instead of two. Falls back
-                    # to the historical standalone calculate_perplexity call
-                    # when KL is off, its base logits aren't active, the KL
-                    # call raised, or its result doesn't carry "ppl" -- the
-                    # "KL failure must not abort/win" guarantee stays intact
-                    # either way (measured entry gets ppl either way, "kl"
-                    # only recorded when the KL call itself succeeded).
-                    kl_result = None
-                    if enable_kl and self._kl_base_logits_path:
-                        try:
-                            kl_result = self.llama_tools.calculate_kl_divergence(
-                                path, self._kl_base_logits_path, self._kl_corpus_path,
-                                ctx_size=self.llama_tools.ctx_size,
-                            )
-                        except Exception as exc:
-                            log.warning(
-                                "KL-divergence measurement failed for candidate; "
-                                "continuing without it", stage="kl", error=str(exc),
-                            )
-                            kl_result = None
-
-                    # Track which corpus THIS measurement actually used --
-                    # recorded per-entry below (fix for CORPUS PROVENANCE:
-                    # search_results.json used to stamp one corpus value at
-                    # save time, which can't catch a corpus that changed
-                    # mid-run). The KL path already threads self._kl_corpus_
-                    # path through explicitly; the plain path re-resolves via
-                    # LlamaCppTools, which now pins its own auto-resolution
-                    # and raises if a later call would disagree -- so this is
-                    # cheap (no new subprocess) and guaranteed consistent
-                    # with what calculate_perplexity itself just measured
-                    # over.
-                    if kl_result is not None and kl_result.get("ppl") is not None:
-                        ppl = kl_result["ppl"]
-                        measurement_corpus = self._kl_corpus_path
-                    else:
-                        ppl = self.llama_tools.calculate_perplexity(path, verbose=verbose)
-                        measurement_corpus = self.llama_tools._resolve_data_file(None)
-
-                    if ppl is not None:
-                        measured_loss = (ppl - self.baseline_ppl) / self.baseline_ppl
-
-                        # A quantized candidate cannot genuinely beat the
-                        # baseline it's a lossy compression OF -- a
-                        # measured_loss below -eps is a failed/noise-floor
-                        # measurement, not a quality win. Unguarded, this fed
-                        # straight into _select_final_survivors' min()
-                        # selection; the incident that motivated this fix saw
-                        # a NaN-driven "measured_loss=-0.9225" WIN a tier.
-                        # eps is sized off this candidate's own reported KL
-                        # ppl_err when available, else the same shared default
-                        # probing.py's clamp uses (magicquant.utils
-                        # .measurement.measurement_eps).
-                        eps = measurement_eps(
-                            self.baseline_ppl,
-                            kl_result.get("ppl_err") if kl_result else None,
-                        )
-                        measurement_invalid = measured_loss < -eps
-                        if measurement_invalid:
-                            log.warning(
-                                "Candidate measurement is physically "
-                                "impossible (measured_loss below -eps) -- "
-                                "flagging invalid instead of letting it win "
-                                "a tier",
-                                stage="measurement",
-                                measured_loss=round(measured_loss, 4),
-                                eps=round(eps, 4),
-                                ppl=round(ppl, 4),
-                                baseline_ppl=round(self.baseline_ppl, 4),
-                            )
-
-                        predicted_loss = self.predictor.predict_loss(config)
-                        residual = measured_loss - predicted_loss
-
-                        # Record measurement
-                        candidate_path = Path(path)
-                        self._measured[config_key] = {
-                            "config": config,
-                            "ppl": ppl,
-                            "measured_loss": measured_loss,
-                            "predicted_loss": predicted_loss,
-                            "residual": residual,
-                            "path": path,
-                            "size_gb": candidate_path.stat().st_size / (1024 ** 3),
-                            "corpus_path": measurement_corpus,
-                            "measurement_invalid": measurement_invalid,
-                        }
-                        if config_key in incumbent_tier_by_key:
-                            self._measured[config_key]["incumbent"] = (
-                                incumbent_tier_by_key[config_key]
-                            )
-
-                        if kl_result is not None:
-                            self._measured[config_key]["kl"] = kl_result
-
-                        # Optional secondary signal -- best-effort (None on
-                        # failure), scored in _select_final_survivors
-                        # alongside measured_loss rather than gating the
-                        # candidate at all. bench() only catches
-                        # CalledProcessError/TimeoutExpired internally; a
-                        # missing or wrong-arch binary raises
-                        # OSError/FileNotFoundError, which must not abort the
-                        # rest of the search.
-                        if enable_speed_bench:
-                            try:
-                                self._measured[config_key]["bench"] = self.llama_tools.bench(path)
-                            except Exception as exc:
-                                log.warning(
-                                    "Speed bench failed for candidate; continuing "
-                                    "without it", stage="bench", error=str(exc),
-                                )
-
-                        # Active learning: feed residual back -- but never
-                        # from an invalid measurement. A physically
-                        # impossible ppl reading would poison the predictor
-                        # with a bogus residual that then biases every LATER
-                        # candidate's predicted_loss in this search, not just
-                        # this one candidate's own record.
-                        if not measurement_invalid:
-                            self.predictor.record_residual(config, residual)
-
-                        if verbose:
-                            log.info(
-                                "Candidate measured",
-                                stage="measurement",
-                                ppl=round(ppl, 4),
-                                measured_loss=round(measured_loss, 4),
-                                predicted_loss=round(predicted_loss, 4),
-                                residual=round(residual, 4),
-                            )
-
-                        # Persist after EVERY successful measurement -- a kill
-                        # right after this point must resume with this candidate
-                        # already recorded, not lost.
-                        self._write_measured_checkpoint(checkpoint_path)
-                    else:
-                        if verbose:
-                            log.warning("Measurement failed", stage="measurement")
-
-                    # Clean up candidate GGUF to save disk (keep only final survivors)
-                    # We'll rebuild the final survivors at the end
-                    candidate_file = Path(path)
-                    if candidate_file.exists():
-                        candidate_file.unlink()
+                    self._record_candidate_measurement(
+                        path, config, config_key, incumbent_tier_by_key,
+                        enable_kl, enable_speed_bench, checkpoint_path, verbose,
+                    )
             finally:
                 # Any prefetched build still outstanding (e.g. we're bailing
                 # out via an exception raised somewhere above) must be
@@ -1390,6 +1222,8 @@ class MagicQuantOrchestrator:
                 "llama.cpp build, disk space, corpus, and per-candidate "
                 "build errors logged above."
             )
+
+        self._log_predictor_tracking()
 
         # ── Step 5: Select final survivors per tier ──
         tiered = self._select_final_survivors(baseline_size_gb)
@@ -1459,6 +1293,245 @@ class MagicQuantOrchestrator:
                 )
 
         return all_configs, tiered
+
+    def _detect_search_groups(self) -> List[str]:
+        """Detect which tensor groups this model actually has: dense
+        E/H/Q/K/O/U/D always, plus X/R when MoE expert/router tensors are
+        present and S when SSM/linear-attention tensors are present. Sets
+        self._search_groups (read by _build_incumbent_seeds and
+        run_evolution) and returns the same list, since callers also use
+        it locally (e.g. as probe_all_groups's groups= argument).
+
+        Byte-identical block previously duplicated in run_measured_search
+        and run_full_search (diffed identical before this extraction).
+
+        TRAP: the `open_model_source` import below is deliberately
+        function-local, not hoisted to module scope. Several tests
+        (e.g. tests/test_strict_probing.py's "Group detection opens the
+        source -- stub it.") monkeypatch magicquant.gguf.source
+        .open_model_source by name; a late import resolves that
+        attribute at call time, which is what makes the patch take. A
+        module-level import would bind the original function at import
+        time and silently break every one of those tests.
+        """
+        groups = ["E", "H", "Q", "K", "O", "U", "D"]
+        # Add MoE/SSM groups if present in the model
+        classifier = TensorGroupClassifier()
+        from magicquant.gguf.source import open_model_source
+        _src = open_model_source(self.source_model_path)
+        try:
+            tensor_names = _src.get_tensor_names()
+        finally:
+            _src.close()
+        if any(classifier.classify_tensor(t) in ("X", "R") for t in tensor_names):
+            groups.extend(["X", "R"])
+        if any(classifier.classify_tensor(t) == "S" for t in tensor_names):
+            groups.append("S")
+        # This loop drove classify_tensor() one name at a time (not
+        # classify_tensors(), which fires the summary automatically) across
+        # the full model's tensor_names -- surface the unclassified-tensor
+        # summary now that the pass is complete. See
+        # TensorGroupClassifier.warn_unclassified_once()'s docstring.
+        classifier.warn_unclassified_once()
+        # Remember the full detected group set so run_evolution actually
+        # varies X/R/S (otherwise it falls back to DEFAULT_GROUPS).
+        self._search_groups = groups
+        return groups
+
+    def _build_predictor(self, calibration_source, baseline_size_gb: float) -> PredictiveScorer:
+        """Construct this search's PredictiveScorer. Byte-identical
+        construction call previously duplicated in run_measured_search and
+        run_full_search (diffed identical before this extraction); each
+        caller still assigns the result to self.predictor itself.
+        """
+        return PredictiveScorer(
+            sensitivity_weights=self.sensitivity_weights,
+            parameter_counts=self._param_counts,
+            baseline_size_gb=baseline_size_gb,
+            baseline_tps=360,
+            imatrix_active=self._imatrix is not None,
+            calibration_source=calibration_source,
+        )
+
+    def _record_candidate_measurement(
+        self, path, config, config_key, incumbent_tier_by_key,
+        enable_kl, enable_speed_bench, checkpoint_path, verbose,
+    ):
+        """Measure one built candidate GGUF (fusing KL+PPL when active),
+        apply the physical-plausibility eps guard, populate
+        self._measured, feed the predictor's active-learning residual
+        cache, persist the checkpoint, and unlink the candidate GGUF.
+        Pure code motion out of run_measured_search's per-candidate loop
+        body -- no logic change, no reordering.
+
+        PRECONDITION: the caller must have already handled `path is
+        None` -- that guard stays at the call site, above this method's
+        call, in run_measured_search. `Path(None)` below would raise.
+
+        53 of this body's ~148 lines are a 9-day-old correctness fix
+        (a6f8dd0, "never let a non-measurement become a number"): the
+        `eps`/`measurement_invalid` guard and the residual-recording
+        suppression it drives exist because a NaN-driven
+        measured_loss=-0.9225 once won a tier. Do not simplify the eps
+        expression, and do not hoist predictor.record_residual() out
+        from under the `if not measurement_invalid:` check.
+
+        Exception semantics are unchanged by this move: an exception
+        escaping calculate_perplexity or the KL-fallback branch is not
+        caught here and propagates to the caller exactly as it did out
+        of the inline block -- including that the candidate GGUF is
+        NOT unlinked on that path, since the cleanup at the bottom of
+        this method never runs. That is pre-existing behavior; it is
+        not fixed here.
+        """
+        # Measure perplexity, fusing in the KL pass when active: a
+        # --kl-divergence run against saved base logits ALSO
+        # prints this candidate's own perplexity (Mean PPL(Q)), so
+        # when KL scoring is active we get both signals from ONE
+        # llama-perplexity invocation instead of two. Falls back
+        # to the historical standalone calculate_perplexity call
+        # when KL is off, its base logits aren't active, the KL
+        # call raised, or its result doesn't carry "ppl" -- the
+        # "KL failure must not abort/win" guarantee stays intact
+        # either way (measured entry gets ppl either way, "kl"
+        # only recorded when the KL call itself succeeded).
+        kl_result = None
+        if enable_kl and self._kl_base_logits_path:
+            try:
+                kl_result = self.llama_tools.calculate_kl_divergence(
+                    path, self._kl_base_logits_path, self._kl_corpus_path,
+                    ctx_size=self.llama_tools.ctx_size,
+                )
+            except Exception as exc:
+                log.warning(
+                    "KL-divergence measurement failed for candidate; "
+                    "continuing without it", stage="kl", error=str(exc),
+                )
+                kl_result = None
+
+        # Track which corpus THIS measurement actually used --
+        # recorded per-entry below (fix for CORPUS PROVENANCE:
+        # search_results.json used to stamp one corpus value at
+        # save time, which can't catch a corpus that changed
+        # mid-run). The KL path already threads self._kl_corpus_
+        # path through explicitly; the plain path re-resolves via
+        # LlamaCppTools, which now pins its own auto-resolution
+        # and raises if a later call would disagree -- so this is
+        # cheap (no new subprocess) and guaranteed consistent
+        # with what calculate_perplexity itself just measured
+        # over.
+        if kl_result is not None and kl_result.get("ppl") is not None:
+            ppl = kl_result["ppl"]
+            measurement_corpus = self._kl_corpus_path
+        else:
+            ppl = self.llama_tools.calculate_perplexity(path, verbose=verbose)
+            measurement_corpus = self.llama_tools._resolve_data_file(None)
+
+        if ppl is not None:
+            measured_loss = (ppl - self.baseline_ppl) / self.baseline_ppl
+
+            # A quantized candidate cannot genuinely beat the
+            # baseline it's a lossy compression OF -- a
+            # measured_loss below -eps is a failed/noise-floor
+            # measurement, not a quality win. Unguarded, this fed
+            # straight into _select_final_survivors' min()
+            # selection; the incident that motivated this fix saw
+            # a NaN-driven "measured_loss=-0.9225" WIN a tier.
+            # eps is sized off this candidate's own reported KL
+            # ppl_err when available, else the same shared default
+            # probing.py's clamp uses (magicquant.utils
+            # .measurement.measurement_eps).
+            eps = measurement_eps(
+                self.baseline_ppl,
+                kl_result.get("ppl_err") if kl_result else None,
+            )
+            measurement_invalid = measured_loss < -eps
+            if measurement_invalid:
+                log.warning(
+                    "Candidate measurement is physically "
+                    "impossible (measured_loss below -eps) -- "
+                    "flagging invalid instead of letting it win "
+                    "a tier",
+                    stage="measurement",
+                    measured_loss=round(measured_loss, 4),
+                    eps=round(eps, 4),
+                    ppl=round(ppl, 4),
+                    baseline_ppl=round(self.baseline_ppl, 4),
+                )
+
+            predicted_loss = self.predictor.predict_loss(config)
+            residual = measured_loss - predicted_loss
+
+            # Record measurement
+            candidate_path = Path(path)
+            self._measured[config_key] = {
+                "config": config,
+                "ppl": ppl,
+                "measured_loss": measured_loss,
+                "predicted_loss": predicted_loss,
+                "residual": residual,
+                "path": path,
+                "size_gb": candidate_path.stat().st_size / (1024 ** 3),
+                "corpus_path": measurement_corpus,
+                "measurement_invalid": measurement_invalid,
+            }
+            if config_key in incumbent_tier_by_key:
+                self._measured[config_key]["incumbent"] = (
+                    incumbent_tier_by_key[config_key]
+                )
+
+            if kl_result is not None:
+                self._measured[config_key]["kl"] = kl_result
+
+            # Optional secondary signal -- best-effort (None on
+            # failure), scored in _select_final_survivors
+            # alongside measured_loss rather than gating the
+            # candidate at all. bench() only catches
+            # CalledProcessError/TimeoutExpired internally; a
+            # missing or wrong-arch binary raises
+            # OSError/FileNotFoundError, which must not abort the
+            # rest of the search.
+            if enable_speed_bench:
+                try:
+                    self._measured[config_key]["bench"] = self.llama_tools.bench(path)
+                except Exception as exc:
+                    log.warning(
+                        "Speed bench failed for candidate; continuing "
+                        "without it", stage="bench", error=str(exc),
+                    )
+
+            # Active learning: feed residual back -- but never
+            # from an invalid measurement. A physically
+            # impossible ppl reading would poison the predictor
+            # with a bogus residual that then biases every LATER
+            # candidate's predicted_loss in this search, not just
+            # this one candidate's own record.
+            if not measurement_invalid:
+                self.predictor.record_residual(config, residual)
+
+            if verbose:
+                log.info(
+                    "Candidate measured",
+                    stage="measurement",
+                    ppl=round(ppl, 4),
+                    measured_loss=round(measured_loss, 4),
+                    predicted_loss=round(predicted_loss, 4),
+                    residual=round(residual, 4),
+                )
+
+            # Persist after EVERY successful measurement -- a kill
+            # right after this point must resume with this candidate
+            # already recorded, not lost.
+            self._write_measured_checkpoint(checkpoint_path)
+        else:
+            if verbose:
+                log.warning("Measurement failed", stage="measurement")
+
+        # Clean up candidate GGUF to save disk (keep only final survivors)
+        # We'll rebuild the final survivors at the end
+        candidate_file = Path(path)
+        if candidate_file.exists():
+            candidate_file.unlink()
 
     def _select_measurement_candidates(
         self,
@@ -1688,12 +1761,13 @@ class MagicQuantOrchestrator:
             tier = self._classify_tier(info["size_gb"], baseline_gb)
             by_tier[tier].append(info)
 
-        # Conservative getattr fallback (False/None) for instances built via
-        # bare __new__ that predate this feature entirely -- a normally
-        # constructed orchestrator always has these attributes set (True /
-        # None by __init__, then possibly overridden by run_measured_search's
-        # own speed_aware/speed_epsilon params), so real callers get the new
-        # default; only pre-feature/stripped-down test doubles fall back here.
+        # Conservative getattr fallback (False/None/"bytes") for instances
+        # built via bare __new__ that predate this feature entirely -- a
+        # normally constructed orchestrator always has these attributes set
+        # (True / None / "bytes" by __init__, then possibly overridden by
+        # run_measured_search's own speed_aware/speed_epsilon/speed_metric
+        # params), so real callers get the new default; only pre-feature/
+        # stripped-down test doubles fall back here.
         speed_aware = getattr(self, "_speed_aware", False)
         speed_epsilon_override = getattr(self, "_speed_epsilon", None)
         speed_metric = getattr(self, "_speed_metric", "bytes")
@@ -1817,6 +1891,163 @@ class MagicQuantOrchestrator:
             "weights_degenerate": weights_degenerate,
         }
 
+    @staticmethod
+    def _serialize_measurement(v: Dict[str, Any], *, include_path: bool) -> Dict[str, Any]:
+        """Single field list for a per-measurement export entry, shared by
+        ``_save_results``' "measurements" dict (include_path=False) and
+        ``_write_measured_checkpoint``'s "measured" dict (include_path=True).
+        Both used to independently re-list the same fields off
+        ``self._measured.items()`` and had to be hand-kept in sync.
+
+        CONTRACT: this whitelist feeds a PERSISTED interchange format.
+        search_results.json's "measurements" is consumed by
+        qat.config.load_hybrid_config, Foundry's rocmfpx MQ-hybrid mode,
+        tools/reselect_tiers.py, and tools/fit_noise_factors.py. The
+        checkpoint's "measured" dict is read back verbatim on resume
+        (``self._measured[key] = dict(entry)``, no second filter) -- this
+        whitelist is therefore the ONLY gate on what a resumed run keeps.
+        A field added here lands in BOTH artifacts; a field dropped here
+        is silently lost by every resumed run. See the BLOCKER note below
+        for why that is not hypothetical.
+
+        Per-site key ORDER is preserved exactly as it was before this
+        helper existed, and is CONTRACTUAL: these artifacts are persisted
+        interchange formats read by external tools, so treat raw JSON key
+        order as part of the format -- do not collapse the two branches
+        into one uniform order. ``_save_results`` ends
+        ...incumbent, corpus_path, measurement_invalid; the checkpoint
+        inserts "path" right after "residual" and ends
+        ...incumbent, measurement_invalid, corpus_path.
+        """
+        entry: Dict[str, Any] = {
+            "config": v["config"],
+            "ppl": v.get("ppl"),
+            "measured_loss": v.get("measured_loss"),
+            "predicted_loss": v.get("predicted_loss"),
+            "residual": v.get("residual"),
+        }
+        if include_path:
+            # Checkpoint-only, write-only field: the candidate GGUF it
+            # names is unlink()ed moments after the checkpoint write, and
+            # nothing ever reads it back on resume. Deliberately NOT
+            # emitted into search_results.json -- that would leak a dead
+            # temp-build path into a published, externally-consumed
+            # artifact.
+            entry["path"] = v.get("path")
+        entry["size_gb"] = v.get("size_gb")
+        entry["kl"] = v.get("kl")
+        entry["bench"] = v.get("bench")
+        entry["incumbent"] = v.get("incumbent")
+        if include_path:
+            # BLOCKER fix: this whitelist used to omit
+            # measurement_invalid/corpus_path, so a resumed run's entries
+            # came back WITHOUT them -- info.get("measurement_invalid") is
+            # None (falsy) post-resume, and a physically-impossible
+            # candidate could win a tier again across a resume boundary.
+            # See tests/test_measured_search_checkpoint_resume.py::
+            # test_measurement_invalid_and_corpus_path_survive_checkpoint_round_trip.
+            entry["measurement_invalid"] = v.get("measurement_invalid", False)
+            entry["corpus_path"] = v.get("corpus_path")
+        else:
+            # Per-measurement corpus (fix for CORPUS PROVENANCE: the
+            # top-level "measurement"/"corpus" field below is still
+            # stamped once, kept for backward compat with older readers,
+            # but each measurement now carries the corpus it was ACTUALLY
+            # taken over, so a mid-run change would be visible here even
+            # if the single summary field wasn't updated).
+            entry["corpus_path"] = v.get("corpus_path")
+            # True when this reading was physically impossible
+            # (measured_loss below -eps) and excluded from
+            # _select_final_survivors -- kept in the record for
+            # diagnostics rather than silently dropped.
+            entry["measurement_invalid"] = v.get("measurement_invalid", False)
+        return entry
+
+    def _log_predictor_tracking(self) -> None:
+        """Kendall-tau diagnostic: does the loss predictor's ranking of
+        candidates actually track measured reality? See
+        ``magicquant.utils.measurement``'s "Predictor tracking" section --
+        ``predictor_rank_correlation``/``predictor_is_tracking`` were built
+        and unit-tested there (the module's own docstring calls this "the
+        guard that would have caught the 2026-07 [Laguna-S] failure no
+        matter which layer was at fault", tau -0.043 over that run's
+        pairs) but were never wired into a live search until now.
+
+        Computed ONCE, cumulatively, over every accumulated
+        (predicted_loss, measured_loss) pair in ``self._measured`` --
+        deliberately NOT per-round: ``candidates_per_round`` defaults to 4,
+        far below ``MIN_TAU_SAMPLES`` (12), so a per-round call would
+        report "unknown" forever and never actually check anything.
+        ``measurement_invalid`` entries are excluded (their measured_loss
+        is a physically-impossible reading that would corrupt the
+        correlation the same way it would corrupt tier selection), and
+        the filter clauses use ``.get(...)`` so incumbent-seeded entries
+        (``predicted_loss`` present, ``measured_loss=None``) and
+        foreign/hand-edited checkpoints missing either field are skipped
+        before the value expression indexes them.
+
+        Report, never gate: ``predictor_is_tracking`` returns a
+        THREE-state verdict (True / False / None-for-"not enough data"),
+        and only False is evidence of a broken run. A None verdict is
+        logged the same as True (info) -- logging "not tracking" for
+        "unknown" would be the exact "measured nothing reported as
+        measured zero" defect this repo's audits keep flagging,
+        reproduced in the reporting layer instead of the measurement
+        layer. Never raises BY CONSTRUCTION (the whole body is wrapped,
+        like the sibling reporting helpers): this runs before
+        ``_save_results``, so an unexpected exception here -- e.g. an
+        older self-installed scipy without ``SignificanceResult
+        .statistic`` -- must not be able to destroy a multi-hour run's
+        results. scipy being absent (``predictor_rank_correlation``
+        degrades to ``(None, None)`` with its own one-time warning)
+        surfaces as the ordinary "unknown" verdict, not a crash.
+
+        Stores the verdict on ``self._predictor_tracking`` for
+        ``_save_results`` to persist under the additive
+        ``"predictor_tracking"`` search_results.json key.
+        """
+        try:
+            self._log_predictor_tracking_inner()
+        except Exception as exc:  # pragma: no cover - defensive, like siblings
+            log.warning(
+                "Predictor-tracking diagnostic failed (non-fatal)",
+                stage="measurement", error=str(exc),
+            )
+
+    def _log_predictor_tracking_inner(self) -> None:
+        pairs = [
+            (info["predicted_loss"], info["measured_loss"])
+            for info in self._measured.values()
+            if not info.get("measurement_invalid")
+            and info.get("predicted_loss") is not None
+            and info.get("measured_loss") is not None
+        ]
+        predicted = [p for p, _m in pairs]
+        measured = [m for _p, m in pairs]
+        is_tracking, tau = predictor_is_tracking(predicted, measured)
+        self._predictor_tracking = {
+            "is_tracking": is_tracking,
+            "tau": tau,
+            "n_pairs": len(pairs),
+        }
+        if is_tracking is False:
+            log.warning(
+                "Predictor is NOT tracking measured reality over this "
+                "run -- its ranking of candidates was no better than "
+                "chance. The search optimized against a signal "
+                "uncorrelated with quality; treat its tier winners with "
+                "suspicion.",
+                stage="measurement", tau=round(tau, 4), n_pairs=len(pairs),
+            )
+        else:
+            log.info(
+                "Predictor tracking check",
+                stage="measurement",
+                is_tracking=is_tracking,
+                tau=round(tau, 4) if tau is not None else None,
+                n_pairs=len(pairs),
+            )
+
     def _save_results(self, all_configs, tiered):
         """Persist search results and measurements to JSON.
 
@@ -1828,6 +2059,33 @@ class MagicQuantOrchestrator:
         ``tiered[tier]["config"]``, which both paths provide.
         """
         from magicquant.quant.tiers import CURRENT_TIER_SCHEME_VERSION
+
+        # Built once and reused for both "tiered" (full) and "tiered_survivors"
+        # (the same per-tier entry minus predicted_loss) below -- the two used
+        # to be independent dict comprehensions over the same `tiered.items()`
+        # and had to be hand-kept in sync.
+        _tiered_full = {
+            tier: {
+                "config": info["config"],
+                "ppl": info.get("ppl"),
+                "measured_loss": info.get("measured_loss"),
+                "predicted_loss": info.get("predicted_loss"),
+                "size_gb": info.get("size_gb", info.get("predicted_size_gb")),
+                # "incumbent" when this tier's winner IS one of
+                # magicquant.incumbents' seeded llama.cpp-mixture
+                # configs (info["incumbent"] holds the seed tier tag,
+                # e.g. "Q4"), "evolved" when the search itself produced
+                # the winner. Previously invisible -- across four real
+                # models the Q4/Q5 tiers were repeatedly won by the
+                # incumbent seed with the search contributing nothing,
+                # and there was no field recording that fact. Only
+                # populated by the measured-search path (run_full_search's
+                # prediction-only tiers don't carry seed provenance, so
+                # they always read "evolved" here).
+                "source": "incumbent" if info.get("incumbent") else "evolved",
+            }
+            for tier, info in tiered.items()
+        }
 
         results = {
             # Which TIER_BOUNDARIES set classified the tier labels below.
@@ -1843,65 +2101,25 @@ class MagicQuantOrchestrator:
             "probing_provenance": getattr(self, "probing_provenance", "unknown"),
             "seed": self._search_seed,
             "measurement": self._measurement_metadata(),
+            # Additive key: the Kendall-tau predicted-vs-measured ranking
+            # check from _log_predictor_tracking(). None on a prediction-
+            # only run (run_full_search never sets self._predictor_tracking
+            # -- it has no measurements to check) or on a bare-__new__ test
+            # double that calls _save_results directly. See
+            # _log_predictor_tracking's docstring for the report-never-gate
+            # semantics of the True/False/None verdict this carries.
+            "predictor_tracking": getattr(self, "_predictor_tracking", None),
             "measurements": {
-                k: {
-                    "config": v["config"],
-                    "ppl": v.get("ppl"),
-                    "measured_loss": v.get("measured_loss"),
-                    "predicted_loss": v.get("predicted_loss"),
-                    "residual": v.get("residual"),
-                    "size_gb": v.get("size_gb"),
-                    "kl": v.get("kl"),
-                    "bench": v.get("bench"),
-                    "incumbent": v.get("incumbent"),
-                    # Per-measurement corpus (fix for CORPUS PROVENANCE: the
-                    # top-level "measurement"/"corpus" field below is still
-                    # stamped once, kept for backward compat with older
-                    # readers, but each measurement now carries the corpus
-                    # it was ACTUALLY taken over, so a mid-run change would
-                    # be visible here even if the single summary field
-                    # wasn't updated).
-                    "corpus_path": v.get("corpus_path"),
-                    # True when this reading was physically impossible
-                    # (measured_loss below -eps) and excluded from
-                    # _select_final_survivors -- kept in the record for
-                    # diagnostics rather than silently dropped.
-                    "measurement_invalid": v.get("measurement_invalid", False),
-                }
+                k: self._serialize_measurement(v, include_path=False)
                 for k, v in self._measured.items()
             },
+            # Same per-tier entry as "tiered" below, minus predicted_loss --
+            # derived from _tiered_full so the two can't drift apart again.
             "tiered_survivors": {
-                tier: {
-                    "config": info["config"],
-                    "ppl": info.get("ppl"),
-                    "measured_loss": info.get("measured_loss"),
-                    "size_gb": info.get("size_gb", info.get("predicted_size_gb")),
-                    # "incumbent" when this tier's winner IS one of
-                    # magicquant.incumbents' seeded llama.cpp-mixture
-                    # configs (info["incumbent"] holds the seed tier tag,
-                    # e.g. "Q4"), "evolved" when the search itself produced
-                    # the winner. Previously invisible -- across four real
-                    # models the Q4/Q5 tiers were repeatedly won by the
-                    # incumbent seed with the search contributing nothing,
-                    # and there was no field recording that fact. Only
-                    # populated by the measured-search path (run_full_search's
-                    # prediction-only tiers don't carry seed provenance, so
-                    # they always read "evolved" here).
-                    "source": "incumbent" if info.get("incumbent") else "evolved",
-                }
-                for tier, info in tiered.items()
+                tier: {k: v for k, v in entry.items() if k != "predicted_loss"}
+                for tier, entry in _tiered_full.items()
             },
-            "tiered": {
-                tier: {
-                    "config": info["config"],
-                    "ppl": info.get("ppl"),
-                    "measured_loss": info.get("measured_loss"),
-                    "predicted_loss": info.get("predicted_loss"),
-                    "size_gb": info.get("size_gb", info.get("predicted_size_gb")),
-                    "source": "incumbent" if info.get("incumbent") else "evolved",
-                }
-                for tier, info in tiered.items()
-            },
+            "tiered": _tiered_full,
         }
 
         results_path = self.output_dir / "search_results.json"
@@ -1925,6 +2143,17 @@ class MagicQuantOrchestrator:
         output_dir or _measured entirely, e.g. ones that call
         ``_save_results`` directly without going through a real ``run_*``
         search) are skipped rather than crashing.
+
+        Excludes ``measurement_invalid`` entries before building the
+        frontier/table, same as ``_select_final_survivors`` and
+        ``_write_noise_calibration`` -- an invalid entry's ppl is below
+        baseline*(1-eps) by construction (a physically-impossible reading,
+        see the eps guard in the measurement loop), so it has a lower ppl
+        than every real candidate and would dominate the frontier on a
+        mixed valid/invalid run. This is a caller-side fix only:
+        ``magicquant.pareto.load_and_report()`` reading a persisted
+        search_results.json off disk still shows invalid entries, since
+        ``_save_results`` deliberately keeps them there for diagnostics.
         """
         output_dir = getattr(self, "output_dir", None)
         measured = getattr(self, "_measured", None)
@@ -1933,10 +2162,20 @@ class MagicQuantOrchestrator:
         try:
             from magicquant.pareto import pareto_frontier, format_pareto_report
 
-            frontier = pareto_frontier(measured)
+            usable = {
+                k: v for k, v in measured.items()
+                if not v.get("measurement_invalid")
+            }
+            excluded = len(measured) - len(usable)
+            if excluded:
+                log.info(
+                    "Pareto report excluding measurement_invalid entries",
+                    stage="pareto", excluded=excluded, total=len(measured),
+                )
+            frontier = pareto_frontier(usable)
             pareto_path = Path(output_dir) / "pareto.json"
             pareto_path.write_text(json.dumps(frontier, indent=2), encoding="utf-8")
-            log.info(format_pareto_report(measured))
+            log.info(format_pareto_report(usable))
         except Exception as exc:
             log.warning(
                 "Pareto report generation failed (non-fatal)",
@@ -1948,9 +2187,10 @@ class MagicQuantOrchestrator:
         sensitivity weights and write ``<output_dir>/noise_calibration.json``
         (opt-in, ``run_measured_search(write_calibration=True)``).
 
-        Mirrors ``tools/fit_noise_factors.py``'s least-squares fit (reused
-        directly, not re-implemented) but skips the round-trip through
-        disk: it builds ``FitInput`` rows straight from ``self._measured``
+        Reuses ``magicquant.evolution.fit_noise_factors``'s least-squares
+        fit directly (not re-implemented; ``tools/fit_noise_factors.py`` is
+        now a thin CLI shim over the same module) but skips the round-trip
+        through disk: it builds ``FitInput`` rows straight from ``self._measured``
         and ``self.sensitivity_weights`` instead of re-reading
         ``search_results.json``/``sensitivity.json`` back off disk. The
         output envelope matches the nested ``{"schemes": {...}}`` shape
@@ -1962,23 +2202,17 @@ class MagicQuantOrchestrator:
         otherwise-successful measured search.
         """
         try:
-            try:
-                from tools.fit_noise_factors import (
-                    FitInput, build_calibration_envelope, fit_noise_factors,
-                )
-            except ModuleNotFoundError:
-                # `tools/` lives at the repo root, next to the `magicquant`
-                # package -- importable when running from a checkout, but not
-                # when only the package itself is on sys.path (e.g. a caller
-                # that added `magicquant` via PYTHONPATH or an editable
-                # install). Fall back to the checkout layout explicitly.
-                import sys
-                repo_root = str(Path(__file__).resolve().parents[1])
-                if repo_root not in sys.path:
-                    sys.path.insert(0, repo_root)
-                from tools.fit_noise_factors import (
-                    FitInput, build_calibration_envelope, fit_noise_factors,
-                )
+            # F4 (2026-08 packaging fix): this used to be `from
+            # tools.fit_noise_factors import ...` with a sys.path fallback,
+            # because `tools/` is a bare top-level package with no guaranteed
+            # presence outside a git checkout -- broken for any caller that
+            # only has `magicquant` on its path (e.g. Foundry via PYTHONPATH,
+            # run 3, 2026-07-06). The fitting logic now lives in-package, so
+            # this import needs no fallback: it works wherever `magicquant`
+            # itself is importable.
+            from magicquant.evolution.fit_noise_factors import (
+                FitInput, build_calibration_envelope, fit_noise_factors,
+            )
 
             sensitivity_weights = self.sensitivity_weights or {}
             results_path = str(self.output_dir / "search_results.json")
@@ -2128,28 +2362,7 @@ class MagicQuantOrchestrator:
             perplexity_calculator=_llama,
             output_dir=str(self.output_dir / "_probes"),
         )
-        groups = ["E", "H", "Q", "K", "O", "U", "D"]
-        # Add MoE/SSM groups if present in the model
-        classifier = TensorGroupClassifier()
-        from magicquant.gguf.source import open_model_source
-        _src = open_model_source(self.source_model_path)
-        try:
-            tensor_names = _src.get_tensor_names()
-        finally:
-            _src.close()
-        if any(classifier.classify_tensor(t) in ("X", "R") for t in tensor_names):
-            groups.extend(["X", "R"])
-        if any(classifier.classify_tensor(t) == "S" for t in tensor_names):
-            groups.append("S")
-        # This loop drove classify_tensor() one name at a time (not
-        # classify_tensors(), which fires the summary automatically) across
-        # the full model's tensor_names -- surface the unclassified-tensor
-        # summary now that the pass is complete. See
-        # TensorGroupClassifier.warn_unclassified_once()'s docstring.
-        classifier.warn_unclassified_once()
-        # Remember the full detected group set so run_evolution actually
-        # varies X/R/S (otherwise it falls back to DEFAULT_GROUPS).
-        self._search_groups = groups
+        groups = self._detect_search_groups()
 
         prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
         self.sensitivity_weights = prober.get_normalized_weights()
@@ -2169,14 +2382,7 @@ class MagicQuantOrchestrator:
         # (_estimate_model_size also populates self._param_counts per group.)
         baseline_size_gb = self._estimate_model_size(self.source_model_path)
 
-        self.predictor = PredictiveScorer(
-            sensitivity_weights=self.sensitivity_weights,
-            parameter_counts=self._param_counts,
-            baseline_size_gb=baseline_size_gb,
-            baseline_tps=360,
-            imatrix_active=self._imatrix is not None,
-            calibration_source=calibration_source,
-        )
+        self.predictor = self._build_predictor(calibration_source, baseline_size_gb)
 
         seed_configs, _incumbent_tier_by_key = self._build_incumbent_seeds(
             seed_incumbents
@@ -2332,8 +2538,12 @@ class MagicQuantOrchestrator:
                 stage="generate",
                 tier=tier,
                 name=name,
-                ppl=round(entry["ppl"], 4) if "ppl" in entry else None,
-                measured_loss=round(entry["measured_loss"], 4) if "measured_loss" in entry else None,
+                # .get() is not None, not key presence: prediction-only
+                # search results serialize ppl/measured_loss as null, so the
+                # keys are PRESENT with value None (round(None) crashed here
+                # for every `generate` after a --rounds 0 search).
+                ppl=round(entry["ppl"], 4) if entry.get("ppl") is not None else None,
+                measured_loss=round(entry["measured_loss"], 4) if entry.get("measured_loss") is not None else None,
             )
 
             path = self.generate_hybrid_model(
@@ -2402,7 +2612,16 @@ class MagicQuantOrchestrator:
 
     @staticmethod
     def _config_key(config: Dict[str, str]) -> str:
-        return "|".join(f"{g}:{config[g]}" for g in sorted(config))
+        # Thin delegate -- canonical implementation now lives in
+        # magicquant.utils.naming.config_key (search-v1/4: was hand-
+        # reimplemented identically here, in pareto._scheme_str, and in
+        # evolution.predictor._make_config_key). Kept as a staticmethod
+        # rather than inlined at call sites: it's called on the class
+        # directly (tests/test_measurement_candidate_coverage.py) and has
+        # ~10 internal call sites in the hot measured-search loop. Its
+        # output is a PERSISTED interchange format -- see
+        # magicquant.utils.naming.config_key's docstring.
+        return _naming_config_key(config)
 
     def _build_incumbent_seeds(
         self, seed_incumbents: bool
@@ -2668,28 +2887,7 @@ class MagicQuantOrchestrator:
                 "n_tensors": len(self._imatrix) if self._imatrix else None,
             },
             "measured": {
-                k: {
-                    "config": v["config"],
-                    "ppl": v.get("ppl"),
-                    "measured_loss": v.get("measured_loss"),
-                    "predicted_loss": v.get("predicted_loss"),
-                    "residual": v.get("residual"),
-                    "path": v.get("path"),
-                    "size_gb": v.get("size_gb"),
-                    "kl": v.get("kl"),
-                    "bench": v.get("bench"),
-                    "incumbent": v.get("incumbent"),
-                    # BLOCKER fix: this whitelist used to omit
-                    # measurement_invalid/corpus_path, so a resumed run's
-                    # entries came back WITHOUT them -- info.get(
-                    # "measurement_invalid") is None (falsy) post-resume,
-                    # and a physically-impossible candidate could win a
-                    # tier again across a resume boundary. See
-                    # tests/test_measured_search_checkpoint_resume.py::
-                    # test_measurement_invalid_and_corpus_path_survive_checkpoint_round_trip.
-                    "measurement_invalid": v.get("measurement_invalid", False),
-                    "corpus_path": v.get("corpus_path"),
-                }
+                k: self._serialize_measurement(v, include_path=True)
                 for k, v in self._measured.items()
             },
         }
@@ -2775,57 +2973,3 @@ class MagicQuantOrchestrator:
             default_size_gb=1.0,
         )
         return 1.0
-
-
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="MagicQuant Orchestrator - Hybrid Quantization Search"
-    )
-    parser.add_argument("source_model", help="Path to source model (GGUF, safetensors, or directory)")
-    parser.add_argument("--output-dir", default="./output")
-    parser.add_argument("--target-quant", default="MXFP4_MOE")
-    parser.add_argument("--generations", type=int, default=30)
-    parser.add_argument("--rounds", type=int, default=3, help="Measurement rounds (0 = prediction only)")
-    parser.add_argument("--candidates", type=int, default=4, help="Candidates to measure per round")
-    parser.add_argument("--llamacpp-path", help="Path to llama.cpp directory")
-    parser.add_argument("--adapter", help="Path to LoRA adapter directory")
-
-    args = parser.parse_args()
-
-    orchestrator = MagicQuantOrchestrator(
-        source_model_path=args.source_model,
-        output_dir=args.output_dir,
-        llamacpp_path=args.llamacpp_path,
-        adapter_path=args.adapter,
-    )
-
-    if args.rounds > 0:
-        all_configs, tiered = orchestrator.run_measured_search(
-            target_base_quant=args.target_quant,
-            search_generations=args.generations,
-            measurement_rounds=args.rounds,
-            candidates_per_round=args.candidates,
-            verbose=True,
-        )
-    else:
-        all_configs, tiered = orchestrator.run_full_search(
-            target_base_quant=args.target_quant,
-            max_generations=args.generations,
-            verbose=True,
-        )
-
-    # Generate final survivors
-    log.info("Generating final survivors", stage="generate")
-
-    orchestrator.generate_tiered_models(
-        tiered=tiered,
-        model_name_prefix=Path(args.source_model).stem,
-        tiers=["Q2", "Q4", "Q5", "Q6", "Q8"],
-        verify=False,
-    )
-
-
-if __name__ == "__main__":
-    main()

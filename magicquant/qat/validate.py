@@ -74,6 +74,11 @@ def compare_perplexity(
 ) -> Dict[str, float]:
     """Compare perplexity of the plain hybrid vs the QAT hybrid.
 
+    Hand-run validation utility, not wired to any CLI subcommand or called by
+    production code in this repo -- it's the harness used to produce the
+    recovery numbers in docs/qat.md (run manually, or from an out-of-repo
+    pipeline). Deliberate: do not delete as dead code.
+
     Args:
         plain_gguf: GGUF packed from the plain (non-QAT) hybrid.
         qat_gguf: GGUF packed from the QAT-adapted hybrid.

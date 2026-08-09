@@ -192,8 +192,9 @@ merge reads for its 3-D scale), `expert_quant_mode`, and a per-tensor
 
 ## The `[qat]` extra
 
-The heavy training stack (torch / transformers / peft / trl / datasets) lives
-behind an optional extra so the core MagicQuant install stays torch-free:
+The heavy training stack (torch / transformers / peft / accelerate, +transitively
+tokenizers / safetensors / huggingface_hub) lives behind an optional extra so the
+core MagicQuant install stays torch-free:
 
 ```bash
 pip install -e ".[qat]"
@@ -251,8 +252,41 @@ with `IGNORE_INDEX = -100`, so loss is computed only on the assistant completion
 HF `Trainer` (cosine schedule, warmup, grad clipping, optional gradient
 checkpointing), then writes the adapters to `adapter_model.safetensors` plus a
 `qat_meta.json` describing the run (base model, `scheme_by_group`, a config hash,
-and all hyperparameters). Merge the adapters (`merge_qat_adapters`) and pack the
-exact hybrid with `magicquant generate`.
+and all hyperparameters). Merge the adapters with `magicquant qat-merge` (below),
+then pack the exact hybrid with `magicquant generate`.
+
+### `magicquant qat-merge`
+
+This is the on-disk counterpart to `wrap.merge_qat_adapters(model)` used above
+in *Eval and handoff* — same idea (fold the LoRA delta into the base weight),
+different implementation. `qat-merge` streams the base model's safetensors
+shard-by-shard, applying each adapter's delta in place, so it never
+materializes the full merged model in memory; that's what makes it usable on
+a 30B+ base where the in-memory `nn.Module` version isn't. It is the function
+this CLI actually calls (`magicquant/qat/merge.py`), not the one named in
+*Eval and handoff*.
+
+```bash
+magicquant qat-merge ./my-model \
+    --adapters ./output/qat_adapters \
+    --out ./output/qat_merged
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `base_model` (positional) | — | HF model id or local path to the base model whose safetensors get merged (the same model QAT was run against). |
+| `--adapters` | *required* | Adapter directory written by `magicquant qat` (needs `adapter_model.safetensors` + `qat_meta.json`). |
+| `--out` | *required* | Output directory for the merged safetensors model. |
+
+Unlike `magicquant qat`'s `--out`, both `--adapters` and `--out` are required
+here — there is no default output directory.
+
+Use this CLI rather than a generic PEFT merge. MagicQuant writes adapter keys
+as `...lora_A`/`...lora_B` with no trailing `.weight`, which doesn't match
+PEFT's key convention; a generic PEFT-shaped merge run against MagicQuant
+adapters has silently produced an unmodified copy of the base model (no
+error, just a no-op). `magicquant qat-merge` raises `QATMergeError` instead
+of degrading silently.
 
 ---
 

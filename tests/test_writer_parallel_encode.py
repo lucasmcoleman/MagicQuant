@@ -13,7 +13,6 @@ the three invariants the pool must preserve:
   3. The byte budget (_ByteBudget) actually caps in-flight decoded+encoded
      bytes rather than just tensor count.
 """
-import os
 import threading
 import time
 from pathlib import Path
@@ -327,7 +326,6 @@ def test_gguf_source_pread_short_reads_are_gathered(tmp_path, monkeypatch):
     tensor and aborting the build (caught live on the real Qwopus 27B,
     2026-07-05). Simulate the cap with a tiny per-call limit and assert the
     gather loop reassembles the exact bytes."""
-    import struct
     import numpy as np
     import magicquant.gguf.source as source_mod
 

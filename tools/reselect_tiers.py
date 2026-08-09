@@ -57,7 +57,6 @@ import numpy as np
 from magicquant.quant.schemes import get_scheme_by_name
 from magicquant.quant.tiers import (
     CURRENT_TIER_SCHEME_VERSION,
-    TIER_BOUNDARIES,
     classify_tier,
     tier_scheme_version,
 )
@@ -74,8 +73,6 @@ DEFAULT_MAX_RESIDUAL = 0.005
 def _bpw(scheme_name: str) -> float:
     """Storage bits-per-weight for a scheme name, straight from the registry."""
     scheme = get_scheme_by_name(scheme_name)
-    if scheme is None:
-        raise KeyError(f"unknown scheme {scheme_name!r}")
     return float(scheme.bits_per_weight)
 
 
@@ -143,6 +140,101 @@ def pareto_front(rows: List[Dict[str, Any]]) -> None:
             row["pareto"] = False
 
 
+def _rows_from_measurements(
+    measurements: Dict[str, Any], eps: Optional[float]
+) -> List[Dict[str, Any]]:
+    """One report row per measurement that has both a size and a loss.
+
+    Includes implausible (below-baseline) rows -- callers that feed this
+    into the size-model fit want every candidate; callers that want only
+    trustworthy candidates filter on ``row["implausible"]`` themselves. The
+    ``_parse_key`` fallback covers older files whose entries omit ``config``.
+    """
+    rows: List[Dict[str, Any]] = []
+    for key, entry in measurements.items():
+        size = entry.get("size_gb")
+        loss = entry.get("measured_loss")
+        if size is None or loss is None:
+            continue
+        config = entry.get("config") or _parse_key(key)
+        rows.append(
+            {
+                "key": key,
+                "config": config,
+                "size_gb": float(size),
+                "loss": float(loss),
+                "ppl": entry.get("ppl"),
+                "implausible": eps is not None and float(loss) < -eps,
+            }
+        )
+    return rows
+
+
+def _corrected_ladder(usable: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Per-band winner: lowest loss, then smaller size.
+
+    ``usable`` must be in its original (measurements-dict insertion) order,
+    not size-sorted -- exact ties in (loss, size_gb) are broken by that
+    order, via the stability of ``sorted()``.
+    """
+    by_band: Dict[str, List[Dict[str, Any]]] = {}
+    for row in usable:
+        by_band.setdefault(row["tier"], []).append(row)
+    return {
+        tier: sorted(band, key=lambda r: (r["loss"], r["size_gb"]))[0]
+        for tier, band in by_band.items()
+    }
+
+
+def _shipped_findings(
+    shipped: Dict[str, Any],
+    usable: List[Dict[str, Any]],
+    baseline_gb: float,
+    eps: Optional[float],
+) -> List[Dict[str, Any]]:
+    """Diff what a run actually shipped per tier against ``usable``.
+
+    ``usable`` must be in its original (measurements-dict insertion) order --
+    ``min(better, key=loss)`` resolves exact ties by that order.
+    """
+    findings: List[Dict[str, Any]] = []
+    for tier, entry in shipped.items():
+        size = entry.get("size_gb")
+        if size is None:
+            continue
+        actual_tier = classify_tier(float(size), baseline_gb)
+        shipped_loss = entry.get("measured_loss")
+        better = [
+            r
+            for r in usable
+            if r["size_gb"] < float(size) - 1e-9
+            and r["loss"] < float(shipped_loss if shipped_loss is not None else "inf")
+            - 1e-12
+        ]
+        flags = []
+        if actual_tier != tier:
+            flags.append("MISLABELED")
+        if better:
+            flags.append("DOMINATED")
+        if eps is not None and shipped_loss is not None and float(shipped_loss) < -eps:
+            flags.append("IMPLAUSIBLE")
+        winner = min(better, key=lambda r: r["loss"]) if better else None
+        findings.append(
+            {
+                "shipped_as": tier,
+                "size_gb": float(size),
+                "loss": entry.get("measured_loss"),
+                "ppl": entry.get("ppl"),
+                "actual_tier": actual_tier,
+                "flags": flags,
+                "dominated_by": winner["key"] if winner else None,
+                "dominated_by_size_gb": winner["size_gb"] if winner else None,
+                "dominated_by_loss": winner["loss"] if winner else None,
+            }
+        )
+    return findings
+
+
 def analyze(path: Path, *, max_residual: float) -> Dict[str, Any]:
     """Re-derive one run's ladder. Never raises for data problems."""
     data = json.loads(path.read_text())
@@ -163,33 +255,17 @@ def analyze(path: Path, *, max_residual: float) -> Dict[str, Any]:
     report["baseline_ppl"] = baseline_ppl
     report["implausible_eps"] = eps
 
-    candidates: List[Tuple[float, Dict[str, str]]] = []
-    rows: List[Dict[str, Any]] = []
-    for key, entry in measurements.items():
-        size = entry.get("size_gb")
-        loss = entry.get("measured_loss")
-        if size is None or loss is None:
-            continue
-        config = entry.get("config") or _parse_key(key)
-        # The size model is fit over every candidate: a bogus *perplexity*
-        # says nothing about whether the file's byte count was measured
-        # correctly, and dropping rows here would only weaken the fit.
-        candidates.append((float(size), config))
-        rows.append(
-            {
-                "key": key,
-                "config": config,
-                "size_gb": float(size),
-                "loss": float(loss),
-                "ppl": entry.get("ppl"),
-                "implausible": eps is not None and float(loss) < -eps,
-            }
-        )
-
+    rows = _rows_from_measurements(measurements, eps)
     if not rows:
         report["error"] = "no usable measurements"
         return report
 
+    # The size model is fit over every candidate: a bogus *perplexity*
+    # says nothing about whether the file's byte count was measured
+    # correctly, and dropping rows here would only weaken the fit.
+    candidates: List[Tuple[float, Dict[str, str]]] = [
+        (row["size_gb"], row["config"]) for row in rows
+    ]
     try:
         baseline_gb, residual = recover_baseline_gb(
             candidates, max_residual=max_residual
@@ -213,60 +289,12 @@ def analyze(path: Path, *, max_residual: float) -> Dict[str, Any]:
     report["candidates"] = rows
     report["n_implausible"] = len(rows) - len(usable)
 
-    # Corrected ladder: within a band prefer lower loss, then smaller.
-    by_band: Dict[str, List[Dict[str, Any]]] = {}
-    for row in usable:
-        by_band.setdefault(row["tier"], []).append(row)
-    corrected = {
-        tier: sorted(band, key=lambda r: (r["loss"], r["size_gb"]))[0]
-        for tier, band in by_band.items()
-    }
-    report["corrected"] = corrected
-    report["empty_bands"] = [t for t in TIER_ORDER if t not in corrected]
+    report["corrected"] = _corrected_ladder(usable)
+    report["empty_bands"] = [t for t in TIER_ORDER if t not in report["corrected"]]
 
     # What the run actually shipped, and how that reads under v2.
     shipped = data.get("tiered_survivors") or data.get("tiered") or {}
-    findings: List[Dict[str, Any]] = []
-    for tier, entry in shipped.items():
-        size = entry.get("size_gb")
-        if size is None:
-            continue
-        actual_tier = classify_tier(float(size), baseline_gb)
-        shipped_loss = entry.get("measured_loss")
-        better = [
-            r
-            for r in usable
-            if r["size_gb"] < float(size) - 1e-9
-            and r["loss"] < float(shipped_loss if shipped_loss is not None else "inf")
-            - 1e-12
-        ]
-        flags = []
-        if actual_tier != tier:
-            flags.append("MISLABELED")
-        if better:
-            flags.append("DOMINATED")
-        if eps is not None and shipped_loss is not None and float(shipped_loss) < -eps:
-            flags.append("IMPLAUSIBLE")
-        findings.append(
-            {
-                "shipped_as": tier,
-                "size_gb": float(size),
-                "loss": entry.get("measured_loss"),
-                "ppl": entry.get("ppl"),
-                "actual_tier": actual_tier,
-                "flags": flags,
-                "dominated_by": (
-                    min(better, key=lambda r: r["loss"])["key"] if better else None
-                ),
-                "dominated_by_size_gb": (
-                    min(better, key=lambda r: r["loss"])["size_gb"] if better else None
-                ),
-                "dominated_by_loss": (
-                    min(better, key=lambda r: r["loss"])["loss"] if better else None
-                ),
-            }
-        )
-    report["shipped"] = findings
+    report["shipped"] = _shipped_findings(shipped, usable, baseline_gb, eps)
     return report
 
 
