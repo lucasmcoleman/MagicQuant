@@ -180,14 +180,12 @@ def _resolve_imatrix_and_schemes(
     """── 2. imatrix (optional, loud when absent) ── + scheme selection."""
     imatrix = None
     if cfg.use_imatrix:
-        from magicquant.imatrix import ensure_imatrix
+        from magicquant.imatrix import ensure_imatrix, resolve_imatrix_bin
 
         kwargs = {}
-        perplexity = getattr(tools, "perplexity_tool", None)
-        if perplexity:
-            sibling = Path(perplexity).parent / "llama-imatrix"
-            if sibling.exists():
-                kwargs["imatrix_bin"] = str(sibling)
+        resolved = resolve_imatrix_bin(tools)
+        if resolved:
+            kwargs["imatrix_bin"] = resolved
         imatrix = ensure_imatrix(
             cfg.source_model_path, corpus_path=cfg.imatrix_corpus, **kwargs
         )

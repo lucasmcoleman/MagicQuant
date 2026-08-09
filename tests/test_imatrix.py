@@ -18,7 +18,7 @@ import pytest
 
 gguf = pytest.importorskip("gguf")
 
-from magicquant.imatrix import capture_imatrix, load_imatrix
+from magicquant.imatrix import capture_imatrix, load_imatrix, resolve_imatrix_bin
 
 
 def _write_imatrix_gguf(path, pairs, *, general_type="imatrix"):
@@ -128,6 +128,38 @@ def test_capture_imatrix_missing_binary(tmp_path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda name: None)
     with pytest.raises(FileNotFoundError, match="llama-imatrix"):
         capture_imatrix("model.gguf", "corpus.txt", tmp_path / "out.gguf")
+
+
+# ── resolve_imatrix_bin (E6: sibling-of-perplexity-tool resolution) ────────
+# Shared by orchestrator.enable_imatrix, v2's group-probe imatrix resolution,
+# and cmd_imatrix (--llamacpp-path) -- a single home so the three copies of
+# this snippet can't drift out of sync.
+
+
+class _StubTools:
+    def __init__(self, perplexity_tool=None):
+        self.perplexity_tool = perplexity_tool
+
+
+def test_resolve_imatrix_bin_finds_sibling(tmp_path):
+    bin_dir = tmp_path / "build" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "llama-imatrix").write_text("")
+    tools = _StubTools(perplexity_tool=str(bin_dir / "llama-perplexity"))
+    assert resolve_imatrix_bin(tools) == str(bin_dir / "llama-imatrix")
+
+
+def test_resolve_imatrix_bin_none_when_sibling_missing(tmp_path):
+    tools = _StubTools(perplexity_tool=str(tmp_path / "nowhere" / "llama-perplexity"))
+    assert resolve_imatrix_bin(tools) is None
+
+
+def test_resolve_imatrix_bin_none_without_perplexity_tool():
+    assert resolve_imatrix_bin(_StubTools(perplexity_tool=None)) is None
+
+
+def test_resolve_imatrix_bin_none_for_none_tools():
+    assert resolve_imatrix_bin(None) is None
 
 
 @pytest.mark.skipif(

@@ -355,6 +355,80 @@ def test_search_real_parser_env_and_flag_output_dir_target_quant(monkeypatch, tm
     assert orch2.full_calls[0]["target_base_quant"] == "Q4_K_M"
 
 
+# ── cmd_search --algo v2 flag hygiene (E5) ───────────────────────────────────
+# _run_v2_search's V2Config construction reads none of v1's evolutionary-
+# search flags (--rounds, --enable-kl, ... -- see cli._V2_IGNORED_V1_FLAGS),
+# so cmd_search must warn about any of them the user explicitly passed
+# alongside --algo v2, and must hard-exit on --adapter (which isn't a silent
+# no-op under v2 -- it would silently build from the wrong, un-merged model).
+
+
+def test_cmd_search_v2_real_parser_warns_ignored_v1_flags_and_still_runs(
+    monkeypatch, capsys,
+):
+    calls = []
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search", lambda cfg: calls.append(cfg) or {}
+    )
+
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--rounds", "3", "--enable-kl",
+            "--bytes-tps", "--target-quant", "Q6_K",
+        ],
+    )
+    cli.main()
+
+    assert len(calls) == 1, "the v2 search must still run"
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    for flag in ("--rounds", "--enable-kl", "--bytes-tps", "--target-quant"):
+        assert flag in out
+    # Flags v2 DOES honor must not be named as ignored (the message itself
+    # legitimately mentions --algo, so check for the ignored-list wording
+    # rather than a bare substring match on that one).
+    ignored_clause = out.split("ignores the following v1-only flag(s)")[-1]
+    for flag in ("--output-dir", "--budget-gb"):
+        assert flag not in ignored_clause
+
+
+def test_cmd_search_v2_no_warning_without_v1_only_flags(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search", lambda cfg: calls.append(cfg) or {}
+    )
+
+    cli.cmd_search(_search_args(algo="v2", budget_gb=5.0))
+
+    assert len(calls) == 1
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_cmd_search_v2_with_adapter_is_hard_exit(monkeypatch):
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search",
+        lambda cfg: pytest.fail("v2 search must not run when --adapter is set"),
+    )
+
+    with pytest.raises(SystemExit, match="not supported with --algo v2"):
+        cli.cmd_search(_search_args(algo="v2", budget_gb=5.0, adapter="/tmp/lora"))
+
+
+def test_cmd_search_v2_env_adapter_also_hard_exits(monkeypatch):
+    """MAGICQUANT_ADAPTER_PATH must not bypass the v2 adapter gate -- the
+    check is at the settings level precisely because a set adapter is always
+    wrong under v2, unlike the warn-only v1 flags (reviewer finding)."""
+    monkeypatch.setenv("MAGICQUANT_ADAPTER_PATH", "/tmp/lora")
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search",
+        lambda cfg: pytest.fail("v2 search must not run with an env adapter"),
+    )
+    with pytest.raises(SystemExit, match="MAGICQUANT_ADAPTER_PATH"):
+        cli.cmd_search(_search_args(algo="v2", budget_gb=5.0))
+
+
 # ── cmd_generate routing (M5 finish) ────────────────────────────────────────
 
 
@@ -476,3 +550,133 @@ def test_cmd_hybrid_honors_env_output_dir(monkeypatch, tmp_path):
     cli.cmd_hybrid(argparse.Namespace(config=str(cfg_path), output_dir=None))
 
     assert captured["output_path"].startswith(str(env_out))
+
+
+# ── cmd_imatrix --llamacpp-path routing (E6) ────────────────────────────────
+# cmd_imatrix used to have no --llamacpp-path flag at all, so llama-imatrix
+# resolution was a bare `shutil.which` PATH lookup with no override --
+# unlike orchestrator.enable_imatrix / v2's group-probe imatrix resolution,
+# which both aim llama-imatrix at the SIBLING of the already-resolved
+# perplexity binary to guarantee the same llama.cpp build is used throughout
+# a run. These tests drive cmd_imatrix (and the real parser) end to end with
+# capture_imatrix/load_imatrix faked, so no real llama.cpp binary is needed.
+
+
+def _imatrix_args(**kw):
+    base = dict(
+        model="/tmp/model.gguf", corpus="/tmp/corpus.txt", output=None,
+        chunks=-1, ctx_size=512, llamacpp_path=None,
+    )
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+class _FakeImatrixTools:
+    """Stands in for LlamaCppTools -- no real llama.cpp binary involved."""
+
+    def __init__(self, llamacpp_path=None, **kwargs):
+        self.llamacpp_path = llamacpp_path
+        self.perplexity_tool = None
+
+
+def test_cmd_imatrix_resolves_sibling_of_perplexity_tool(monkeypatch, tmp_path):
+    bin_dir = tmp_path / "fork" / "build" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "llama-imatrix").write_text("")
+
+    class _Tools(_FakeImatrixTools):
+        def __init__(self, llamacpp_path=None, **kwargs):
+            super().__init__(llamacpp_path, **kwargs)
+            self.perplexity_tool = str(bin_dir / "llama-perplexity")
+
+    monkeypatch.setattr("magicquant.utils.llamacpp.LlamaCppTools", _Tools)
+
+    captured = {}
+
+    def _fake_capture(model, corpus, out, **kwargs):
+        captured.update(kwargs)
+        return out
+
+    monkeypatch.setattr("magicquant.imatrix.capture_imatrix", _fake_capture)
+    monkeypatch.setattr("magicquant.imatrix.load_imatrix", lambda out: {})
+
+    cli.cmd_imatrix(_imatrix_args(llamacpp_path=str(tmp_path / "fork")))
+
+    assert captured["imatrix_bin"] == str(bin_dir / "llama-imatrix")
+
+
+def test_cmd_imatrix_falls_back_to_none_without_sibling(monkeypatch, tmp_path):
+    monkeypatch.setattr("magicquant.utils.llamacpp.LlamaCppTools", _FakeImatrixTools)
+
+    captured = {}
+
+    def _fake_capture(model, corpus, out, **kwargs):
+        captured.update(kwargs)
+        return out
+
+    monkeypatch.setattr("magicquant.imatrix.capture_imatrix", _fake_capture)
+    monkeypatch.setattr("magicquant.imatrix.load_imatrix", lambda out: {})
+
+    cli.cmd_imatrix(_imatrix_args())
+
+    assert captured["imatrix_bin"] is None
+
+
+def test_cmd_imatrix_survives_llamacpp_tools_construction_failure(monkeypatch):
+    """A machine with no llama-quantize (only a PATH llama-imatrix) must
+    keep working exactly as it did before --llamacpp-path existed --
+    LlamaCppTools construction failing must not crash cmd_imatrix, mirroring
+    orchestrator.llama_tools' try/except -> None."""
+
+    def _raise(*a, **k):
+        raise FileNotFoundError("no llama-quantize found")
+
+    monkeypatch.setattr("magicquant.utils.llamacpp.LlamaCppTools", _raise)
+
+    captured = {}
+
+    def _fake_capture(model, corpus, out, **kwargs):
+        captured.update(kwargs)
+        return out
+
+    monkeypatch.setattr("magicquant.imatrix.capture_imatrix", _fake_capture)
+    monkeypatch.setattr("magicquant.imatrix.load_imatrix", lambda out: {})
+
+    cli.cmd_imatrix(_imatrix_args())
+
+    assert captured["imatrix_bin"] is None
+
+
+def test_cmd_imatrix_real_parser_has_llamacpp_path_flag(monkeypatch, tmp_path):
+    """End-to-end through the real argparse parser (not a hand-built
+    Namespace), so a dest mismatch on --llamacpp-path would be caught."""
+    bin_dir = tmp_path / "fork" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "llama-imatrix").write_text("")
+
+    class _Tools(_FakeImatrixTools):
+        def __init__(self, llamacpp_path=None, **kwargs):
+            super().__init__(llamacpp_path, **kwargs)
+            self.perplexity_tool = str(bin_dir / "llama-perplexity")
+
+    monkeypatch.setattr("magicquant.utils.llamacpp.LlamaCppTools", _Tools)
+
+    captured = {}
+
+    def _fake_capture(model, corpus, out, **kwargs):
+        captured.update(kwargs)
+        return out
+
+    monkeypatch.setattr("magicquant.imatrix.capture_imatrix", _fake_capture)
+    monkeypatch.setattr("magicquant.imatrix.load_imatrix", lambda out: {})
+
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "imatrix", "/tmp/model.gguf", "-f", "/tmp/corpus.txt",
+            "--llamacpp-path", str(tmp_path / "fork"),
+        ],
+    )
+    cli.main()
+
+    assert captured["imatrix_bin"] == str(bin_dir / "llama-imatrix")

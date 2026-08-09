@@ -167,6 +167,52 @@ def _settings_from_args(args: argparse.Namespace):
     return MagicQuantSettings(**overrides)
 
 
+# v1-only flags with no effect under --algo v2: _run_v2_search's V2Config
+# construction (below) reads none of them. All default to None on the
+# shared search parser, so `is not None` against the raw argparse Namespace
+# reliably means "the user typed this on the CLI" -- checked against `args`
+# rather than `settings`, since `settings` also inherits from MAGICQUANT_*
+# env/.env and warning about an env var the user did not pass on this
+# command line would be noise. --adapter is deliberately NOT in this list:
+# under v2 it isn't a silent no-op like these, it silently builds the budget
+# GGUF from the WRONG (un-merged) model -- see cmd_search's dedicated
+# SystemExit for it.
+_V2_IGNORED_V1_FLAGS = (
+    ("--rounds", "rounds"),
+    ("--candidates", "candidates"),
+    ("--patience", "patience"),
+    ("--generations", "generations"),
+    ("--population", "population"),
+    ("--seed", "seed"),
+    ("--enable-kl", "enable_kl"),
+    ("--kl-weight", "kl_weight"),
+    ("--enable-speed-bench", "enable_speed_bench"),
+    ("--enable-iq", "enable_iq"),
+    ("--stream-aware", "stream_aware"),
+    ("--head-aggressive", "head_aggressive"),
+    ("--speed-weight", "speed_weight"),
+    ("--bytes-tps", "use_bytes_tps"),
+    ("--write-calibration", "write_calibration"),
+    ("--calibration-source", "calibration_source"),
+    ("--target-quant", "target_quant"),
+)
+
+
+def _warn_v2_ignored_v1_flags(args: argparse.Namespace) -> None:
+    """Print one warning line naming any v1-only flag the user explicitly
+    passed alongside --algo v2, since _run_v2_search silently ignores all
+    of them."""
+    ignored = [
+        flag for flag, attr in _V2_IGNORED_V1_FLAGS
+        if getattr(args, attr, None) is not None
+    ]
+    if ignored:
+        print(
+            "WARNING: --algo v2 ignores the following v1-only flag(s) "
+            "(no effect on the budget search): " + ", ".join(ignored)
+        )
+
+
 def _run_v2_search(args: argparse.Namespace, settings) -> None:
     """--algo v2: budget-constrained per-tensor allocation (docs/redesign.md)."""
     from magicquant.v2 import V2Config, run_budget_search
@@ -222,6 +268,19 @@ def cmd_search(args: argparse.Namespace) -> None:
     settings = _settings_from_args(args)
 
     if settings.algo == "v2":
+        # Checked at the SETTINGS level, unlike the warn-only flags below:
+        # a set adapter is always wrong under v2 (never a benign env-var
+        # default), so MAGICQUANT_ADAPTER_PATH must not bypass the gate.
+        if settings.adapter_path is not None:
+            raise SystemExit(
+                "an adapter path (--adapter / MAGICQUANT_ADAPTER_PATH) is not "
+                "supported with --algo v2: the v2 budget search reads no "
+                "adapter_path and builds straight from the base model, so the "
+                "LoRA delta would be silently dropped -- the output GGUF "
+                "would be the WRONG (un-merged) model. Use --algo v1, which "
+                "does merge the adapter, or drop the adapter path."
+            )
+        _warn_v2_ignored_v1_flags(args)
         _run_v2_search(args, settings)
         return
     if settings.algo != "v1":
@@ -434,15 +493,39 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 def cmd_imatrix(args: argparse.Namespace) -> None:
     """Capture an importance matrix for a GGUF model via llama-imatrix."""
-    from magicquant.imatrix import capture_imatrix, load_imatrix
+    from magicquant.imatrix import capture_imatrix, load_imatrix, resolve_imatrix_bin
 
     out = args.output or (str(Path(args.model).with_suffix("")) + ".imatrix.gguf")
     print(f"Capturing imatrix: {args.model}")
     print(f"  corpus: {args.corpus}")
     print(f"  output: {out}")
+
+    # Resolve llama-imatrix as the sibling of the resolved perplexity tool --
+    # same as orchestrator.enable_imatrix / v2's _resolve_imatrix_and_schemes
+    # -- so this standalone command doesn't fall back to a bare PATH lookup
+    # that can silently resolve to a DIFFERENT llama.cpp build than the one
+    # configured via --llamacpp-path. Mirrors orchestrator.llama_tools:
+    # construction failures (no llama-quantize found, etc.) must not break a
+    # command that worked fine via a PATH-only llama-imatrix before this flag
+    # existed -- swallow them and fall through to capture_imatrix's own
+    # shutil.which fallback.
+    imatrix_bin = None
+    try:
+        from magicquant.utils.llamacpp import LlamaCppTools
+        tools = LlamaCppTools(getattr(args, "llamacpp_path", None))
+        imatrix_bin = resolve_imatrix_bin(tools)
+    except Exception as exc:
+        # Mirror orchestrator.llama_tools: degrade to the PATH fallback, but
+        # never silently -- an explicitly-passed --llamacpp-path being
+        # discarded is exactly the wrong-binary failure mode this flag closes.
+        log = get_logger("imatrix")
+        log.warning("llama.cpp not available; falling back to PATH lookup "
+                    "for llama-imatrix", error=str(exc))
+
     capture_imatrix(
         args.model, args.corpus, out,
         chunks=args.chunks, ctx_size=args.ctx_size,
+        imatrix_bin=imatrix_bin,
     )
     imat = load_imatrix(out)
     print(f"Captured importance vectors for {len(imat)} tensors -> {out}")
@@ -1017,6 +1100,10 @@ def main() -> None:
         "--ctx-size", type=int, default=512,
         help="Chunk length in tokens (default 512)",
     )
+    imatrix_parser.add_argument(
+        "--llamacpp-path",
+        help="Path to llama.cpp directory (auto-detect if omitted)",
+    )
     imatrix_parser.set_defaults(func=cmd_imatrix)
 
     # ── qat ───────────────────────────────────────────────────────────────────
@@ -1158,7 +1245,7 @@ def main() -> None:
         sys.exit(1)
 
     # Configure structured logging
-    configure_logging(verbose=True)
+    configure_logging()
 
     # Handle --dry-run on the search command
     if args.command == "search" and getattr(args, "dry_run", False):
