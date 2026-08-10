@@ -1185,15 +1185,32 @@ class MagicQuantOrchestrator:
 
             # 4d. Log round summary
             if verbose and self._measured:
-                avg_residual = sum(
+                # A measurement-timeout disclosure entry (see
+                # _record_candidate_measurement's failure branch) has no
+                # "residual" at all -- it never reached a real ppl
+                # reading -- so filter rather than indexing unconditionally
+                # (that used to be safe when every self._measured entry
+                # came from the ppl-succeeded branch and therefore always
+                # had one). Log UNCONDITIONALLY once verbose+non-empty,
+                # even when every entry this round was a disclosure (no
+                # residuals at all) -- reviewer Q1: suppressing the line
+                # in exactly that case would drop round-level visibility
+                # in precisely the failure scenario this whole fix exists
+                # to surface, so mean_abs_residual reads None instead of
+                # the log line vanishing.
+                residuals = [
                     abs(m["residual"]) for m in self._measured.values()
-                ) / len(self._measured)
+                    if m.get("residual") is not None
+                ]
+                mean_abs_residual = (
+                    round(sum(residuals) / len(residuals), 4) if residuals else None
+                )
                 log.info(
                     "Round summary",
                     stage="measurement",
                     round=round_idx + 1,
                     total_measurements=len(self._measured),
-                    mean_abs_residual=round(avg_residual, 4),
+                    mean_abs_residual=mean_abs_residual,
                 )
 
         # A measured search whose every candidate build/measure failed --
@@ -1396,6 +1413,7 @@ class MagicQuantOrchestrator:
         # either way (measured entry gets ppl either way, "kl"
         # only recorded when the KL call itself succeeded).
         kl_result = None
+        kl_timed_out = False
         if enable_kl and self._kl_base_logits_path:
             try:
                 kl_result = self.llama_tools.calculate_kl_divergence(
@@ -1408,6 +1426,15 @@ class MagicQuantOrchestrator:
                     "continuing without it", stage="kl", error=str(exc),
                 )
                 kl_result = None
+            if kl_result is None:
+                # Distinguish "the KL subprocess itself timed out" from
+                # any other KL failure (unparseable output, an OSError
+                # caught above) -- see LlamaCppTools._run_subprocess_or_
+                # none's _last_subprocess_failure. getattr-safe: a
+                # hand-rolled fake tools object (several tests) never
+                # sets this attribute at all.
+                kl_failure = getattr(self.llama_tools, "_last_subprocess_failure", None)
+                kl_timed_out = bool(kl_failure) and kl_failure.get("kind") == "timeout"
 
         # Track which corpus THIS measurement actually used --
         # recorded per-entry below (fix for CORPUS PROVENANCE:
@@ -1423,9 +1450,15 @@ class MagicQuantOrchestrator:
         if kl_result is not None and kl_result.get("ppl") is not None:
             ppl = kl_result["ppl"]
             measurement_corpus = self._kl_corpus_path
+            ppl_timed_out = False
         else:
             ppl = self.llama_tools.calculate_perplexity(path, verbose=verbose)
             measurement_corpus = self.llama_tools._resolve_data_file(None)
+            # Same distinction as the KL leg above, for this (always the
+            # LAST-attempted) leg -- whichever of the two determines
+            # "ppl is None" below.
+            ppl_failure = getattr(self.llama_tools, "_last_subprocess_failure", None)
+            ppl_timed_out = bool(ppl_failure) and ppl_failure.get("kind") == "timeout"
 
         if ppl is not None:
             measured_loss = (ppl - self.baseline_ppl) / self.baseline_ppl
@@ -1482,6 +1515,14 @@ class MagicQuantOrchestrator:
 
             if kl_result is not None:
                 self._measured[config_key]["kl"] = kl_result
+            elif kl_timed_out:
+                # KL leg timed out but the PPL fallback above still
+                # succeeded -- this candidate gets scored WITHOUT the KL
+                # term its siblings carry. Record that instead of
+                # silently comparing it apples-to-oranges against
+                # candidates that DID get a KL measurement (field
+                # report, 2026-08).
+                self._measured[config_key]["kl_timeout"] = True
 
             # Optional secondary signal -- best-effort (None on
             # failure), scored in _select_final_survivors
@@ -1524,6 +1565,42 @@ class MagicQuantOrchestrator:
             # already recorded, not lost.
             self._write_measured_checkpoint(checkpoint_path)
         else:
+            if kl_timed_out or ppl_timed_out:
+                # Neither leg produced a usable measurement, and at
+                # least one failure was a genuine subprocess TIMEOUT
+                # (not a parse failure/OSError) -- without this, this
+                # candidate leaves NO trace in self._measured,
+                # indistinguishable from "never attempted" (field
+                # report, 2026-08: a 37.8GB candidate burned ~4h of
+                # healthy CPU across both legs and search_results.json
+                # recorded nothing). This entry is diagnostics-only and
+                # deliberately INERT to selection, using the same
+                # "drop from selection, don't erase the record"
+                # contract as every other measurement_invalid entry:
+                # measurement_invalid=True makes _select_final_
+                # survivors skip it before it ever touches size_gb
+                # (which this entry doesn't even have), and the
+                # existing n_valid all-invalid guard, noise-calibration
+                # fit, and predictor-tracking diagnostic already filter
+                # on measurement_invalid / measured_loss is not None,
+                # so none of them need to change for this entry to stay
+                # harmless. "config" is the one field _serialize_
+                # measurement requires unconditionally (v["config"], no
+                # fallback), so it must be present.
+                self._measured[config_key] = {
+                    "config": config,
+                    "measurement_invalid": True,
+                    "measurement_timeout": True,
+                    "timeout_leg": "ppl" if ppl_timed_out else "kl",
+                }
+                if kl_timed_out:
+                    self._measured[config_key]["kl_timeout"] = True
+                # Persist so a kill shortly after this point resumes
+                # without re-attempting a candidate already known to
+                # time out at this size/timeout budget -- the whole
+                # point of recording this is to stop burning hours on
+                # it every round.
+                self._write_measured_checkpoint(checkpoint_path)
             if verbose:
                 log.warning("Measurement failed", stage="measurement")
 
@@ -1917,7 +1994,11 @@ class MagicQuantOrchestrator:
         into one uniform order. ``_save_results`` ends
         ...incumbent, corpus_path, measurement_invalid; the checkpoint
         inserts "path" right after "residual" and ends
-        ...incumbent, measurement_invalid, corpus_path.
+        ...incumbent, measurement_invalid, corpus_path. Both then get
+        kl_timeout, measurement_timeout, timeout_leg appended at the TAIL
+        (additive; see _record_candidate_measurement's timeout-disclosure
+        fix -- these are new fields, not a reordering of the existing
+        ones, so each site's pre-existing order above is unchanged).
         """
         entry: Dict[str, Any] = {
             "config": v["config"],
@@ -1961,6 +2042,17 @@ class MagicQuantOrchestrator:
             # _select_final_survivors -- kept in the record for
             # diagnostics rather than silently dropped.
             entry["measurement_invalid"] = v.get("measurement_invalid", False)
+
+        # Additive (2026-08 measurement-timeout fix), appended at the TAIL
+        # of BOTH orders above -- see the docstring note. All three
+        # default to falsy/None when absent, so an OLDER checkpoint or
+        # search_results.json (written before this fix) round-trips
+        # exactly as before: no KeyError, no behavior change, these just
+        # read back as "no timeout info recorded" for every pre-existing
+        # entry.
+        entry["kl_timeout"] = v.get("kl_timeout", False)
+        entry["measurement_timeout"] = v.get("measurement_timeout", False)
+        entry["timeout_leg"] = v.get("timeout_leg")
         return entry
 
     def _log_predictor_tracking(self) -> None:

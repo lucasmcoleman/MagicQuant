@@ -30,11 +30,13 @@ parsers/methods in magicquant/utils/llamacpp.py for the full detail):
   ``abs(mean_kl)`` is small rather than ``mean_kl >= 0``.
 """
 import json
+import os
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
+import magicquant.utils.llamacpp as llamacpp_mod
 from magicquant.utils.llamacpp import (
     LlamaCppTools,
     _env_int,
@@ -849,3 +851,345 @@ def test_bench_explicit_arg_beats_env(monkeypatch):
         tools.bench("/m.gguf", reps=2)
     cmd = run.call_args[0][0]
     assert cmd[cmd.index("-r") + 1] == "2"
+
+
+# ── Measurement-timeout fix (2026-08 field report): flat 2h _SUBPROCESS_
+# ── TIMEOUT didn't scale with artifact size, so a healthy (not hung),
+# ── bandwidth-bound pass over a 37.8GB candidate hit the cap on BOTH the
+# ── KL and PPL-fallback legs -- 4h burned for zero measurements, with no
+# ── record distinguishing "measured and lost" from "never attempted". ──
+
+
+def test_bench_default_timeout_unchanged_at_300():
+    """bench() keeps its own flat _BENCH_TIMEOUT -- explicitly NOT wired
+    to _measure_timeout, per the fix's scope (bench measures throughput
+    over a short prompt/gen, not a full corpus pass, so it never needed
+    the size-aware scaling)."""
+    import inspect
+    sig = inspect.signature(LlamaCppTools.bench)
+    assert sig.parameters["timeout"].default == llamacpp_mod._BENCH_TIMEOUT == 300
+
+
+def test_subprocess_timeout_env_override_at_import(monkeypatch):
+    """_SUBPROCESS_TIMEOUT is read ONCE at module-import time
+    (``_env_int("MAGICQUANT_SUBPROCESS_TIMEOUT") or 7200``) -- there is no
+    per-instance re-read to exercise the way MAGICQUANT_PPL_CHUNKS gets
+    re-read fresh in __init__ (see test_ppl_chunks_env_caps_all_
+    measurement_passes above). Spawn a subprocess with the env var set and
+    import fresh rather than importlib.reload()-ing this module in-process,
+    which would mutate the SAME module dict every other already-imported
+    test file's LlamaCppTools methods read their globals from."""
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env["MAGICQUANT_SUBPROCESS_TIMEOUT"] = "3600"
+    out = subprocess.run(
+        [
+            sys.executable, "-c",
+            "from magicquant.utils.llamacpp import _SUBPROCESS_TIMEOUT; "
+            "print(_SUBPROCESS_TIMEOUT)",
+        ],
+        env=env, capture_output=True, text=True, check=True, timeout=30,
+    )
+    assert out.stdout.strip() == "3600"
+
+
+def test_subprocess_timeout_env_unset_defaults_to_7200():
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env.pop("MAGICQUANT_SUBPROCESS_TIMEOUT", None)
+    out = subprocess.run(
+        [
+            sys.executable, "-c",
+            "from magicquant.utils.llamacpp import _SUBPROCESS_TIMEOUT; "
+            "print(_SUBPROCESS_TIMEOUT)",
+        ],
+        env=env, capture_output=True, text=True, check=True, timeout=30,
+    )
+    assert out.stdout.strip() == "7200"
+
+
+def test_measure_timeout_small_file_returns_base(tmp_path):
+    small = tmp_path / "small.gguf"
+    small.write_bytes(b"x" * 1024)  # 1 KiB -- far below the bandwidth floor
+    tools = _bare_tools()
+    assert tools._measure_timeout(str(small)) == llamacpp_mod._SUBPROCESS_TIMEOUT
+
+
+def test_measure_timeout_huge_file_scales(monkeypatch, tmp_path):
+    """37.8GB is the field report's actual candidate size -- confirms the
+    worked example (~2.6h for the plain-PPL leg) arithmetically."""
+    huge_path = tmp_path / "huge.gguf"
+    huge_path.write_bytes(b"")  # existence only; size is faked below
+    huge_bytes = 37_800_000_000
+    monkeypatch.setattr(os.path, "getsize", lambda p: huge_bytes)
+
+    tools = _bare_tools()
+    expected = huge_bytes // llamacpp_mod._MIN_MEASURE_BANDWIDTH
+    assert expected > llamacpp_mod._SUBPROCESS_TIMEOUT  # scaling actually kicks in
+    result = tools._measure_timeout(str(huge_path))
+    assert result == expected
+    assert 2.5 * 3600 < result < 2.7 * 3600  # ~2.6h, matching the field report
+
+
+def test_measure_timeout_kl_doubles_plain_ppl(monkeypatch, tmp_path):
+    huge_path = tmp_path / "huge.gguf"
+    huge_path.write_bytes(b"")
+    monkeypatch.setattr(os.path, "getsize", lambda p: 37_800_000_000)
+
+    tools = _bare_tools()
+    ppl_timeout = tools._measure_timeout(str(huge_path), kl=False)
+    kl_timeout = tools._measure_timeout(str(huge_path), kl=True)
+    assert kl_timeout == ppl_timeout * 2
+
+
+def test_measure_timeout_missing_file_returns_base():
+    tools = _bare_tools()
+    assert tools._measure_timeout("/does/not/exist.gguf") == llamacpp_mod._SUBPROCESS_TIMEOUT
+
+
+def test_measure_timeout_always_finite(monkeypatch, tmp_path):
+    """Hang protection must never be disabled, only sized correctly (this
+    box has an OOM-livelock history) -- even a pathological fake size must
+    still produce a finite int, never inf/nan."""
+    import math
+    monkeypatch.setattr(os.path, "getsize", lambda p: 10 ** 15)
+    tools = _bare_tools()
+    result = tools._measure_timeout(str(tmp_path / "whatever.gguf"), kl=True)
+    assert isinstance(result, int) and math.isfinite(result)
+
+
+def test_run_subprocess_or_none_records_timeout_failure():
+    import subprocess
+
+    tools = _bare_tools()
+
+    def _raise_timeout(cmd, timeout):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_raise_timeout):
+        result = tools._run_subprocess_or_none(["fake"], 10, "Test op")
+    assert result is None
+    assert tools._last_subprocess_failure == {"kind": "timeout", "label": "Test op"}
+
+
+def test_run_subprocess_or_none_records_error_failure():
+    import subprocess
+
+    tools = _bare_tools()
+
+    def _raise_called_process_error(cmd, timeout):
+        raise subprocess.CalledProcessError(returncode=1, cmd=cmd, stderr="boom")
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_raise_called_process_error):
+        result = tools._run_subprocess_or_none(["fake"], 10, "Test op")
+    assert result is None
+    assert tools._last_subprocess_failure == {"kind": "error", "label": "Test op"}
+
+
+def test_run_subprocess_or_none_clears_failure_on_success():
+    import subprocess
+
+    tools = _bare_tools()
+    tools._last_subprocess_failure = {"kind": "timeout", "label": "stale"}  # leftover from a prior call
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake):
+        result = tools._run_subprocess_or_none(["fake"], 10, "Test op")
+    assert result is fake
+    assert tools._last_subprocess_failure is None
+
+
+def test_run_subprocess_or_none_failure_attr_getattr_safe_on_never_called_instance():
+    """A bare __new__ instance that has never run _run_subprocess_or_none
+    has no _last_subprocess_failure attribute at all -- callers (the
+    orchestrator) must read it via getattr(..., None), not direct access."""
+    tools = LlamaCppTools.__new__(LlamaCppTools)
+    assert getattr(tools, "_last_subprocess_failure", None) is None
+
+
+# ── Q2 (Opus review, 2026-08-10): _last_subprocess_failure LEAK across
+# ── calls -- calculate_perplexity's corpus-resolution early return (fires
+# ── BEFORE _run_subprocess_or_none is ever reached) used to leave a
+# ── PREVIOUS call's stale "timeout"/"error" reading in place, since
+# ── nothing cleared the flag on that path. Reviewer reproduced 1 real
+# ── timeout turning into 5 disclosure entries downstream in the
+# ── orchestrator, each permanently blacklisting its config. ─────────────
+
+
+def test_calculate_perplexity_early_return_does_not_leak_previous_timeout(tmp_path):
+    """Two sequential calls on the SAME instance: the first genuinely
+    times out (a real _run_perplexity_subprocess TimeoutExpired, setting
+    _last_subprocess_failure for real); the second hits the
+    resolve-data-file early return (corpus unresolvable for that one
+    call) and must read back _last_subprocess_failure as None -- not the
+    first call's stale timeout -- because _run_subprocess_or_none is
+    never reached on the second call at all."""
+    import subprocess
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("hello world\n")
+
+    tools = _bare_tools(data_file=str(corpus))
+
+    def _raise_timeout(cmd, timeout):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_raise_timeout):
+        first = tools.calculate_perplexity("/model_1.gguf")
+    assert first is None
+    assert tools._last_subprocess_failure == {
+        "kind": "timeout", "label": "Perplexity calculation",
+    }
+
+    # Second call: force the SAME early return calculate_perplexity has at
+    # `if resolved_data_file is None: return None` -- _resolve_data_file
+    # returns None for this call only, so _run_perplexity_subprocess is
+    # never invoked (asserted below).
+    with mock.patch.object(
+        tools, "_resolve_data_file", return_value=None,
+    ), mock.patch.object(
+        tools, "_run_perplexity_subprocess",
+    ) as run_mock:
+        second = tools.calculate_perplexity("/model_2.gguf")
+
+    assert second is None
+    run_mock.assert_not_called()
+    assert tools._last_subprocess_failure is None, (
+        "the early return must have cleared the flag, not left the "
+        "first call's timeout reading in place"
+    )
+
+
+def test_save_base_logits_and_calculate_kl_divergence_also_clear_at_top(tmp_path):
+    """Defensive clearing (Q2): even though save_base_logits/
+    calculate_kl_divergence have no KNOWN early-return-before-subprocess
+    path today, both now clear _last_subprocess_failure at their own top
+    too -- confirms a stale reading from a prior call never survives
+    into either method's own outcome."""
+    import subprocess
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("hello world\n")
+    base_logits = tmp_path / "base.kld"
+    base_logits.write_bytes(b"fake-logits")
+
+    tools = _bare_tools()
+    tools._last_subprocess_failure = {"kind": "timeout", "label": "stale from a prior call"}
+
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=_KL_STDOUT, stderr="")
+    with mock.patch.object(tools, "_run_perplexity_subprocess", return_value=fake):
+        tools.calculate_kl_divergence("/quant/model.gguf", str(base_logits), str(corpus))
+    assert tools._last_subprocess_failure is None
+
+    tools._last_subprocess_failure = {"kind": "error", "label": "stale from a prior call"}
+    out_logits = tmp_path / "out.kld"
+
+    def _fake_run(cmd, timeout):
+        out_logits.write_bytes(b"fake-logits" * 1000)
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_fake_run):
+        tools.save_base_logits("/base/model.gguf", str(corpus), str(out_logits))
+    assert tools._last_subprocess_failure is None
+
+
+def test_calculate_perplexity_scales_timeout_with_file_size(monkeypatch, tmp_path):
+    import subprocess
+
+    data_file = tmp_path / "corpus.txt"
+    data_file.write_text("hello world\n")
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"g")
+    monkeypatch.setattr(os.path, "getsize", lambda p: 37_800_000_000)
+
+    tools = _bare_tools(data_file=str(data_file))
+    fake = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="", stderr="Final estimate: PPL = 5.0 +/- 0.1"
+    )
+    captured = {}
+
+    def _fake_run(cmd, timeout):
+        captured["timeout"] = timeout
+        return fake
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_fake_run):
+        tools.calculate_perplexity(str(model))
+    assert captured["timeout"] == 37_800_000_000 // llamacpp_mod._MIN_MEASURE_BANDWIDTH
+    assert captured["timeout"] > llamacpp_mod._SUBPROCESS_TIMEOUT
+
+
+def test_save_base_logits_uses_2x_kl_timeout_by_default(monkeypatch, tmp_path):
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("hello world\n")
+    out_logits = tmp_path / "base.kld"
+    base_model = tmp_path / "base.gguf"
+    base_model.write_bytes(b"g")
+    monkeypatch.setattr(os.path, "getsize", lambda p: 37_800_000_000)
+
+    tools = _bare_tools()
+    captured = {}
+
+    def _fake_run(cmd, timeout):
+        captured["timeout"] = timeout
+        out_logits.write_bytes(b"fake-logits" * 1000)
+        import subprocess
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_fake_run):
+        tools.save_base_logits(str(base_model), str(corpus), str(out_logits))
+    ppl_leg = 37_800_000_000 // llamacpp_mod._MIN_MEASURE_BANDWIDTH
+    assert captured["timeout"] == ppl_leg * 2
+
+
+def test_calculate_kl_divergence_uses_2x_kl_timeout_by_default(monkeypatch, tmp_path):
+    import subprocess
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("hello world\n")
+    base_logits = tmp_path / "base.kld"
+    base_logits.write_bytes(b"fake-logits")
+    quant_model = tmp_path / "quant.gguf"
+    quant_model.write_bytes(b"g")
+    monkeypatch.setattr(os.path, "getsize", lambda p: 37_800_000_000)
+
+    tools = _bare_tools()
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=_KL_STDOUT, stderr="")
+    captured = {}
+
+    def _fake_run(cmd, timeout):
+        captured["timeout"] = timeout
+        return fake
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_fake_run):
+        tools.calculate_kl_divergence(str(quant_model), str(base_logits), str(corpus))
+    ppl_leg = 37_800_000_000 // llamacpp_mod._MIN_MEASURE_BANDWIDTH
+    assert captured["timeout"] == ppl_leg * 2
+
+
+def test_calculate_kl_divergence_explicit_timeout_still_overrides_default(monkeypatch, tmp_path):
+    """An explicit timeout= (e.g. the live smoke test's timeout=120) must
+    keep winning over the new size-aware default -- backward compatible."""
+    import subprocess
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("hello world\n")
+    base_logits = tmp_path / "base.kld"
+    base_logits.write_bytes(b"fake-logits")
+    monkeypatch.setattr(os.path, "getsize", lambda p: 37_800_000_000)
+
+    tools = _bare_tools()
+    fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=_KL_STDOUT, stderr="")
+    captured = {}
+
+    def _fake_run(cmd, timeout):
+        captured["timeout"] = timeout
+        return fake
+
+    with mock.patch.object(tools, "_run_perplexity_subprocess", side_effect=_fake_run):
+        tools.calculate_kl_divergence(
+            "/quant/model.gguf", str(base_logits), str(corpus), timeout=120,
+        )
+    assert captured["timeout"] == 120

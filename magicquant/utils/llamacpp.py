@@ -16,17 +16,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 _log = logging.getLogger(__name__)
 
 
-# Default timeout for subprocess calls (seconds)
-_SUBPROCESS_TIMEOUT = 7200  # 2 hours (35B baseline perplexity ~67 min)
-_QUANTIZE_TIMEOUT = 1800   # 30 minutes for large model quantization
-_BENCH_TIMEOUT = 300       # 5 minutes for llama-bench pp/tg speed measurement
-# A real saved-logits (--kl-divergence-base) file is tens of MB even for a
-# tiny model/corpus; a corpus too short for the requested ctx_size*chunks
-# makes llama-perplexity exit 0 but write only a ~12-byte header stub. 4 KiB
-# comfortably separates "real" from "stub" without depending on model size.
-_MIN_LOGITS_FILE_BYTES = 4096
-
-
 def _env_int(name: str) -> Optional[int]:
     """Parse an optional int env var; unset/empty/invalid -> None (flag omitted)."""
     raw = os.environ.get(name)
@@ -36,6 +25,35 @@ def _env_int(name: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+# Default timeout for subprocess calls (seconds). MAGICQUANT_SUBPROCESS_TIMEOUT
+# overrides the flat floor; large artifacts additionally scale this up per
+# call site -- see LlamaCppTools._measure_timeout below. (2026-08 field
+# report: a 37.8GB candidate's KL pass hit this flat 2h cap while healthy at
+# ~96% CPU -- not a hang -- then the PPL fallback hit the same cap, burning
+# 4h of compute for zero measurements.)
+# Same `_env_int(...) or <default>` falsy-collapse as every other env knob
+# in this file (see _effective_chunks' note on MAGICQUANT_PPL_CHUNKS): unset,
+# empty, non-numeric, AND a literal "0" all collapse to the 7200 default --
+# there is no way to request an actual zero timeout. A negative value (e.g.
+# "-1") parses fine and is used as-is, unvalidated -- callers are trusted not
+# to pass one.
+_SUBPROCESS_TIMEOUT = _env_int("MAGICQUANT_SUBPROCESS_TIMEOUT") or 7200  # 2 hours (35B baseline perplexity ~67 min)
+_QUANTIZE_TIMEOUT = 1800   # 30 minutes for large model quantization
+_BENCH_TIMEOUT = 300       # 5 minutes for llama-bench pp/tg speed measurement
+# Conservative floor bandwidth (bytes/sec) for scaling a measurement
+# timeout to a specific file's size (LlamaCppTools._measure_timeout). Its
+# ONLY job is to keep the cap FINITE for a genuine hang while never
+# undercutting a healthy bandwidth-bound pass: 4 MB/s is far below any real
+# llama-perplexity throughput on this box, so a run still making progress
+# never hits this cap, while a real 0 B/s hang still times out eventually.
+_MIN_MEASURE_BANDWIDTH = 4_000_000  # 4 MB/s
+# A real saved-logits (--kl-divergence-base) file is tens of MB even for a
+# tiny model/corpus; a corpus too short for the requested ctx_size*chunks
+# makes llama-perplexity exit 0 but write only a ~12-byte header stub. 4 KiB
+# comfortably separates "real" from "stub" without depending on model size.
+_MIN_LOGITS_FILE_BYTES = 4096
 
 
 def _find_tool_in_dirs(possible_names: List[str], search_dirs: List[Path]) -> Optional[str]:
@@ -143,6 +161,39 @@ class LlamaCppTools:
         out of parity with each other.
         """
         return ["--batch-size", "512", "--ubatch-size", "128"]
+
+    def _measure_timeout(self, model_path: str, kl: bool = False) -> int:
+        """Size-aware subprocess timeout for one measurement pass over
+        *model_path*.
+
+        ``max(_SUBPROCESS_TIMEOUT, file_size_bytes // _MIN_MEASURE_BANDWIDTH)``
+        -- never lower than the flat floor (small/typical models keep
+        exactly the historical cap), but scaled up for a large artifact
+        whose legitimate bandwidth-bound pass would otherwise exceed it
+        (37.8GB -> ~2.6h for the plain-PPL leg at the 4 MB/s floor). *kl*
+        doubles the result: the KL/logits legs (``save_base_logits``,
+        ``calculate_kl_divergence``) are empirically slower than plain PPL
+        over the same file -- same forward compute plus a saved-logits
+        read plus full-vocab KL accumulation.
+
+        ``os.path.getsize`` is read defensively: a missing/inaccessible
+        file (already-deleted candidate, permissions, race -- ``OSError``)
+        OR a bad argument (e.g. ``model_path=None`` -- ``TypeError``, which
+        ``os.path.getsize`` raises rather than an ``OSError`` subclass)
+        both degrade to the base timeout rather than raising -- this
+        helper's job is to WIDEN a timeout for a known-large file, not to
+        gate on the file's existence or the caller's argument being
+        well-formed (the subprocess call itself fails loudly if the model
+        path is actually bad). Always returns a finite int: this box has
+        an OOM-livelock history, so hang protection must never be
+        disabled, only sized correctly.
+        """
+        try:
+            size_bytes = os.path.getsize(model_path)
+        except (OSError, TypeError):
+            size_bytes = 0
+        ppl_timeout = max(_SUBPROCESS_TIMEOUT, size_bytes // _MIN_MEASURE_BANDWIDTH)
+        return ppl_timeout * 2 if kl else ppl_timeout
 
     def _find_llamacpp(self) -> str:
         """Auto-detect llama.cpp installation."""
@@ -377,15 +428,34 @@ class LlamaCppTools:
         silently recording "no measurement" (see
         tests/test_orchestrator_measurement.py::
         test_measured_search_survives_kl_and_bench_raising_oserror).
+
+        Also records the failure kind on the instance
+        (``self._last_subprocess_failure = {"kind": "timeout"|"error",
+        "label": label}``), cleared (``None``) on every call before the
+        subprocess even runs -- so a caller can distinguish "this specific
+        call timed out" from "this specific call failed for another
+        reason" (e.g. unparseable output) without either kind being
+        confused with a stale reading left over from a PRIOR call. An
+        OSError that propagates out of this method (see above) leaves the
+        attribute cleared too, since it was reset before the propagating
+        call. Callers that need this must read it via
+        ``getattr(tools, "_last_subprocess_failure", None)`` -- several
+        tests construct a bare instance via ``LlamaCppTools.__new__`` that
+        never runs ``__init__`` and so never gets this attribute set at
+        all until the first call.
         """
+        self._last_subprocess_failure = None
         try:
-            return self._run_perplexity_subprocess(cmd, timeout=timeout)
+            result = self._run_perplexity_subprocess(cmd, timeout=timeout)
         except subprocess.CalledProcessError as e:
             print(f"{label} failed: {e.stderr}")
+            self._last_subprocess_failure = {"kind": "error", "label": label}
             return None
         except subprocess.TimeoutExpired:
             print(f"{label} timed out")
+            self._last_subprocess_failure = {"kind": "timeout", "label": label}
             return None
+        return result
 
     def calculate_perplexity(
         self,
@@ -406,6 +476,14 @@ class LlamaCppTools:
         Returns:
             Perplexity value or None if failed
         """
+        # Cleared HERE, before the early return below, not just inside
+        # _run_subprocess_or_none: the corpus-resolution early return can
+        # fire before that helper (and therefore this flag) is ever
+        # touched, which used to leave a PREVIOUS call's stale
+        # "timeout"/"error" reading in place -- the orchestrator would
+        # then misread an unrelated later failure (e.g. a vanished
+        # corpus) as a timeout too (Q2 field review, 2026-08).
+        self._last_subprocess_failure = None
         resolved_data_file = self._resolve_data_file(data_file)
         if resolved_data_file is None:
             return None
@@ -428,7 +506,9 @@ class LlamaCppTools:
         if verbose:
             print(f"Calculating perplexity for {Path(model_path).name}...")
 
-        result = self._run_subprocess_or_none(cmd, _SUBPROCESS_TIMEOUT, "Perplexity calculation")
+        result = self._run_subprocess_or_none(
+            cmd, self._measure_timeout(model_path), "Perplexity calculation"
+        )
         if result is None:
             return None
 
@@ -520,7 +600,7 @@ class LlamaCppTools:
         *,
         ctx_size: int = 512,
         chunks: int = -1,
-        timeout: int = _SUBPROCESS_TIMEOUT,
+        timeout: Optional[int] = None,
     ) -> Optional[float]:
         """Run the base model once, saving per-token logits to disk.
 
@@ -548,7 +628,10 @@ class LlamaCppTools:
             out_logits_path: Where to write the saved logits.
             ctx_size: Context size for the pass.
             chunks: Number of context-sized chunks to process (-1 = all).
-            timeout: Subprocess timeout in seconds.
+            timeout: Subprocess timeout in seconds. *None* (default) uses
+                the size-aware KL-leg timeout for *base_model_path* (see
+                ``_measure_timeout``, ``kl=True`` -- this pass saves logits,
+                grouped with the KL/logits legs, not the plain-PPL leg).
 
         Returns:
             The parsed "Final estimate: PPL" value from this pass on success,
@@ -557,6 +640,13 @@ class LlamaCppTools:
             guard always wins: a stub-sized output file means failure/None
             even if a PPL line happened to parse from stdout/stderr.
         """
+        # Cleared at the top defensively (Q2 field review) -- this method
+        # currently always reaches _run_subprocess_or_none (which clears
+        # it itself too), so there is no known early-return leak here
+        # today, but the same class of bug as calculate_perplexity's
+        # would be trivial to reintroduce with a future early return
+        # added above the subprocess call.
+        self._last_subprocess_failure = None
         cmd = [
             self.perplexity_tool,
             "-m", base_model_path,
@@ -566,7 +656,11 @@ class LlamaCppTools:
             "--chunks", self._effective_chunks(chunks),
         ] + self._perplexity_batch_flags() + self._gpu_flags()
 
-        result = self._run_subprocess_or_none(cmd, timeout, "Saving base logits")
+        effective_timeout = (
+            timeout if timeout is not None
+            else self._measure_timeout(base_model_path, kl=True)
+        )
+        result = self._run_subprocess_or_none(cmd, effective_timeout, "Saving base logits")
         if result is None:
             return None
 
@@ -590,7 +684,7 @@ class LlamaCppTools:
         *,
         ctx_size: int = 512,
         chunks: int = -1,
-        timeout: int = _SUBPROCESS_TIMEOUT,
+        timeout: Optional[int] = None,
     ) -> Optional[dict]:
         """Compute KL divergence of a quantized model against saved base logits.
 
@@ -613,7 +707,9 @@ class LlamaCppTools:
                 run).
             chunks: Number of context-sized chunks to process (-1 = all;
                 must match the base-logits run).
-            timeout: Subprocess timeout in seconds.
+            timeout: Subprocess timeout in seconds. *None* (default) uses
+                the size-aware KL-leg timeout for *quant_model_path* (see
+                ``_measure_timeout``, ``kl=True``).
 
         Returns:
             {"mean_kl": float, "max_kl": float, "p90_kl": float, "ppl": float,
@@ -627,6 +723,11 @@ class LlamaCppTools:
             this ONE invocation instead of a separate calculate_perplexity
             call (see run_measured_search's candidate-measurement fusion).
         """
+        # Cleared at the top defensively -- see save_base_logits' identical
+        # note (Q2 field review): no known early-return leak here today,
+        # but cheap insurance against one being added later above the
+        # subprocess call.
+        self._last_subprocess_failure = None
         cmd = [
             self.perplexity_tool,
             "-m", quant_model_path,
@@ -637,7 +738,11 @@ class LlamaCppTools:
             "--chunks", self._effective_chunks(chunks),
         ] + self._perplexity_batch_flags() + self._gpu_flags()
 
-        result = self._run_subprocess_or_none(cmd, timeout, "KL divergence calculation")
+        effective_timeout = (
+            timeout if timeout is not None
+            else self._measure_timeout(quant_model_path, kl=True)
+        )
+        result = self._run_subprocess_or_none(cmd, effective_timeout, "KL divergence calculation")
         if result is None:
             return None
 
