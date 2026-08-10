@@ -8,12 +8,14 @@ Real EvolutionarySurvivor/PredictiveScorer/SensitivityProber run unmocked
 exercises the actual wiring rather than a hand-rolled stand-in.
 """
 import json
+import subprocess
 
 import pytest
 
 import magicquant.gguf.source as source_mod
 import magicquant.orchestrator as orch_mod
 from magicquant.orchestrator import MagicQuantOrchestrator
+from magicquant.utils.llamacpp import LlamaCppTools
 
 
 _TENSOR_NAMES = [
@@ -73,6 +75,71 @@ class _FakeLlamaTools:
     def bench(self, model_path, **kw):
         self.bench_calls.append(model_path)
         return {"pp_tps": 100.0, "tg_tps": 50.0}
+
+
+class _TimeoutAwareFakeLlamaTools(_FakeLlamaTools):
+    """Reproduces LlamaCppTools._run_subprocess_or_none's REAL contract for
+    a subprocess timeout: caught internally, surfaced as a return of None
+    PLUS ``self._last_subprocess_failure = {"kind": "timeout", ...}`` --
+    never raised up to the orchestrator (see that method's docstring). A
+    fake that instead literally raised subprocess.TimeoutExpired would be
+    unfaithful to production, where TimeoutExpired never escapes
+    _run_subprocess_or_none at all.
+    """
+
+    def __init__(self, kl_times_out=False, ppl_times_out=False):
+        super().__init__()
+        self._kl_times_out = kl_times_out
+        self._ppl_times_out = ppl_times_out
+        self._last_subprocess_failure = None
+
+    def calculate_kl_divergence(self, quant_model_path, base_logits_path, corpus_path, **kw):
+        self.kl_calls.append((quant_model_path, base_logits_path, corpus_path))
+        if self._kl_times_out:
+            self._last_subprocess_failure = {
+                "kind": "timeout", "label": "KL divergence calculation",
+            }
+            return None
+        self._last_subprocess_failure = None
+        return self.kl_result
+
+    def calculate_perplexity(self, path, verbose=False, **kw):
+        self.perplexity_calls.append(path)
+        if self._ppl_times_out:
+            self._last_subprocess_failure = {
+                "kind": "timeout", "label": "Perplexity calculation",
+            }
+            return None
+        self._last_subprocess_failure = None
+        return 5.0
+
+
+class _MixedTimeoutFakeLlamaTools(_FakeLlamaTools):
+    """The FIRST candidate-level calculate_perplexity call succeeds
+    normally (a real, fully-scored measurement, "residual" and all);
+    every call after that times out on the PPL leg (KL stays disabled by
+    the caller, so only the PPL leg matters) -- a MIXED round: one
+    normally-scored entry alongside one-or-more measurement-timeout
+    disclosure entries that have no "residual" at all. This is the exact
+    self._measured shape that broke the unguarded "Round summary"
+    ``abs(m["residual"]) for m in self._measured.values()`` sum (Q1
+    regression, Opus review 2026-08-10)."""
+
+    def __init__(self):
+        super().__init__()
+        self._call_n = 0
+        self._last_subprocess_failure = None
+
+    def calculate_perplexity(self, path, verbose=False, **kw):
+        self.perplexity_calls.append(path)
+        self._call_n += 1
+        if self._call_n == 1:
+            self._last_subprocess_failure = None
+            return 5.0
+        self._last_subprocess_failure = {
+            "kind": "timeout", "label": "Perplexity calculation",
+        }
+        return None
 
 
 def _make_orchestrator(tmp_path, monkeypatch):
@@ -645,6 +712,465 @@ def test_measured_search_survives_kl_and_bench_raising_oserror(tmp_path, monkeyp
     for info in orch._measured.values():
         assert "kl" not in info
         assert "bench" not in info
+
+
+# ── Measurement-timeout recording (2026-08 field report) ────────────────────
+
+
+def test_measured_search_records_kl_timeout_when_ppl_still_succeeds(tmp_path, monkeypatch):
+    """The KL leg times out but the PPL fallback succeeds -- the candidate
+    must still be scored (it has a real measured_loss and competes for its
+    tier normally), but the record must show it ran WITHOUT the KL term
+    its siblings carry (field report: previously invisible)."""
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    orch._llama_tools = _TimeoutAwareFakeLlamaTools(kl_times_out=True, ppl_times_out=False)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        enable_kl=True,
+    )
+
+    assert orch._measured, "PPL succeeded -- candidates must still be scored"
+    for info in orch._measured.values():
+        assert info.get("kl_timeout") is True
+        assert "kl" not in info
+        assert info.get("measured_loss") is not None
+        assert not info.get("measurement_invalid")
+
+    results = json.loads((orch.output_dir / "search_results.json").read_text())
+    saved = next(iter(results["measurements"].values()))
+    assert saved["kl_timeout"] is True
+    # Tail-appended, per _serialize_measurement's key-order contract.
+    keys = list(saved.keys())
+    assert keys.index("kl_timeout") > keys.index("measurement_invalid")
+
+
+def test_measured_search_records_measurement_timeout_disclosure_when_both_legs_time_out(
+    tmp_path, monkeypatch,
+):
+    """Both the KL leg and the PPL fallback time out -- zero measurements
+    are produced (matches the field report exactly: 4h of healthy compute,
+    nothing measured), so run_measured_search must still raise the
+    existing "zero VALID measurements" guard (F3) rather than reporting
+    success. But self._measured must NOT stay empty: a minimal disclosure
+    entry (measurement_invalid=True, so it is excluded from tier
+    competition and from the VALID count -- inert to selection) is what
+    distinguishes "measured and lost" from "never attempted"."""
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    orch._llama_tools = _TimeoutAwareFakeLlamaTools(kl_times_out=True, ppl_times_out=True)
+
+    with pytest.raises(RuntimeError, match="zero VALID"):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=2, verbose=False,
+            enable_kl=True,
+        )
+
+    assert orch._measured, "timeout disclosure entries must still be recorded"
+    for info in orch._measured.values():
+        assert info["measurement_invalid"] is True
+        assert info["measurement_timeout"] is True
+        assert info["timeout_leg"] == "ppl"  # the PPL fallback is always the deciding leg
+        assert info["kl_timeout"] is True  # the KL leg independently timed out too
+        assert info["config"]
+        assert info.get("ppl") is None
+
+    # Persisted to the checkpoint (so a subsequent kill+resume doesn't
+    # re-attempt a candidate already known to time out at this size) even
+    # though the run as a whole raised before ever reaching _save_results.
+    checkpoint = json.loads(orch._measured_checkpoint_path().read_text())
+    entry = next(iter(checkpoint["measured"].values()))
+    assert entry["measurement_timeout"] is True
+    assert entry["timeout_leg"] == "ppl"
+    assert entry["kl_timeout"] is True
+    # Tail-appended, per the checkpoint site's key-order contract.
+    keys = list(entry.keys())
+    assert keys[-3:] == ["kl_timeout", "measurement_timeout", "timeout_leg"]
+
+
+def test_measured_search_no_leaked_timeout_across_candidates(tmp_path, monkeypatch):
+    """Q2 (Opus review, 2026-08-10): end-to-end reproduction of the
+    _last_subprocess_failure leak through a real run_measured_search
+    round. Uses a REAL LlamaCppTools instance (not the hand-rolled
+    _FakeLlamaTools/_TimeoutAwareFakeLlamaTools doubles) because the bug
+    lives inside calculate_perplexity's own control flow -- a fake
+    reimplementing calculate_perplexity from scratch could not exercise
+    the early-return path that causes the leak.
+
+    "Candidate 1" genuinely times out (a mocked _run_perplexity_subprocess
+    raises TimeoutExpired for real) and correctly gets a disclosure entry.
+    "Candidate 2" is engineered to hit calculate_perplexity's own
+    corpus-resolution early return (`if resolved_data_file is None: return
+    None`) -- its OWN failure has nothing to do with a timeout, and
+    _run_perplexity_subprocess is never even called for it. Pre-fix, it
+    would still read candidate 1's STALE _last_subprocess_failure and get
+    mislabeled+blacklisted as a timeout too; fixed, it gets no disclosure
+    entry at all (matching a config that was never measured).
+    """
+    monkeypatch.setattr(source_mod, "open_model_source", lambda *a, **k: _FakeSource())
+    orch = MagicQuantOrchestrator(
+        source_model_path=str(tmp_path / "nonexistent.gguf"),
+        output_dir=str(tmp_path / "out"),
+    )
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text("hello world\n")
+
+    real_tools = LlamaCppTools.__new__(LlamaCppTools)
+    real_tools.perplexity_tool = "/bin/true"
+    real_tools.bench_tool = None
+    real_tools.ctx_size = 512
+    real_tools.ngl = None
+    real_tools.threads = None
+    real_tools.ppl_chunks = None
+    real_tools.data_file = str(corpus)
+    real_tools._pinned_corpus = None
+    orch._llama_tools = real_tools
+
+    candidate_calls = {"n": 0}
+    real_calculate_perplexity = LlamaCppTools.calculate_perplexity
+
+    def controlled_calculate_perplexity(model_path, verbose=True, data_file=None, ctx_size=None):
+        if model_path == orch.source_model_path:
+            # Baseline: always resolves and measures normally.
+            return real_calculate_perplexity(
+                real_tools, model_path, verbose=verbose,
+                data_file=data_file, ctx_size=ctx_size,
+            )
+        candidate_calls["n"] += 1
+        if candidate_calls["n"] != 2:
+            # Candidate 1 (and any candidate beyond 2): normal corpus
+            # resolution -- whether the underlying subprocess then
+            # succeeds or times out is controlled by fake_run_subprocess
+            # below, keyed on candidate_calls["n"].
+            return real_calculate_perplexity(
+                real_tools, model_path, verbose=verbose,
+                data_file=data_file, ctx_size=ctx_size,
+            )
+        # Candidate 2: force the early return specifically -- corpus is
+        # unresolvable for THIS call only (e.g. a transient vanished-
+        # corpus condition), never reaching _run_perplexity_subprocess.
+        orig_resolve = real_tools._resolve_data_file
+        real_tools._resolve_data_file = lambda data_file=None: None
+        try:
+            return real_calculate_perplexity(
+                real_tools, model_path, verbose=verbose,
+                data_file=data_file, ctx_size=ctx_size,
+            )
+        finally:
+            real_tools._resolve_data_file = orig_resolve
+
+    real_tools.calculate_perplexity = controlled_calculate_perplexity
+
+    def fake_run_subprocess(cmd, timeout):
+        model_path = cmd[cmd.index("-m") + 1]
+        if model_path == orch.source_model_path:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="", stderr="Final estimate: PPL = 5.0 +/- 0.1",
+            )
+        if candidate_calls["n"] == 1:
+            # Candidate 1's real, genuine timeout.
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+        # Any later candidate that actually reaches the subprocess
+        # (everyone except candidate 2, which is diverted above) measures
+        # normally.
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout="", stderr="Final estimate: PPL = 6.0 +/- 0.1",
+        )
+
+    monkeypatch.setattr(real_tools, "_run_perplexity_subprocess", fake_run_subprocess)
+
+    candidates_dir = tmp_path / "candidates"
+    candidates_dir.mkdir()
+    build_counter = {"n": 0}
+
+    def fake_build_candidate(config, name, base_quant):
+        build_counter["n"] += 1
+        p = candidates_dir / f"{name}_{build_counter['n']}.gguf"
+        p.write_bytes(b"0" * 1024)
+        return str(p)
+
+    monkeypatch.setattr(orch, "_build_candidate", fake_build_candidate)
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        probe_kl=False,  # isolate to the PPL leg only, per the bug's own repro
+    )
+
+    assert candidate_calls["n"] >= 2, "test setup requires at least 2 measured candidates"
+
+    disclosure_entries = [
+        info for info in orch._measured.values()
+        if info.get("measurement_invalid") and info.get("measurement_timeout")
+    ]
+    # Exactly one real timeout occurred (candidate 1) -- candidate 2's
+    # early return must NOT have produced a second (mislabeled) one.
+    assert len(disclosure_entries) == 1
+    assert disclosure_entries[0]["timeout_leg"] == "ppl"
+
+
+def test_measured_search_no_disclosure_entry_for_non_timeout_ppl_failure(tmp_path, monkeypatch):
+    """A plain (non-timeout) measurement failure -- e.g. unparseable
+    output or a CalledProcessError -- must keep the EXACT pre-fix
+    behavior: no self._measured entry at all, not a disclosure entry. The
+    new disclosure mechanism is scoped to genuine subprocess TIMEOUTS
+    only.
+
+    Q3 (Opus review, 2026-08-10): the fake explicitly sets
+    ``_last_subprocess_failure = {"kind": "error", ...}`` on BOTH legs
+    (KL via ``enable_kl=True``, and the PPL fallback) rather than just
+    leaving the attribute unset. An unset attribute would make
+    ``kl_timed_out``/``ppl_timed_out`` False via the ``bool(None)``
+    short-circuit alone, never actually exercising the
+    ``kind == "timeout"`` comparison against a REAL (non-timeout) failure
+    dict -- this pins that the comparison itself, not just attribute
+    absence, correctly reads False for ``kind == "error"``.
+    """
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+
+    def flaky_perplexity(path, verbose=False, **kw):
+        # Baseline is fused via save_base_logits (enable_kl=True triggers
+        # the Step 1b fusion attempt, unaffected by this override), so
+        # every call reaching this fake is a CANDIDATE call -- all fail,
+        # non-timeout.
+        fake_tools._last_subprocess_failure = {
+            "kind": "error", "label": "Perplexity calculation",
+        }
+        return None
+
+    def flaky_kl(quant_model_path, base_logits_path, corpus_path, **kw):
+        fake_tools._last_subprocess_failure = {
+            "kind": "error", "label": "KL divergence calculation",
+        }
+        return None
+
+    monkeypatch.setattr(fake_tools, "calculate_perplexity", flaky_perplexity)
+    monkeypatch.setattr(fake_tools, "calculate_kl_divergence", flaky_kl)
+
+    with pytest.raises(RuntimeError, match="zero VALID"):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=2, verbose=False,
+            enable_kl=True,
+        )
+
+    assert orch._measured == {}, (
+        "a non-timeout failure on both legs must leave no trace, matching pre-fix behavior"
+    )
+
+
+def test_round_summary_logged_with_mixed_scored_and_disclosure_entries(tmp_path, monkeypatch):
+    """Q1 (Opus review, 2026-08-10): the round-summary log used to index
+    every self._measured entry's "residual" unconditionally
+    (``abs(m["residual"]) for m in self._measured.values()``) -- a
+    measurement-timeout disclosure entry has no "residual" at all, so a
+    MIXED round (one normally-scored candidate + one-or-more disclosure
+    entries) with verbose=True used to KeyError inside the round-summary
+    log call itself, an untested path (reviewer reverted the filtering
+    fix and the suite stayed green). Captures the log via the established
+    _FakeLog pattern (see its own docstring: structlog's real backing is
+    a bare PrintLogger, invisible to caplog) to confirm the line is both
+    emitted (not silently swallowed by an exception) and correct
+    (mean_abs_residual reflects only the one scored entry's residual).
+    """
+    fake_log = _FakeLog()
+    monkeypatch.setattr(orch_mod, "log", fake_log)
+
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    orch._llama_tools = _MixedTimeoutFakeLlamaTools()
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=True,
+    )
+
+    scored = [
+        info for info in orch._measured.values()
+        if not info.get("measurement_invalid")
+    ]
+    disclosures = [
+        info for info in orch._measured.values()
+        if info.get("measurement_invalid") and info.get("measurement_timeout")
+    ]
+    assert len(scored) == 1, "test setup expects exactly one normally-scored candidate"
+    assert disclosures, "test setup expects at least one timeout disclosure entry"
+
+    round_summary_calls = [
+        (event, kw) for level, event, kw in fake_log.calls if event == "Round summary"
+    ]
+    assert len(round_summary_calls) == 1, "the round-summary log call must not have been skipped/crashed"
+    _, kw = round_summary_calls[0]
+    assert kw["total_measurements"] == len(orch._measured)
+    assert kw["mean_abs_residual"] == pytest.approx(round(abs(scored[0]["residual"]), 4))
+
+
+def test_round_summary_mean_abs_residual_none_when_all_disclosure_entries(tmp_path, monkeypatch):
+    """Q1 sibling: when EVERY entry in a verbose round is a measurement-
+    timeout disclosure (no residuals at all), the round-summary line must
+    still be logged -- not silently suppressed by an ``if residuals:``
+    guard -- with mean_abs_residual=None, so round-level visibility
+    doesn't drop in exactly the failure case this whole fix exists to
+    surface. The run overall still raises the pre-existing zero-VALID-
+    measurements guard (F3) since nothing was actually measured, but the
+    round-summary log line fires (inside the round loop) before that
+    guard is ever reached (after the loop)."""
+    fake_log = _FakeLog()
+    monkeypatch.setattr(orch_mod, "log", fake_log)
+
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    orch._llama_tools = _TimeoutAwareFakeLlamaTools(kl_times_out=True, ppl_times_out=True)
+
+    with pytest.raises(RuntimeError, match="zero VALID"):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=2, verbose=True,
+            enable_kl=True,
+        )
+
+    round_summary_calls = [
+        (event, kw) for level, event, kw in fake_log.calls if event == "Round summary"
+    ]
+    assert len(round_summary_calls) == 1, (
+        "the round-summary line must still fire even when every entry is a disclosure"
+    )
+    _, kw = round_summary_calls[0]
+    assert kw["mean_abs_residual"] is None
+    assert kw["total_measurements"] == len(orch._measured)
+
+
+def test_serialize_measurement_appends_timeout_fields_at_tail_both_sites():
+    v = {
+        "config": {"E": "BF16"}, "ppl": 5.5, "measured_loss": 0.1,
+        "predicted_loss": 0.09, "residual": 0.01, "path": "/tmp/c.gguf",
+        "size_gb": 4.0, "kl": {"mean_kl": 0.02}, "bench": {"pp_tps": 90.0},
+        "incumbent": "Q4", "corpus_path": "/fake/corpus.txt",
+        "measurement_invalid": False,
+        "kl_timeout": True, "measurement_timeout": False, "timeout_leg": None,
+    }
+
+    save_results_entry = MagicQuantOrchestrator._serialize_measurement(v, include_path=False)
+    assert list(save_results_entry.keys()) == [
+        "config", "ppl", "measured_loss", "predicted_loss", "residual",
+        "size_gb", "kl", "bench", "incumbent", "corpus_path",
+        "measurement_invalid", "kl_timeout", "measurement_timeout", "timeout_leg",
+    ]
+    assert save_results_entry["kl_timeout"] is True
+
+    checkpoint_entry = MagicQuantOrchestrator._serialize_measurement(v, include_path=True)
+    assert list(checkpoint_entry.keys()) == [
+        "config", "ppl", "measured_loss", "predicted_loss", "residual",
+        "path", "size_gb", "kl", "bench", "incumbent", "measurement_invalid",
+        "corpus_path", "kl_timeout", "measurement_timeout", "timeout_leg",
+    ]
+    assert checkpoint_entry["kl_timeout"] is True
+
+
+def test_serialize_measurement_timeout_fields_default_when_absent():
+    """A pre-fix entry (no kl_timeout/measurement_timeout/timeout_leg at
+    all) must serialize with the new fields defaulting to falsy/None, not
+    KeyError -- the backward-compatibility guarantee for an OLDER
+    checkpoint/search_results.json resuming under the fixed code."""
+    v = {"config": {"E": "BF16"}, "measured_loss": 0.1, "size_gb": 4.0}
+    entry = MagicQuantOrchestrator._serialize_measurement(v, include_path=False)
+    assert entry["kl_timeout"] is False
+    assert entry["measurement_timeout"] is False
+    assert entry["timeout_leg"] is None
+
+
+def test_timeout_disclosure_fields_survive_checkpoint_round_trip(tmp_path):
+    """kl_timeout/measurement_timeout/timeout_leg must survive a checkpoint
+    write+load round trip -- otherwise a resumed run silently loses the
+    disclosure and re-attempts a candidate already known to time out."""
+    from pathlib import Path
+
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch._search_seed = 42
+    orch.baseline_ppl = 34.8363
+    orch.baseline_provenance = "measured"
+    orch.probing_provenance = "measured"
+    orch.sensitivity_weights = {"E": 0.5}
+    orch._kl_base_logits_path = None
+    orch._kl_corpus_path = None
+    orch.source_model_path = str(tmp_path / "m.gguf")
+    Path(orch.source_model_path).write_bytes(b"g")
+    orch._llama_tools = None
+    orch._llamacpp_path = None
+    orch._imatrix = None
+    orch._measured = {
+        "timed_out": {
+            "config": {"E": "TIMEOUT"},
+            "measurement_invalid": True,
+            "measurement_timeout": True,
+            "timeout_leg": "ppl",
+            "kl_timeout": True,
+        },
+    }
+
+    ckpt_path = tmp_path / "ckpt.json"
+    orch._write_measured_checkpoint(ckpt_path)
+    checkpoint = json.loads(ckpt_path.read_text())
+
+    # Simulate exactly what run_measured_search's resume path does with a
+    # loaded checkpoint (orchestrator.py's `for key, entry in
+    # checkpoint.get("measured", {}).items(): self._measured[key] =
+    # dict(entry)`).
+    orch2 = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch2._measured = {}
+    for key, entry in checkpoint.get("measured", {}).items():
+        orch2._measured[key] = dict(entry)
+
+    resumed = orch2._measured["timed_out"]
+    assert resumed["measurement_timeout"] is True
+    assert resumed["timeout_leg"] == "ppl"
+    assert resumed["kl_timeout"] is True
+    assert resumed["measurement_invalid"] is True
+
+
+def test_pre_fix_checkpoint_without_timeout_fields_resumes_with_defaults(tmp_path):
+    """An OLDER checkpoint written before this fix has no
+    kl_timeout/measurement_timeout/timeout_leg keys at all -- resume must
+    not KeyError, and re-serializing a resumed entry must default the
+    missing fields to falsy/None rather than crashing."""
+    ckpt_path = tmp_path / "ckpt.json"
+    ckpt_path.write_text(json.dumps({
+        "version": 2,
+        "seed": 42,
+        "source_model": {"kind": "gguf", "path": "m.gguf"},
+        "measurement_conditions": {},
+        "baseline_ppl": 34.8363,
+        "baseline_provenance": "measured",
+        "sensitivity_weights": {"E": 0.5},
+        "probing_provenance": "measured",
+        "weights_degenerate": False,
+        "kl": {"enabled": False, "base_logits_path": None, "corpus_path": None},
+        "imatrix": {"active": False, "n_tensors": None},
+        "measured": {
+            "old": {
+                "config": {"E": "OLD"}, "ppl": 5.0, "measured_loss": 0.1,
+                "predicted_loss": 0.09, "residual": 0.01, "size_gb": 4.0,
+                "kl": None, "bench": None, "incumbent": None,
+                "measurement_invalid": False, "corpus_path": "/fake/corpus.txt",
+            },
+        },
+    }))
+    checkpoint = json.loads(ckpt_path.read_text())
+
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch._measured = {}
+    for key, entry in checkpoint.get("measured", {}).items():
+        orch._measured[key] = dict(entry)
+
+    resumed = orch._measured["old"]
+    assert resumed.get("kl_timeout") is None
+    assert resumed.get("measurement_timeout") is None
+    assert resumed.get("timeout_leg") is None
+
+    reserialized = MagicQuantOrchestrator._serialize_measurement(resumed, include_path=True)
+    assert reserialized["kl_timeout"] is False
+    assert reserialized["measurement_timeout"] is False
+    assert reserialized["timeout_leg"] is None
 
 
 def test_save_results_persists_kl_and_bench_fields(tmp_path):
