@@ -1,0 +1,126 @@
+name: Release
+
+# The release decision, version choice, and CHANGELOG cut are Lucas's: he
+# cuts CHANGELOG.md's [Unreleased] section into a dated [X.Y.Z] section
+# (leaving a fresh [Unreleased] above it), bumps pyproject.toml, commits,
+# tags vX.Y.Z, and pushes the tag. This workflow never writes to the repo --
+# it VALIDATES that cut (tools/release_check.py) and mechanizes the rest:
+# build sdist+wheel, publish a GitHub Release with the CHANGELOG section as
+# notes and the built artifacts attached. No PyPI publishing -- that's a
+# separate, out-of-scope decision.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write  # gh release create (and the pre-flight `gh api` check) only
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Derive the release version from the tag
+        # tools/release_check.py takes a bare version so it stays testable
+        # offline with no tag-parsing logic baked into it -- this is the one
+        # line of shell that does the vX.Y.Z -> X.Y.Z strip. Reads the
+        # ACTUAL env var $GITHUB_REF_NAME (set by the runner for every step),
+        # not the ${{ github.ref_name }} expression -- expressions get
+        # textually substituted into the script before the shell ever runs
+        # it, which is unsafe for a value as attacker-influenceable as a tag
+        # name (see the injection note on the two steps below). A real env
+        # var is expanded by the shell instead, which is safe.
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to clobber an existing release
+        # Idempotent-safe by construction: a re-tag (e.g. after a botched
+        # push) is a human problem to untangle, not something CI silently
+        # overwrites. Checked before any install/build/test cost is spent.
+        #
+        # `gh release view` is deliberately NOT used here: it exits 1
+        # identically whether the release is genuinely absent, or the check
+        # itself failed (network blip, DNS hiccup, an expired token) -- so a
+        # transient failure reads as "absent, proceed" and the never-clobber
+        # gate fails OPEN exactly when it matters most. `gh api` on the
+        # tags endpoint lets the three outcomes be told apart: success means
+        # a release exists (fail loudly, do not proceed); HTTP 404 is a real
+        # "does not exist" answer (proceed); anything else is an
+        # inconclusive check and must ALSO fail rather than silently
+        # proceeding as if absent.
+        #
+        # TAG comes from the env: block, not a ${{ }} expression inlined
+        # into the script -- see Q1 note below.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set +e
+          api_output=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$TAG" 2>&1)
+          api_exit=$?
+          set -e
+          if [ "$api_exit" -eq 0 ]; then
+            echo "::error::Release $TAG already exists -- refusing to overwrite it. A re-tag is a human problem to untangle."
+            exit 1
+          elif echo "$api_output" | grep -q "HTTP 404"; then
+            echo "No existing release for $TAG -- proceeding."
+          else
+            echo "::error::Could not confirm whether release $TAG already exists (gh api failed with a non-404 error, which may be transient network/DNS/auth trouble rather than a real absence) -- refusing to proceed. gh api output: $api_output"
+            exit 1
+          fi
+
+      # Quoted deliberately: an unquoted YAML scalar cannot contain ": ".
+      # See ci.yml's own comment on this -- an unquoted step name here broke
+      # CI silently for 61 runs before tests/test_workflow_files_parse.py
+      # existed to catch it.
+      - name: "Install (with dev extras: pytest + gguf + ruff) + build"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          # `build` is deliberately NOT in the dev extra (the dead Makefile
+          # `build` target's removal documented why) -- installed only here,
+          # the one place that needs it.
+          pip install build
+
+      # Q1 note (applies to this step and the two `gh` steps above/below):
+      # a git tag name is attacker-influenceable text (a reviewer
+      # demonstrated shell injection via a tag containing ";cmd;"), and
+      # ${{ }} expressions are substituted into `run:` script text BEFORE
+      # the shell parses it -- so interpolating one directly is a shell
+      # injection vector. Routing the value through `env:` instead makes the
+      # shell receive it as an already-bound variable's VALUE, never as
+      # script text, which is safe regardless of its contents.
+      - name: "Validate the release cut (version match, CHANGELOG section + date, fresh Unreleased above)"
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python tools/release_check.py --version "$VERSION" --notes-out release-notes.md
+
+      - name: "Lint (blocking -- pyflakes only, matches ci.yml's gate)"
+        run: ruff check --select F magicquant/ tools/ tests/
+
+      - name: Run tests
+        # The qat leg stays in ci.yml only -- not duplicated here.
+        run: python -m pytest tests/ -q
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            dist/*
