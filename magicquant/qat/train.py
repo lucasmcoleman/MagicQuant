@@ -910,16 +910,41 @@ def _log_expert_cost(
 
 def _build_training_args(trainer_output_dir: str, rc: _RunConfig, use_bf16: bool, use_fp16: bool):
     """Build run_qat's TrainingArguments (schedule/checkpoint defaults are
-    documented on run_qat itself)."""
+    documented on run_qat itself).
+
+    transformers-5 compat: ``warmup_ratio`` was removed upstream and folded
+    into ``warmup_steps``, which now accepts a float in [0, 1) meaning "ratio
+    of total training steps" -- semantically identical to the old
+    ``warmup_ratio``. Same try/TypeError fallback pattern as
+    ``_from_pretrained``'s dtype= handling: pass the legacy kwarg first (older
+    transformers), retry with the mapped one only when the TypeError names
+    warmup_ratio (any other TypeError propagates untouched).
+    """
     from transformers import TrainingArguments
 
+    try:
+        return _construct_training_args(
+            TrainingArguments, trainer_output_dir, rc, use_bf16, use_fp16,
+            warmup_kwargs={"warmup_ratio": rc.warmup_ratio},
+        )
+    except TypeError as exc:
+        if "warmup_ratio" not in str(exc):
+            raise
+        return _construct_training_args(
+            TrainingArguments, trainer_output_dir, rc, use_bf16, use_fp16,
+            warmup_kwargs={"warmup_steps": float(rc.warmup_ratio)},
+        )
+
+
+def _construct_training_args(TrainingArguments, trainer_output_dir, rc,
+                             use_bf16, use_fp16, *, warmup_kwargs):
     return TrainingArguments(
         output_dir=trainer_output_dir,
         per_device_train_batch_size=1,
         num_train_epochs=rc.epochs,
         max_steps=rc.max_steps,
         learning_rate=rc.lr,
-        warmup_ratio=rc.warmup_ratio,
+        **warmup_kwargs,
         weight_decay=rc.weight_decay,
         max_grad_norm=rc.max_grad_norm,
         lr_scheduler_type=rc.lr_scheduler,

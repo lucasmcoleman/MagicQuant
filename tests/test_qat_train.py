@@ -398,3 +398,55 @@ def test_load_model_falls_back_to_offline_when_all_classes_fail(monkeypatch):
 
     model, tok, src = _load_model_and_tokenizer("some/unloadable")
     assert src == "offline-tiny-llama"
+
+
+class _LegacyTA:
+    """Pre-transformers-5 shape: accepts warmup_ratio."""
+    def __init__(self, **kw):
+        assert "warmup_ratio" in kw and "warmup_steps" not in kw
+        self.kw = kw
+
+
+class _V5TA:
+    """transformers-5 shape: warmup_ratio removed, warmup_steps takes the
+    float ratio (regression for the 2026-08-10 CI breakage: 21 qat tests
+    died on TypeError when latest transformers dropped warmup_ratio)."""
+    def __init__(self, **kw):
+        if "warmup_ratio" in kw:
+            raise TypeError(
+                "TrainingArguments.__init__() got an unexpected keyword "
+                "argument 'warmup_ratio'"
+            )
+        self.kw = kw
+
+
+class _BrokenTA:
+    """Rejects an UNRELATED kwarg -- the shim must not retry on this."""
+    def __init__(self, **kw):
+        raise TypeError(
+            "TrainingArguments.__init__() got an unexpected keyword "
+            "argument 'learning_rate'"
+        )
+
+
+@pytest.mark.parametrize("ta_cls,expect_key,expect_val", [
+    (_LegacyTA, "warmup_ratio", 0.03),
+    (_V5TA, "warmup_steps", 0.03),
+])
+def test_build_training_args_warmup_compat(monkeypatch, ta_cls, expect_key, expect_val):
+    import transformers
+    monkeypatch.setattr(transformers, "TrainingArguments", ta_cls)
+    rc = train_mod._parse_run_cfg({"max_steps": 5})
+    ta = train_mod._build_training_args("/tmp/x", rc, use_bf16=False, use_fp16=False)
+    assert ta.kw[expect_key] == expect_val
+    other = "warmup_steps" if expect_key == "warmup_ratio" else "warmup_ratio"
+    assert other not in ta.kw
+    assert isinstance(ta.kw[expect_key], float)
+
+
+def test_build_training_args_unrelated_typeerror_propagates(monkeypatch):
+    import transformers
+    monkeypatch.setattr(transformers, "TrainingArguments", _BrokenTA)
+    rc = train_mod._parse_run_cfg({"max_steps": 5})
+    with pytest.raises(TypeError, match="learning_rate"):
+        train_mod._build_training_args("/tmp/x", rc, use_bf16=False, use_fp16=False)
