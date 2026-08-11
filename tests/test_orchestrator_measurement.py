@@ -8,14 +8,16 @@ Real EvolutionarySurvivor/PredictiveScorer/SensitivityProber run unmocked
 exercises the actual wiring rather than a hand-rolled stand-in.
 """
 import json
+import struct
 import subprocess
+from pathlib import Path
 
 import pytest
 
 import magicquant.gguf.source as source_mod
 import magicquant.orchestrator as orch_mod
 from magicquant.orchestrator import MagicQuantOrchestrator
-from magicquant.utils.llamacpp import LlamaCppTools
+from magicquant.utils.llamacpp import LlamaBinaryArchError, LlamaCppTools
 
 
 _TENSOR_NAMES = [
@@ -140,6 +142,75 @@ class _MixedTimeoutFakeLlamaTools(_FakeLlamaTools):
             "kind": "timeout", "label": "Perplexity calculation",
         }
         return None
+
+
+def _write_gguf_stub(path, *, arch=None):
+    """Minimal on-disk GGUF: magic + version + 0 tensors + optional
+    general.architecture STRING metadata -- exactly what GGUFReader.open()
+    needs to parse a real header for the fail-fast arch check, without
+    depending on the optional `gguf` package. Mirrors
+    tests/test_llamacpp_arch_check.py's identically-named helper."""
+    def _string(s: str) -> bytes:
+        b = s.encode("utf-8")
+        return struct.pack("<Q", len(b)) + b
+
+    buf = bytearray()
+    buf += struct.pack("<I", 0x46554747)  # "GGUF" magic
+    buf += struct.pack("<I", 3)           # version
+    buf += struct.pack("<Q", 0)           # tensor_count
+    kvs = [("general.architecture", arch)] if arch is not None else []
+    buf += struct.pack("<Q", len(kvs))    # metadata_key_count
+    for k, v in kvs:
+        buf += _string(k)
+        buf += struct.pack("<I", 8)  # GGUF STRING type
+        buf += _string(v)
+    Path(path).write_bytes(bytes(buf))
+
+
+def _make_arch_check_orchestrator(tmp_path, monkeypatch, *, arch="muse-glimmer"):
+    """Like _make_orchestrator, but source_model_path is a REAL tiny GGUF
+    (see _write_gguf_stub) so resolve_source_gguf_arch can read a genuine
+    architecture off it -- the fail-fast arch check reads the source file
+    directly, independent of the monkeypatched open_model_source used for
+    the rest of the search machinery."""
+    monkeypatch.setattr(source_mod, "open_model_source", lambda *a, **k: _FakeSource())
+    src = tmp_path / "m.gguf"
+    _write_gguf_stub(src, arch=arch)
+    orch = MagicQuantOrchestrator(source_model_path=str(src), output_dir=str(tmp_path / "out"))
+
+    fake_tools = _FakeLlamaTools()
+    fake_tools.perplexity_tool = str(tmp_path / "llama-perplexity")
+    Path(fake_tools.perplexity_tool).write_bytes(b"binary bytes, no arch literal here" * 5)
+    orch._llama_tools = fake_tools
+
+    candidates_dir = tmp_path / "candidates"
+    candidates_dir.mkdir()
+    counter = {"n": 0}
+
+    def fake_build_candidate(config, name, base_quant):
+        counter["n"] += 1
+        p = candidates_dir / f"{name}_{counter['n']}.gguf"
+        p.write_bytes(b"0" * 1024)
+        return str(p)
+
+    monkeypatch.setattr(orch, "_build_candidate", fake_build_candidate)
+    return orch, fake_tools
+
+
+def _make_orchestrator_with_mocked_arch(tmp_path, monkeypatch, *, arch="muse-glimmer"):
+    """For arch-check tests that need the run to PROCEED past the check:
+    the standard _make_orchestrator fixture (nonexistent.gguf source, so
+    probing.py's `os.path.isfile(base_model_path)` gate keeps sensitivity
+    probing on its cheap heuristic path -- see _probe_single_group -- the
+    same way every other test in this file relies on), with
+    resolve_source_gguf_arch monkeypatched to report *arch* directly
+    instead of needing a real on-disk GGUF (already covered independently
+    by tests/test_llamacpp_arch_check.py). Keeps the arch-check DOWNSTREAM
+    behavior under test decoupled from GGUFReader parsing and from
+    probing's real-vs-heuristic gate.
+    """
+    monkeypatch.setattr(orch_mod, "resolve_source_gguf_arch", lambda path: arch)
+    return _make_orchestrator(tmp_path, monkeypatch)
 
 
 def _make_orchestrator(tmp_path, monkeypatch):
@@ -1663,3 +1734,210 @@ def test_predictor_tracking_absent_defaults_to_none_in_save_results(tmp_path):
     orch._save_results([], {})
     saved = json.loads((tmp_path / "search_results.json").read_text())
     assert saved["predictor_tracking"] is None
+
+
+# ── Fail-fast llama.cpp arch check (2026-08 multi-build-coexistence fix) ──
+# See magicquant/utils/llamacpp.py's binary_supports_arch / the field
+# incident: a measured search auto-resolved to a llama.cpp build lacking
+# the source model's arch and died at baseline 40+ minutes in with
+# "unknown model architecture". These wire the check into
+# run_measured_search: raise pre-measurement, the escape hatch, the
+# 'supported'/'unknown' verdicts, and the auto-detect warning.
+
+
+def test_arch_check_raises_before_any_measurement(tmp_path, monkeypatch):
+    orch, fake_tools = _make_arch_check_orchestrator(tmp_path, monkeypatch)
+
+    with pytest.raises(LlamaBinaryArchError, match="muse-glimmer"):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=2, verbose=False,
+        )
+
+    assert fake_tools.perplexity_calls == [], (
+        "the resolved binary provably lacks the arch -- no llama-perplexity "
+        "call (baseline or otherwise) may have happened before the raise"
+    )
+
+
+def test_arch_check_error_names_binary_and_hint(tmp_path, monkeypatch):
+    orch, fake_tools = _make_arch_check_orchestrator(tmp_path, monkeypatch)
+
+    with pytest.raises(LlamaBinaryArchError) as excinfo:
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=2, verbose=False,
+        )
+
+    message = str(excinfo.value)
+    assert fake_tools.perplexity_tool in message
+    assert "muse-glimmer" in message
+    assert "llamacpp_path" in message
+    assert "MAGICQUANT_SKIP_ARCH_CHECK" in message
+
+
+def test_arch_check_passes_when_literal_present(tmp_path, monkeypatch):
+    orch, fake_tools = _make_orchestrator_with_mocked_arch(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = str(tmp_path / "llama-perplexity")
+    Path(fake_tools.perplexity_tool).write_bytes(b"pad" + b"muse-glimmer" + b"pad")
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+    )
+
+    assert orch._llamacpp_arch_check == "supported"
+    assert fake_tools.perplexity_calls, "run should have proceeded to real measurement"
+
+
+def test_arch_check_escape_hatch_sanity_raises_without_env(tmp_path, monkeypatch):
+    """Differential half of the escape-hatch proof below: this EXACT setup
+    (determinable arch + a binary proven to lack the literal) must raise
+    without the env var, so the paired test's "does not raise" result
+    actually demonstrates the hatch did something -- not that the arch was
+    undeterminable regardless (the vacuousness Opus review caught in the
+    pre-fix version of that test). Same construction
+    (_make_orchestrator_with_mocked_arch) as the paired test below, so the
+    two are a true apples-to-apples differential, not just two similar-
+    looking setups."""
+    orch, fake_tools = _make_orchestrator_with_mocked_arch(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = str(tmp_path / "llama-perplexity")
+    Path(fake_tools.perplexity_tool).write_bytes(b"no arch literal here at all" * 5)
+
+    with pytest.raises(LlamaBinaryArchError):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=2, verbose=False,
+        )
+
+
+def test_arch_check_escape_hatch_skips(tmp_path, monkeypatch):
+    """Opus review: the original version of this test used the standard
+    "nonexistent.gguf" _make_orchestrator fixture, whose arch is
+    undeterminable ('skipped') REGARDLESS of the env var -- reviewer broke
+    the hatch (made the env check a no-op) and this test still passed,
+    because the final verdict was 'skipped' for an unrelated reason either
+    way. Rebuilt like the v2 escape-hatch test: a determinable arch plus a
+    literal-less binary -- the sanity test above proves this exact shape
+    raises WITHOUT the env var, so "does not raise WITH the env var" here
+    is actually attributable to the hatch, not to the arch being
+    undeterminable regardless. Uses
+    _make_orchestrator_with_mocked_arch rather than
+    _make_arch_check_orchestrator (real on-disk GGUF) specifically because
+    THIS test needs the run to proceed PAST the check into real
+    measurement -- a real GGUF at source_model_path would flip probing.py's
+    os.path.isfile gate into the real-probe path, which the file's fake
+    source double doesn't support (see that helper's docstring)."""
+    fake_log = _FakeLog()
+    monkeypatch.setattr(orch_mod, "log", fake_log)
+    orch, fake_tools = _make_orchestrator_with_mocked_arch(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = str(tmp_path / "llama-perplexity")
+    Path(fake_tools.perplexity_tool).write_bytes(b"no arch literal here at all" * 5)
+    monkeypatch.setenv("MAGICQUANT_SKIP_ARCH_CHECK", "1")
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+    )
+
+    assert orch._llamacpp_arch_check == "skipped"
+    assert fake_tools.perplexity_calls, "escape hatch must let the run proceed"
+    skip_warnings = [
+        (event, kw) for level, event, kw in fake_log.calls
+        if level == "warning" and "SKIP_ARCH_CHECK" in event
+    ]
+    assert skip_warnings, "the escape hatch must be logged, not silent"
+
+
+def test_arch_check_unknown_when_tool_path_unresolvable(tmp_path, monkeypatch):
+    """The source arch IS determinable, but the (fake) tools object has no
+    resolvable perplexity_tool path at all -- undeterminable, not a
+    negative verdict, so the run proceeds with 'unknown'."""
+    orch, fake_tools = _make_orchestrator_with_mocked_arch(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = str(tmp_path / "does" / "not" / "exist")
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+    )
+
+    assert orch._llamacpp_arch_check == "unknown"
+    assert fake_tools.perplexity_calls, "an undeterminable verdict must not block the run"
+
+
+def test_arch_check_skipped_when_source_is_not_a_readable_gguf(tmp_path, monkeypatch):
+    """The overwhelming majority of this file's other tests use a
+    "nonexistent.gguf" source path -- this pins that the arch check
+    degrades to 'skipped' (never raises, never blocks) for exactly that
+    shape, which is what keeps every pre-existing orchestrator test in
+    this file passing unmodified."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = str(tmp_path / "llama-perplexity")
+    Path(fake_tools.perplexity_tool).write_bytes(b"irrelevant binary bytes")
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+    )
+
+    assert orch._llamacpp_arch_check == "skipped"
+
+
+def test_resolved_tools_logged_at_measured_search_start(tmp_path, monkeypatch):
+    fake_log = _FakeLog()
+    monkeypatch.setattr(orch_mod, "log", fake_log)
+    orch, fake_tools = _make_orchestrator_with_mocked_arch(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = str(tmp_path / "llama-perplexity")
+    Path(fake_tools.perplexity_tool).write_bytes(b"pad" + b"muse-glimmer" + b"pad")
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+    )
+
+    resolved_calls = [
+        (event, kw) for level, event, kw in fake_log.calls
+        if event == "Resolved llama.cpp tools"
+    ]
+    assert len(resolved_calls) == 1
+    _, kw = resolved_calls[0]
+    assert kw["perplexity_tool"] == fake_tools.perplexity_tool
+    assert kw["arch_check"] == "supported"
+
+
+def test_auto_detect_warning_fires_for_measured_auto(tmp_path, monkeypatch):
+    """_llamacpp_path=None (the default -- LlamaCppTools auto-detects) must
+    log a warning naming the resolved path when a MEASURED search starts."""
+    fake_log = _FakeLog()
+    monkeypatch.setattr(orch_mod, "log", fake_log)
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    assert orch._llamacpp_path is None  # sanity: this IS the auto-detect case
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+    )
+
+    warnings = [
+        (event, kw) for level, event, kw in fake_log.calls
+        if level == "warning" and "not pinned" in event
+    ]
+    assert warnings, "auto-detected llamacpp_path must warn on a measured run"
+
+
+def test_auto_detect_warning_does_not_fire_when_llamacpp_path_pinned(tmp_path, monkeypatch):
+    fake_log = _FakeLog()
+    monkeypatch.setattr(orch_mod, "log", fake_log)
+    orch, _ = _make_orchestrator(tmp_path, monkeypatch)
+    orch._llamacpp_path = "/pinned/llamacpp/build"  # simulate an explicit pin
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+    )
+
+    warnings = [
+        (event, kw) for level, event, kw in fake_log.calls
+        if level == "warning" and "not pinned" in event
+    ]
+    assert not warnings, "a pinned llamacpp_path must not trigger the auto-detect warning"

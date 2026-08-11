@@ -75,6 +75,261 @@ def _find_tool_in_dirs(possible_names: List[str], search_dirs: List[Path]) -> Op
     return None
 
 
+# ---------------------------------------------------------------------------
+# Fail-fast arch support check (2026-08 multi-build-coexistence field fix)
+#
+# Multiple llama.cpp builds can coexist on one box (a stock-current build
+# that knows a new arch; a pinned older build and a fork that don't), and
+# LlamaCppTools' resolution inputs (hint / MAGICQUANT env / PATH) can vary
+# across submission paths -- a measured search once auto-resolved to a
+# build lacking the source model's arch and died at baseline 40+ minutes
+# in with llama.cpp's own "unknown model architecture", burning the whole
+# run's compute for zero measurements. The functions below let a caller
+# catch that at t+0, before any subprocess runs, instead.
+# ---------------------------------------------------------------------------
+
+
+class LlamaBinaryArchError(RuntimeError):
+    """The resolved llama.cpp binary's libllama does not contain the GGUF
+    architecture literal the source model requires -- it provably cannot
+    load this model. Raised by the fail-fast arch check
+    (``binary_supports_arch`` + the wiring in
+    ``MagicQuantOrchestrator.run_measured_search`` /
+    ``magicquant.v2.search.run_budget_search``) BEFORE any measurement
+    subprocess runs.
+    """
+
+
+# The probed binaries/libraries are 5-80MB; read in fixed-size chunks so a
+# scan never has to hold a whole one in memory at once. *carry* (the tail of
+# the previous chunk, sized len(literal)-1) is prepended to each new chunk
+# so a literal that straddles a chunk boundary is still found.
+_ARCH_SCAN_CHUNK_BYTES = 4 * 1024 * 1024  # 4 MiB
+
+# Directories (relative to the resolved binary's own directory; "" means
+# that directory itself) and filename globs searched for a sibling
+# libllama. Extended (Opus review) beyond "same dir as the binary" to also
+# cover a standard install-prefix layout (<prefix>/bin/llama-perplexity +
+# <prefix>/lib/libllama.so or .../lib64/...) and Windows shared-library
+# names -- the original same-dir-only search returned a guaranteed-wrong
+# False (not even None) for a real install-prefix layout, since it fell
+# through to scanning the (dynamically-linked, arch-table-free) binary
+# itself and found nothing.
+_LIBLLAMA_SEARCH_DIRS = ("", "../lib", "../lib64")
+_LIBLLAMA_NAME_GLOBS = ("libllama.so*", "libllama.dll", "llama.dll")
+
+# The DT_NEEDED entry (e.g. "libllama.so", "libllama.so.1") that every
+# dynamically-linked llama-perplexity binary observed in the field carries
+# as plain bytes in its dynamic section -- present in all three real
+# binaries checked during review, absent from a true static build (which
+# instead carries the arch literals directly). Used ONLY to decide whether
+# a negative binary-only scan is a real negative (static build) or
+# uninformative (dynamic build whose real arch table lives in an
+# unreachable libllama.so) -- see binary_supports_arch.
+_DYNAMIC_LINK_MARKER = b"libllama"
+
+
+def _scan_file_for_literal(path: Path, literal: bytes, chunk_size: int) -> bool:
+    """True iff *literal* occurs anywhere in the file at *path*."""
+    overlap = max(len(literal) - 1, 0)
+    with open(path, "rb") as f:
+        carry = b""
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                return False
+            haystack = carry + chunk
+            if literal in haystack:
+                return True
+            carry = haystack[-overlap:] if overlap else b""
+
+
+def _library_candidates(tool_path: Path) -> List[Path]:
+    """Every libllama-shaped file that might sit alongside *tool_path*'s
+    llama-perplexity binary, across the layouts actually seen in the field:
+    the binary's own directory (a common CMake build/bin/ layout), or a
+    sibling ``../lib``/``../lib64`` (a standard install-prefix layout).
+    Windows names are matched the same way. Existing files only, in a
+    fixed (dir, name-glob) order for reproducibility -- every match found
+    gets scanned (see binary_supports_arch's OR semantics), so this order
+    affects only which match is scanned first, never the final verdict.
+    """
+    tool_dir = tool_path.parent
+    found: List[Path] = []
+    for rel_dir in _LIBLLAMA_SEARCH_DIRS:
+        d = (tool_dir / rel_dir) if rel_dir else tool_dir
+        if not d.is_dir():
+            continue
+        for name_glob in _LIBLLAMA_NAME_GLOBS:
+            found.extend(sorted(d.glob(name_glob)))
+    return found
+
+
+def binary_supports_arch(
+    perplexity_tool: Optional[str],
+    arch: Optional[str],
+    *,
+    chunk_size: int = _ARCH_SCAN_CHUNK_BYTES,
+) -> Optional[bool]:
+    """Does *perplexity_tool*'s build support the GGUF architecture *arch*?
+
+    Ground-truth probe: GGUF architecture names are string literals baked
+    into libllama.so (or a statically-linked binary) -- llama.cpp
+    dispatches model loading by looking up ``general.architecture`` against
+    a compiled-in table, so a build that never registered an arch cannot
+    contain its literal. This scans file BYTES for that literal WITHOUT
+    loading any model and WITHOUT shelling out to ``strings`` (``strings
+    <lib> | grep -c '<arch>'`` is the established equivalent; this
+    reimplements it in pure Python for determinism/portability).
+
+    Necessary, NOT sufficient, in TWO directions: a build that never
+    registered an arch cannot contain its literal (this is what makes a
+    real ``False`` trustworthy), but presence of the literal does not by
+    itself guarantee full support. The likelier of the two ways presence
+    can mislead is a substring false-positive: a build supporting only
+    ``qwen3moe`` answers True for a scan of ``qwen3``, since the shorter
+    name is a literal substring of the longer one -- a plain byte scan
+    cannot tell "the arch table has this exact entry" from "the arch table
+    has an entry that happens to contain these bytes". A stub/partial
+    registration (the literal present but the dispatch incomplete) is the
+    other, less likely, direction.
+
+    Scans candidate sibling libraries (see ``_library_candidates`` -- same
+    directory as the binary, or a sibling ``../lib``/``../lib64``, covering
+    both a CMake build/bin/ layout and a standard install-prefix layout)
+    AND the binary itself, OR-ing every scan together: a True from ANY
+    candidate wins immediately. This is not just belt-and-suspenders --
+    verified to also catch, for free, a stale/mismatched library sitting
+    beside a STATIC binary that itself carries the current literal (the
+    library-only scan would say False; the binary scan says True; the OR
+    is correct). If nothing comes back True, a real ``False`` requires that
+    at least one candidate was actually scanned successfully AND, when the
+    only informative scan was of the binary itself, that the binary does
+    NOT look dynamically linked against libllama (see
+    ``_DYNAMIC_LINK_MARKER``) -- a dynamically-linked binary's own bytes
+    never carry the arch table at all (it lives in the unreachable
+    libllama.so), so a negative scan of ONLY the binary is uninformative,
+    not a negative, and must return ``None`` rather than a guaranteed-wrong
+    ``False``.
+
+    Args:
+        perplexity_tool: Path to the resolved llama-perplexity binary, or
+            None/empty (returns None -- nothing resolvable to scan).
+        arch: The GGUF ``general.architecture`` value to look for, or
+            None/empty (returns None -- an empty needle would otherwise
+            vacuously match, which must never look like "supported").
+        chunk_size: Read chunk size in bytes (default 4 MiB). Exposed so
+            tests can force a small chunk size to exercise the
+            straddling-a-chunk-boundary case deterministically.
+
+    Returns:
+        True: some candidate (library or binary) contains the literal --
+            the build supports this arch.
+        False: at least one candidate was scanned and definitively
+            answered the question (a library, or a binary that does not
+            look dynamically linked) and none of them had the literal --
+            the build provably does not support this arch.
+        None: undeterminable -- nothing could be located/read at all, or
+            the only informative-looking candidate was a dynamically-linked
+            binary with no reachable library. Callers must treat this as
+            "proceed, unverified", never as a negative result.
+    """
+    if not perplexity_tool:
+        return None
+    if not arch:
+        _log.debug(
+            "binary_supports_arch: empty/missing arch literal -- "
+            "undeterminable (never a vacuous True)"
+        )
+        return None
+
+    tool_path = Path(perplexity_tool)
+    needle = arch.encode("utf-8")
+
+    # 1. Every candidate sibling library. A True from ANY of them settles
+    #    the question immediately.
+    library_scanned = False
+    for lib_path in _library_candidates(tool_path):
+        try:
+            found = _scan_file_for_literal(lib_path, needle, chunk_size)
+        except OSError:
+            continue
+        library_scanned = True
+        if found:
+            return True
+
+    # 2. Also scan the binary itself (OR, not "only if no library was
+    #    found") -- catches a static build (the binary IS the arch table)
+    #    and the stale-library-beside-a-static-binary case described above.
+    binary_negative = False
+    if tool_path.is_file():
+        try:
+            if _scan_file_for_literal(tool_path, needle, chunk_size):
+                return True
+            binary_negative = True
+        except OSError:
+            pass
+
+    # 3. Nothing came back True -- decide a real False vs undeterminable.
+    if library_scanned:
+        # A definitive negative straight from the build's real arch table
+        # (a library) stands regardless of what the separate binary scan
+        # said (which may be uninformative if dynamically linked).
+        return False
+    if binary_negative:
+        # No library was found/scanned at all -- the binary's own "not
+        # found" is only a real negative if the binary IS the arch table,
+        # i.e. it does NOT look dynamically linked against libllama.
+        try:
+            dynamically_linked = _scan_file_for_literal(
+                tool_path, _DYNAMIC_LINK_MARKER, chunk_size
+            )
+        except OSError:
+            dynamically_linked = False
+        if dynamically_linked:
+            _log.debug(
+                "binary_supports_arch: %s looks dynamically linked against "
+                "libllama and no sibling library was found/readable -- "
+                "undeterminable, not a negative", tool_path,
+            )
+            return None
+        return False
+    return None
+
+
+def resolve_source_gguf_arch(source_model_path: str) -> Optional[str]:
+    """Best-effort, header-only read of *source_model_path*'s GGUF
+    ``general.architecture`` metadata, for the fail-fast arch check.
+
+    Returns None -- meaning "the caller should skip the check entirely" --
+    whenever the path isn't a readable GGUF with an architecture key: a
+    safetensors source (file or directory), a directory, a corrupt/stub
+    file (as several unit-test fixtures deliberately write), or any other
+    parse failure. Uses ``magicquant.gguf.reader.GGUFReader``, which stops
+    after the metadata + tensor-info header and never touches tensor data
+    -- milliseconds even for a multi-GB file.
+    """
+    from magicquant.gguf.reader import GGUFReader
+
+    try:
+        reader = GGUFReader(source_model_path)
+        reader.open()
+        arch = reader.get_model_architecture()
+    except Exception as exc:
+        _log.debug(
+            "arch pre-check: %s is not a readable GGUF (%s) -- skipping",
+            source_model_path, exc,
+        )
+        return None
+    if arch == "unknown":
+        _log.debug(
+            "arch pre-check: %s has no general.architecture metadata -- "
+            "skipping", source_model_path,
+        )
+        return None
+    return arch
+
+
 class LlamaCppTools:
     """Interface to llama.cpp quantization tools."""
 
@@ -206,6 +461,10 @@ class LlamaCppTools:
 
         for p in common_paths:
             if p.exists():
+                _log.debug(
+                    "_find_llamacpp: resolved to %s (first common install "
+                    "path that exists, of %s)", p, common_paths,
+                )
                 return str(p)
 
         # Try to find in PATH
@@ -218,7 +477,13 @@ class LlamaCppTools:
                 check=True,
                 timeout=30,
             )
-            return str(Path(result.stdout.strip()).parent)
+            resolved = str(Path(result.stdout.strip()).parent)
+            _log.debug(
+                "_find_llamacpp: resolved to %s (none of the common install "
+                "paths existed; fell back to `%s llama-quantize` on PATH)",
+                resolved, which_cmd,
+            )
+            return resolved
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             raise FileNotFoundError(
                 "Could not find llama.cpp. Please install or provide path."

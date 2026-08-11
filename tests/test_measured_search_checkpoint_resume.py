@@ -733,3 +733,188 @@ def test_old_style_checkpoint_without_kl_keys_rejected_under_kl_blended_run(
     # checkpoint's bogus measurement was never restored.
     assert orch2.baseline_ppl == 5.0
     assert "fake:key" not in orch2._measured
+
+
+# ── Fail-fast llama.cpp arch check: instrument persistence + checkpoint ──
+# ── compat (2026-08 multi-build-coexistence fix) ──────────────────────────
+# See magicquant/utils/llamacpp.py's binary_supports_arch. The resolved
+# perplexity-tool path and arch-check verdict are persisted (additively, at
+# the tail) into BOTH search_results.json and the measured checkpoint; a
+# checkpoint missing "llamacpp_binary" (written before this fix) is legacy-
+# compatible, but a PRESENT-and-different one is a real measurement-
+# instrument change and must force a fresh run, same as any other
+# measurement-condition mismatch.
+
+
+def test_results_json_has_llamacpp_binary_and_arch_check_keys(tmp_path, monkeypatch):
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = "/fake/llama-perplexity"
+
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False,
+    )
+
+    results = json.loads((orch.output_dir / "search_results.json").read_text())
+    assert results["llamacpp_binary"] == "/fake/llama-perplexity"
+    assert results["llamacpp_arch_check"] in ("supported", "unknown", "skipped")
+    # Additive, tail-appended -- same key-order contract as
+    # _serialize_measurement's per-measurement fields.
+    assert list(results.keys())[-2:] == ["llamacpp_binary", "llamacpp_arch_check"]
+
+
+def test_checkpoint_has_llamacpp_binary_and_arch_check_keys(tmp_path, monkeypatch):
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = "/fake/llama-perplexity"
+    fake_tools._kill_after = 1
+
+    with pytest.raises(RuntimeError, match="simulated kill"):
+        orch.run_measured_search(
+            search_generations=2, population_size=8,
+            measurement_rounds=1, candidates_per_round=5, verbose=False,
+            seed_incumbents=False, seed=3,
+        )
+
+    checkpoint = json.loads(_checkpoint_path(orch).read_text())
+    assert checkpoint["llamacpp_binary"] == "/fake/llama-perplexity"
+    assert checkpoint["llamacpp_arch_check"] in ("supported", "unknown", "skipped")
+    assert list(checkpoint.keys())[-2:] == ["llamacpp_binary", "llamacpp_arch_check"]
+
+
+def _base_fake_checkpoint(orch):
+    """Minimal well-formed checkpoint dict matching orch's own identity/
+    conditions -- deliberately WITHOUT an "llamacpp_binary" key, i.e. the
+    legacy (pre-this-fix) shape. Callers add "llamacpp_binary" themselves
+    to test the present-and-matching / present-and-different cases."""
+    return {
+        "version": 2,
+        "seed": None,
+        "source_model": orch._source_identity(),
+        "measurement_conditions": orch._current_measurement_conditions(),
+        "baseline_ppl": 1.23,
+        "baseline_provenance": "measured",
+        "sensitivity_weights": {},
+        "probing_provenance": "measured",
+        "kl": {"enabled": False, "base_logits_path": None, "corpus_path": None},
+        "imatrix": {"active": False, "n_tensors": None},
+        "measured": {},
+    }
+
+
+def test_load_matching_checkpoint_accepts_missing_llamacpp_binary_key(tmp_path, monkeypatch):
+    """A checkpoint written before this fix has no llamacpp_binary key at
+    all -- must still be treated as compatible (legacy)."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = "/build-A/llama-perplexity"
+    checkpoint = _base_fake_checkpoint(orch)
+    assert "llamacpp_binary" not in checkpoint  # sanity: this IS the legacy shape
+    path = _checkpoint_path(orch)
+    path.write_text(json.dumps(checkpoint))
+
+    assert orch._load_matching_checkpoint(path, verbose=False) is not None
+
+
+def test_load_matching_checkpoint_accepts_matching_llamacpp_binary(tmp_path, monkeypatch):
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = "/build-A/llama-perplexity"
+    checkpoint = _base_fake_checkpoint(orch)
+    checkpoint["llamacpp_binary"] = "/build-A/llama-perplexity"
+    path = _checkpoint_path(orch)
+    path.write_text(json.dumps(checkpoint))
+
+    assert orch._load_matching_checkpoint(path, verbose=False) is not None
+
+
+def test_load_matching_checkpoint_rejects_present_different_llamacpp_binary(tmp_path, monkeypatch):
+    """Different instrument = different measurements: a checkpoint recorded
+    under a DIFFERENT llama.cpp binary must not resume, even though every
+    other condition (chunks/ctx_size/corpus/seed/source) matches."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = "/build-A/llama-perplexity"
+    checkpoint = _base_fake_checkpoint(orch)
+    checkpoint["llamacpp_binary"] = "/build-B/llama-perplexity"
+    path = _checkpoint_path(orch)
+    path.write_text(json.dumps(checkpoint))
+
+    assert orch._load_matching_checkpoint(path, verbose=False) is None
+
+
+def test_load_matching_checkpoint_accepts_symlink_spelling_of_same_llamacpp_binary(
+    tmp_path, monkeypatch
+):
+    """Opus review: the comparison must go through os.path.realpath() on
+    BOTH sides so a relative-vs-absolute or symlinked spelling of the SAME
+    binary doesn't spuriously reject a valid checkpoint -- that would throw
+    away exactly the hours the checkpoint protects. A real symlink here
+    (not just string normalization) proves actual filesystem resolution,
+    not merely path-string cleanup."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+
+    real_bin_dir = tmp_path / "real_build" / "bin"
+    real_bin_dir.mkdir(parents=True)
+    real_bin = real_bin_dir / "llama-perplexity"
+    real_bin.write_bytes(b"fake binary bytes")
+
+    link_dir = tmp_path / "pinned_link"
+    link_dir.symlink_to(real_bin_dir, target_is_directory=True)
+    linked_bin = link_dir / "llama-perplexity"
+
+    # The checkpoint recorded the SYMLINK spelling; this run resolves the
+    # REAL path -- same binary, different spelling.
+    fake_tools.perplexity_tool = str(real_bin)
+    checkpoint = _base_fake_checkpoint(orch)
+    checkpoint["llamacpp_binary"] = str(linked_bin)
+    path = _checkpoint_path(orch)
+    path.write_text(json.dumps(checkpoint))
+
+    assert orch._load_matching_checkpoint(path, verbose=False) is not None
+
+
+def test_load_matching_checkpoint_rejects_stored_binary_when_current_is_unresolvable(
+    tmp_path, monkeypatch
+):
+    """current_binary=None (no resolvable perplexity_tool at all this run)
+    is DELIBERATELY still a mismatch against a stored path -- this run
+    can't confirm it's even using a binary, let alone the same one."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    assert not hasattr(fake_tools, "perplexity_tool")  # sanity: unresolvable
+    checkpoint = _base_fake_checkpoint(orch)
+    checkpoint["llamacpp_binary"] = "/build-A/llama-perplexity"
+    path = _checkpoint_path(orch)
+    path.write_text(json.dumps(checkpoint))
+
+    assert orch._load_matching_checkpoint(path, verbose=False) is None
+
+
+def test_mismatched_llamacpp_binary_forces_fresh_measured_search(tmp_path, monkeypatch):
+    """Integration-level companion to the direct _load_matching_checkpoint
+    tests above: end to end through run_measured_search, a checkpoint
+    recorded under a different llama.cpp binary must not silently resurrect
+    a stale measurement, and the baseline gets remeasured for real."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools.perplexity_tool = "/build-A/llama-perplexity"
+    orch.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False, seed=9,
+    )
+    # Successful run deleted its own checkpoint -- rebuild one recorded
+    # under a DIFFERENT llama.cpp binary (e.g. a later run submission
+    # resolving to the fork build instead of the pinned one).
+    checkpoint = _base_fake_checkpoint(orch)
+    checkpoint["seed"] = 9
+    checkpoint["measured"] = {"fake:key": {"config": {"E": "BF16"}, "ppl": 1.0}}
+    checkpoint["llamacpp_binary"] = "/build-B/llama-perplexity"
+    _checkpoint_path(orch).write_text(json.dumps(checkpoint))
+
+    orch2, fake_tools2 = _make_orchestrator(tmp_path, monkeypatch)
+    fake_tools2.perplexity_tool = "/build-A/llama-perplexity"  # differs from stored build-B
+    orch2.run_measured_search(
+        search_generations=2, population_size=8,
+        measurement_rounds=1, candidates_per_round=2, verbose=False,
+        seed_incumbents=False, seed=9,
+    )
+
+    assert orch2.baseline_ppl == 5.0
+    assert "fake:key" not in orch2._measured

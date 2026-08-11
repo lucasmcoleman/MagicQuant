@@ -493,6 +493,70 @@ def _assemble_results(
     return results
 
 
+def _check_arch_support(source_model_path: str, perplexity_tool: Optional[str]) -> None:
+    """Fail-fast pre-measurement check (t+0, before any real measurement
+    subprocess runs): does the resolved perplexity tool's libllama actually
+    contain the source model's GGUF architecture literal? Mirrors
+    ``MagicQuantOrchestrator._run_arch_support_check`` -- see
+    ``utils.llamacpp.binary_supports_arch`` for the ground-truth probe and
+    the field incident this fixes (multiple llama.cpp builds coexisting on
+    one box; a measured search auto-resolved to a build lacking the arch
+    and died at baseline 40+ minutes in with "unknown model architecture").
+
+    Only applies when the source is a readable GGUF with an architecture
+    key (``resolve_source_gguf_arch`` returns None -- skip, debug-logged --
+    for a safetensors source or any source it can't parse). Escape hatch:
+    ``MAGICQUANT_SKIP_ARCH_CHECK=1`` skips with a logged warning.
+
+    Raises ``LlamaBinaryArchError`` when the literal is PROVABLY absent.
+
+    Deliberately does NOT persist a llamacpp_binary/llamacpp_arch_check
+    verdict into v2_results.json the way run_measured_search persists into
+    search_results.json/the checkpoint -- tests/test_v2_search_
+    characterization.py::test_happy_path_results_json_shape_and_values pins
+    the EXACT top-level key set of that file, so adding keys here is a
+    deliberate scope decision (v1's checkpoint-resume machinery, which is
+    what the persisted verdict feeds, has no v2 analog), not an oversight.
+    """
+    from magicquant.utils.llamacpp import (
+        LlamaBinaryArchError,
+        binary_supports_arch,
+        resolve_source_gguf_arch,
+    )
+
+    if os.environ.get("MAGICQUANT_SKIP_ARCH_CHECK") == "1":
+        log.warning(
+            "MAGICQUANT_SKIP_ARCH_CHECK=1 -- skipping the pre-measurement "
+            "llama.cpp architecture check", stage="init",
+        )
+        return
+
+    arch = resolve_source_gguf_arch(source_model_path)
+    if arch is None:
+        return
+
+    # binary_supports_arch itself guards a missing/empty perplexity_tool
+    # (returns None) -- no need to short-circuit here.
+    verdict = binary_supports_arch(perplexity_tool, arch)
+    if verdict is False:
+        raise LlamaBinaryArchError(
+            f"The resolved llama.cpp binary ({perplexity_tool!r}) does not "
+            f"contain the GGUF architecture literal {arch!r} -- it cannot "
+            "load this model. This is a PRE-MEASUREMENT check (runs before "
+            "any llama-perplexity subprocess); catching it now, at t+0, "
+            "just saved a v2 budget search from dying at baseline with "
+            "llama.cpp's own 'unknown model architecture' error. Point "
+            "llamacpp_path (or the MAGICQUANT_LLAMACPP_PATH env var) at a "
+            f"llama.cpp build that supports {arch!r}, or set "
+            "MAGICQUANT_SKIP_ARCH_CHECK=1 to bypass this check."
+        )
+    if verdict is None:
+        log.debug(
+            "arch pre-check: could not verify -- proceeding unverified",
+            stage="init", perplexity_tool=perplexity_tool, arch=arch,
+        )
+
+
 def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
     """Execute the v2 pipeline end to end. Returns the results dict (also
     written to ``<output_dir>/v2_results.json``)."""
@@ -512,6 +576,10 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
     tools = LlamaCppTools(cfg.llamacpp_path, data_file=cfg.data_file)
     if cfg.measurement_chunks is not None:
         tools.ppl_chunks = cfg.measurement_chunks
+
+    # Fail-fast arch check, before any real measurement (baseline PPL is
+    # next) -- see _check_arch_support's docstring.
+    _check_arch_support(cfg.source_model_path, getattr(tools, "perplexity_tool", None))
 
     baseline_ppl = _measure_baseline(tools, cfg)
     imatrix, schemes = _resolve_imatrix_and_schemes(tools, cfg)
