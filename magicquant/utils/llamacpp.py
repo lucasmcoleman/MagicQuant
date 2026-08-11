@@ -275,6 +275,11 @@ def binary_supports_arch(
         # A definitive negative straight from the build's real arch table
         # (a library) stands regardless of what the separate binary scan
         # said (which may be uninformative if dynamically linked).
+        # Assumes a discovered candidate library is the one the binary
+        # actually loads; a stale decoy in ../lib (binary resolving its
+        # real lib via RPATH/LD_LIBRARY_PATH) can still produce a wrong
+        # False -- the MAGICQUANT_SKIP_ARCH_CHECK escape hatch covers
+        # that residual.
         return False
     if binary_negative:
         # No library was found/scanned at all -- the binary's own "not
