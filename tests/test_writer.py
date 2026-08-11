@@ -264,3 +264,56 @@ def test_bf16_group_written_as_f16_with_warning(tmp_path, caplog):
         reader.close()
     assert any("BF16" in rec.message and "F16" in rec.message
                for rec in caplog.records), "expected a one-time BF16->F16 warning"
+
+
+def test_split_kv_keys_dropped_from_copied_metadata(tmp_path):
+    """Regression (2026-08-10 Muse-Glimmer incident): a source GGUF carrying
+    llama.cpp gguf-split keys (split.no/split.count u16, split.tensors.count
+    i32 -- e.g. any file produced by `llama-gguf-split --merge`) must NOT have
+    them copied into the writer's output. GGUFReader flattens KVs to plain
+    ints, _write_metadata_value re-types them u32, and llama.cpp's loader
+    strictly type-checks split.count as u16 -- so a copied key makes every
+    probe/candidate/tier artifact unloadable ("key split.count has wrong type
+    u32 but expected type u16"). The writer emits exactly one file, so per
+    llama.cpp convention the keys must be absent entirely. Other copied KVs
+    must survive the filter."""
+    src = StubSource(
+        [
+            _f32_tensor("token_embd.weight", (256, 256)),
+            _f32_tensor("blk.0.attn_q.weight", (256, 256)),
+            _f32_tensor("output.weight", (256, 256)),
+        ],
+        metadata={
+            "general.architecture": "llama",
+            "general.name": "split-fixture",
+            "split.no": 0,
+            "split.count": 0,
+            "split.tensors.count": 731,
+        },
+    )
+    out = str(tmp_path / "out.gguf")
+    import magicquant.gguf.source as source_mod
+    orig = source_mod.open_model_source
+    source_mod.open_model_source = lambda *a, **k: src
+    try:
+        create_hybrid_gguf(
+            output_path=out,
+            base_model_path="ignored",
+            quant_config={"base": "Q8_0", "groups": {}},
+            verbose=False,
+        )
+    finally:
+        source_mod.open_model_source = orig
+
+    from magicquant.gguf.reader import GGUFReader
+    r = GGUFReader(out)
+    r.open()
+    try:
+        meta = r.get_metadata()
+        split_keys = {k for k in meta if k.startswith("split.")}
+        assert split_keys == set(), f"split keys leaked into output: {split_keys}"
+        # The filter must be surgical: sibling copied KVs survive.
+        assert meta.get("general.name") == "split-fixture"
+        assert meta.get("general.architecture") == "llama"
+    finally:
+        r.close()

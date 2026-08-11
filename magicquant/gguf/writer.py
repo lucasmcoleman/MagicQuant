@@ -139,6 +139,20 @@ _ftype_map: Dict[str, int] = {
     "IQ4_XS": int(_LlamaFileType.MOSTLY_IQ4_XS),
 }
 
+# llama.cpp's gguf-split KV keys. GGUFReader (magicquant.gguf.reader) parses
+# these into plain Python ints with no memory of their on-disk GGUF type, and
+# _write_metadata_value below re-derives the output type from the Python
+# value's magnitude alone -- so a source split.no/split.count (u16) or
+# split.tensors.count (i32) always round-trips as u32. llama.cpp's model
+# loader type-checks these three keys strictly against u16/u16/i32 and
+# refuses to load a file where they come back u32 ("key split.count has
+# wrong type u32 but expected type u16"). They are excluded from
+# _build_metadata's KV copy regardless of type fixing that, though, because
+# this writer always emits exactly one file: per llama.cpp's gguf-split
+# convention, absence of split.count means single-file, so these keys don't
+# belong in a single-file artifact's metadata at all.
+_SPLIT_KV_KEYS = frozenset({"split.no", "split.count", "split.tensors.count"})
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1221,6 +1235,12 @@ class GGUFWriter:
         """
         self.metadata = {}
         for k, v in source_metadata.items():
+            # split.* excluded: see _SPLIT_KV_KEYS. (Source KVs generally
+            # lose their on-disk GGUF type here, not just these three keys --
+            # a broader fix would need GGUFReader to retain per-key types;
+            # out of scope for this change.)
+            if k in _SPLIT_KV_KEYS:
+                continue
             self.metadata[k] = v
         self.metadata["magicquant.hybrid"] = True
         self.metadata["magicquant.base_quant"] = base_quant
