@@ -19,6 +19,7 @@ which binding each one defeats.
 from __future__ import annotations
 
 import json
+import struct
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -28,6 +29,7 @@ import magicquant.gguf.writer as wmod
 import magicquant.imatrix as imatrix_mod
 import magicquant.utils.llamacpp as llamacpp_mod
 import magicquant.v2.search as v2search
+from magicquant.utils.llamacpp import LlamaBinaryArchError
 from magicquant.v2.interchange import budget_tier_key
 from magicquant.v2.outcome import BudgetInfeasibleError
 from magicquant.v2.search import V2Config, run_budget_search
@@ -760,3 +762,146 @@ def test_keep_anchors_true_preserves_every_anchor_file(tmp_path, monkeypatch):
         assert a["path"] is not None
         assert Path(a["path"]).exists()
         assert a["actual_bytes"] == 4096
+
+
+# ===========================================================================
+# Fail-fast llama.cpp arch check (2026-08 multi-build-coexistence fix):
+# run_budget_search wires the same helper the orchestrator's measured
+# search uses (magicquant.utils.llamacpp.binary_supports_arch) in
+# immediately after LlamaCppTools construction, before _measure_baseline's
+# calculate_perplexity ever runs. Self-contained -- deliberately NOT using
+# _install_stubs/_fake_table, since this only needs LlamaCppTools()
+# construction intercepted, not the rest of the pipeline.
+# ===========================================================================
+
+
+def _write_gguf_stub(path, *, arch=None):
+    """Minimal on-disk GGUF: magic + version + 0 tensors + optional
+    general.architecture STRING metadata. Mirrors
+    tests/test_llamacpp_arch_check.py's identically-named helper."""
+    def _string(s: str) -> bytes:
+        b = s.encode("utf-8")
+        return struct.pack("<Q", len(b)) + b
+
+    buf = bytearray()
+    buf += struct.pack("<I", 0x46554747)  # "GGUF" magic
+    buf += struct.pack("<I", 3)           # version
+    buf += struct.pack("<Q", 0)           # tensor_count
+    kvs = [("general.architecture", arch)] if arch is not None else []
+    buf += struct.pack("<Q", len(kvs))    # metadata_key_count
+    for k, v in kvs:
+        buf += _string(k)
+        buf += struct.pack("<I", 8)  # GGUF STRING type
+        buf += _string(v)
+    Path(path).write_bytes(bytes(buf))
+
+
+class _NoMeasurementTools:
+    """Stand-in for LlamaCppTools whose calculate_perplexity must NEVER be
+    called -- proves the arch check raises strictly before
+    _measure_baseline (the pipeline's first real measurement)."""
+
+    def __init__(self, llamacpp_path=None, data_file=None):
+        self.perplexity_tool = None  # overwritten per-test below
+        self.ctx_size = 512
+        self.ppl_chunks = None
+
+    def calculate_perplexity(self, *a, **kw):
+        raise AssertionError(
+            "calculate_perplexity must not run -- the arch check should "
+            "have raised first"
+        )
+
+
+def test_run_budget_search_raises_before_baseline_on_unsupported_arch(tmp_path, monkeypatch):
+    src = tmp_path / "m.gguf"
+    _write_gguf_stub(src, arch="muse-glimmer")
+
+    binp = tmp_path / "llama-perplexity"
+    binp.write_bytes(b"no arch literal in this binary" * 5)
+
+    def _tools_factory(llamacpp_path=None, data_file=None):
+        t = _NoMeasurementTools(llamacpp_path, data_file)
+        t.perplexity_tool = str(binp)
+        return t
+
+    monkeypatch.setattr(llamacpp_mod, "LlamaCppTools", _tools_factory)
+
+    cfg = V2Config(source_model_path=str(src), output_dir=str(tmp_path / "out"), budget_gb=1.0)
+
+    with pytest.raises(LlamaBinaryArchError, match="muse-glimmer"):
+        run_budget_search(cfg)
+
+
+def test_run_budget_search_proceeds_when_arch_supported(tmp_path, monkeypatch):
+    """Sibling to the raise test: when the literal IS present, the arch
+    check must not block the run -- it should reach _measure_baseline's
+    calculate_perplexity normally."""
+    src = tmp_path / "m.gguf"
+    _write_gguf_stub(src, arch="muse-glimmer")
+
+    binp = tmp_path / "llama-perplexity"
+    binp.write_bytes(b"pad" + b"muse-glimmer" + b"pad")
+
+    calls = []
+
+    class _Tools(_NoMeasurementTools):
+        def calculate_perplexity(self, path, verbose=False, **kw):
+            calls.append(path)
+            return 10.0
+
+        def _resolve_data_file(self, data_file=None):
+            return "corpus.raw"
+
+    def _tools_factory(llamacpp_path=None, data_file=None):
+        t = _Tools(llamacpp_path, data_file)
+        t.perplexity_tool = str(binp)
+        return t
+
+    monkeypatch.setattr(llamacpp_mod, "LlamaCppTools", _tools_factory)
+
+    cfg = V2Config(source_model_path=str(src), output_dir=str(tmp_path / "out"), budget_gb=1.0)
+
+    with pytest.raises(Exception):
+        # The stub tools don't support the rest of the pipeline (imatrix/
+        # distortion table etc.) -- this only needs to prove the arch
+        # check let calculate_perplexity run at all before failing later
+        # for an unrelated reason.
+        run_budget_search(cfg)
+
+    assert calls, "arch check must not block a run whose binary supports the arch"
+
+
+def test_run_budget_search_arch_check_escape_hatch(tmp_path, monkeypatch):
+    src = tmp_path / "m.gguf"
+    _write_gguf_stub(src, arch="muse-glimmer")
+
+    binp = tmp_path / "llama-perplexity"
+    binp.write_bytes(b"no arch literal in this binary" * 5)  # would otherwise raise
+
+    calls = []
+
+    class _Tools(_NoMeasurementTools):
+        def calculate_perplexity(self, path, verbose=False, **kw):
+            calls.append(path)
+            return 10.0
+
+        def _resolve_data_file(self, data_file=None):
+            return "corpus.raw"
+
+    def _tools_factory(llamacpp_path=None, data_file=None):
+        t = _Tools(llamacpp_path, data_file)
+        t.perplexity_tool = str(binp)
+        return t
+
+    monkeypatch.setattr(llamacpp_mod, "LlamaCppTools", _tools_factory)
+    monkeypatch.setenv("MAGICQUANT_SKIP_ARCH_CHECK", "1")
+
+    cfg = V2Config(source_model_path=str(src), output_dir=str(tmp_path / "out"), budget_gb=1.0)
+
+    with pytest.raises(Exception):
+        # Same rationale as the "proceeds" test above -- only the arch
+        # check's own gate is under test here.
+        run_budget_search(cfg)
+
+    assert calls, "escape hatch must let the run proceed past the arch check"

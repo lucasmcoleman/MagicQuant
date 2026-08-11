@@ -22,7 +22,12 @@ from magicquant.evolution.survival import EvolutionarySurvivor
 from magicquant.evolution.probing import SensitivityProber
 from magicquant.gguf.tensor_groups import TensorGroupClassifier
 from magicquant.utils.naming import generate_name, config_key as _naming_config_key
-from magicquant.utils.llamacpp import LlamaCppTools
+from magicquant.utils.llamacpp import (
+    LlamaCppTools,
+    LlamaBinaryArchError,
+    binary_supports_arch,
+    resolve_source_gguf_arch,
+)
 from magicquant.utils.measurement import measurement_eps, predictor_is_tracking
 from magicquant.logging import get_logger
 from magicquant.quant.schemes import get_scheme_by_name
@@ -59,6 +64,13 @@ class MagicQuantOrchestrator:
         # -- kept so a pin-violation RuntimeError there can report this
         # instead of silently going to None.
         self._last_resolved_corpus: Optional[str] = None
+        # 'supported' | 'unknown' | 'skipped', set by run_measured_search's
+        # fail-fast arch check (see _run_arch_support_check below) right
+        # after tools construction, before any real measurement. None
+        # before any measured search has run (prediction-only run_full_search
+        # never sets this). Persisted into search_results.json /
+        # the measured checkpoint (_save_results / _write_measured_checkpoint).
+        self._llamacpp_arch_check: Optional[str] = None
 
         self.baseline_ppl: Optional[float] = None
         # How baseline_ppl was obtained: "measured" (real llama-perplexity),
@@ -423,6 +435,82 @@ class MagicQuantOrchestrator:
                 return None
         return self._llama_tools
 
+    def _current_llamacpp_binary(self) -> Optional[str]:
+        """The resolved perplexity-tool path for THIS run's LlamaCppTools
+        instance, or None (prediction-only run / bare test double with no
+        ``_llama_tools`` / a fake lacking the attribute). Read via
+        ``getattr`` off ``self._llama_tools`` directly -- never via the
+        ``llama_tools`` property -- so persisting results/checkpoint state
+        can never trigger a lazy ``LlamaCppTools()`` auto-construction as a
+        side effect.
+        """
+        return getattr(getattr(self, "_llama_tools", None), "perplexity_tool", None)
+
+    def _run_arch_support_check(self) -> str:
+        """Fail-fast pre-measurement check (t+0, before any real
+        measurement subprocess runs): does the resolved perplexity tool's
+        libllama actually contain the source model's GGUF architecture
+        literal? See ``utils.llamacpp.binary_supports_arch`` for the
+        ground-truth probe and the field incident this fixes -- multiple
+        llama.cpp builds coexisting on one box, where a measured search
+        auto-resolved to a build lacking the arch and died at baseline
+        40+ minutes in with "unknown model architecture".
+
+        Only applies when the source is a readable GGUF with an
+        architecture key (see ``resolve_source_gguf_arch`` -- a
+        safetensors source, or any source this reader can't parse, skips
+        the check with a debug note; safetensors sources go through
+        ``create_hybrid_gguf``'s own conversion path and this check has no
+        equivalent signal to probe there).
+
+        Escape hatch: ``MAGICQUANT_SKIP_ARCH_CHECK=1`` skips with a logged
+        warning.
+
+        Returns 'supported' | 'unknown' | 'skipped' -- the value
+        ``run_measured_search`` persists as ``llamacpp_arch_check``.
+        Raises ``LlamaBinaryArchError`` when the literal is PROVABLY
+        absent (verdict False): the resolved binary cannot load this
+        model.
+        """
+        if os.environ.get("MAGICQUANT_SKIP_ARCH_CHECK") == "1":
+            log.warning(
+                "MAGICQUANT_SKIP_ARCH_CHECK=1 -- skipping the "
+                "pre-measurement llama.cpp architecture check",
+                stage="init",
+            )
+            return "skipped"
+
+        arch = resolve_source_gguf_arch(self.source_model_path)
+        if arch is None:
+            return "skipped"
+
+        perplexity_tool = self._current_llamacpp_binary()
+        # binary_supports_arch itself now guards a missing/empty
+        # perplexity_tool (returns None) -- no need to short-circuit here.
+        verdict = binary_supports_arch(perplexity_tool, arch)
+        if verdict is False:
+            raise LlamaBinaryArchError(
+                f"The resolved llama.cpp binary ({perplexity_tool!r}) does "
+                f"not contain the GGUF architecture literal {arch!r} -- it "
+                "cannot load this model. This is a PRE-MEASUREMENT check "
+                "(runs before any llama-perplexity subprocess); catching "
+                "it now, at t+0, just saved an hours-long measured search "
+                "from dying at baseline with llama.cpp's own 'unknown "
+                "model architecture' error after burning real compute for "
+                "zero measurements. Point llamacpp_path (or the "
+                "MAGICQUANT_LLAMACPP_PATH env var) at a llama.cpp build "
+                f"that supports {arch!r}, or set "
+                "MAGICQUANT_SKIP_ARCH_CHECK=1 to bypass this check."
+            )
+        if verdict is None:
+            log.debug(
+                "arch pre-check: could not verify -- proceeding "
+                "unverified",
+                stage="init", perplexity_tool=perplexity_tool, arch=arch,
+            )
+            return "unknown"
+        return "supported"
+
     # ------------------------------------------------------------------
     # Full measured search (the real MagicQuant pipeline)
     # ------------------------------------------------------------------
@@ -694,6 +782,33 @@ class MagicQuantOrchestrator:
             )
         if measurement_chunks is not None:
             self.llama_tools.ppl_chunks = measurement_chunks
+
+        # ── Fail-fast arch check + instrument visibility (t+0, before any
+        # real measurement -- see _run_arch_support_check / the
+        # multi-build-coexistence field incident it fixes). Auto-detect
+        # warning: an unpinned llamacpp_path can silently resolve to a
+        # DIFFERENT build across submission paths/runs -- flag it for any
+        # measured run. ──
+        self._llamacpp_arch_check = self._run_arch_support_check()
+        log.info(
+            "Resolved llama.cpp tools",
+            stage="init",
+            perplexity_tool=self._current_llamacpp_binary(),
+            bench_tool=getattr(self._llama_tools, "bench_tool", None),
+            arch_check=self._llamacpp_arch_check,
+        )
+        if self._llamacpp_path is None:
+            log.warning(
+                "llamacpp_path was not pinned -- LlamaCppTools auto-"
+                "resolved a build on its own. For a measured run, pin an "
+                "explicit llamacpp_path (or MAGICQUANT_LLAMACPP_PATH) so "
+                "the instrument can't drift to a different coexisting "
+                "build across runs.",
+                stage="init",
+                resolved_llamacpp_path=getattr(
+                    self._llama_tools, "llamacpp_path", None
+                ),
+            )
 
         # ── Resume: look for a checkpoint from a prior (possibly killed) run
         # of this exact search before doing any real measurement work ──
@@ -2212,6 +2327,17 @@ class MagicQuantOrchestrator:
                 for tier, entry in _tiered_full.items()
             },
             "tiered": _tiered_full,
+            # Additive (2026-08 fail-fast arch-check fix): which llama.cpp
+            # binary took these measurements, and whether its libllama was
+            # verified (before any measurement ran) to support the source
+            # model's GGUF architecture -- see run_measured_search's
+            # _run_arch_support_check. Top-level, not a per-measurement
+            # field (_serialize_measurement's docstring): every measurement
+            # in one run shares one instrument. None on a prediction-only
+            # run_full_search (never sets _llamacpp_arch_check) or a
+            # bare-__new__ test double with no _llama_tools.
+            "llamacpp_binary": self._current_llamacpp_binary(),
+            "llamacpp_arch_check": getattr(self, "_llamacpp_arch_check", None),
         }
 
         results_path = self.output_dir / "search_results.json"
@@ -2929,6 +3055,35 @@ class MagicQuantOrchestrator:
         if not self._measurement_conditions_match(stored_conditions, current_conditions):
             reasons.append("measurement conditions changed")
 
+        # Different llama.cpp BINARY = a different measurement instrument:
+        # resurrecting a checkpoint's PPL/KL numbers next to a run using a
+        # different llama-perplexity build would merge two runs whose
+        # numbers are not comparable (this fix's whole point -- see
+        # _run_arch_support_check). A checkpoint written before this fix
+        # simply lacks "llamacpp_binary" -- treated as compatible (legacy),
+        # same missing-key-is-compatible spirit as the enable_kl backward-
+        # compat default above. Compared via os.path.realpath() on BOTH
+        # sides (Opus review) so a relative-vs-absolute or symlinked
+        # spelling of the SAME binary can't spuriously reject a valid
+        # checkpoint -- that would throw away exactly the hours the
+        # checkpoint protects; realpath() is safe to call on a path that
+        # doesn't exist on disk (it just normalizes, never raises).
+        # current_binary=None (no resolvable binary path at all this run,
+        # e.g. tools missing a perplexity_tool) is DELIBERATELY still a
+        # mismatch against a stored path: this run cannot confirm it is
+        # even using a binary, let alone the same one.
+        stored_binary = checkpoint.get("llamacpp_binary")
+        if stored_binary is not None:
+            current_binary = self._current_llamacpp_binary()
+            resolved_stored = os.path.realpath(stored_binary)
+            resolved_current = (
+                os.path.realpath(current_binary) if current_binary is not None else None
+            )
+            if resolved_current != resolved_stored:
+                reasons.append(
+                    f"llamacpp_binary changed ({stored_binary!r} != {current_binary!r})"
+                )
+
         if reasons:
             if verbose:
                 log.info(
@@ -2982,6 +3137,13 @@ class MagicQuantOrchestrator:
                 k: self._serialize_measurement(v, include_path=True)
                 for k, v in self._measured.items()
             },
+            # Additive (2026-08 fail-fast arch-check fix), same fields/
+            # rationale as _save_results' tail -- see that site's comment.
+            # Also read back by _load_matching_checkpoint's resume gate:
+            # a stored llamacpp_binary that DIFFERS from this run's is a
+            # different measurement instrument, not just a config change.
+            "llamacpp_binary": self._current_llamacpp_binary(),
+            "llamacpp_arch_check": getattr(self, "_llamacpp_arch_check", None),
         }
         tmp_path = str(path) + ".tmp"
         Path(tmp_path).write_text(
