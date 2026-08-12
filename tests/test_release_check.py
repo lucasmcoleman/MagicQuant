@@ -20,7 +20,10 @@ than hardcoding one, specifically so it keeps passing across every future
 release cut rather than breaking at the first one (see its docstring).
 """
 import sys
-import tomllib
+try:
+    import tomllib  # stdlib on Python >= 3.11
+except ModuleNotFoundError:  # Python 3.10 (CI matrix floor)
+    import tomli as tomllib  # type: ignore[no-redef]
 
 import tools.release_check as release_check
 
