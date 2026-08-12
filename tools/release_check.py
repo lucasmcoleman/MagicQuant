@@ -44,7 +44,10 @@ import argparse
 import datetime
 import re
 import sys
-import tomllib
+try:
+    import tomllib  # stdlib on Python >= 3.11
+except ModuleNotFoundError:  # Python 3.10 (CI test matrix floor)
+    import tomli as tomllib  # type: ignore[no-redef]  # dev extra, py<3.11 marker
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional

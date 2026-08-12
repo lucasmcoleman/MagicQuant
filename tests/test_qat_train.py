@@ -85,10 +85,22 @@ def _base_cfg(tmp_path):
 
 # ── training defaults wired into TrainingArguments ─────────────────────────────
 
+def _effective_warmup(args):
+    """Version-portable read of the warmup ratio off a real TrainingArguments.
+
+    Pre-transformers-5 exposes .warmup_ratio; transformers 5 folded it into
+    .warmup_steps (float in [0,1) == ratio). Same compat seam as
+    train._build_training_args writes through.
+    """
+    if hasattr(args, "warmup_ratio"):
+        return args.warmup_ratio
+    return args.warmup_steps
+
+
 def test_run_qat_defaults_wired_into_training_args(tmp_path, patched_trainer):
     train_mod.run_qat(_base_cfg(tmp_path))
     args = patched_trainer.last_args
-    assert args.warmup_ratio == pytest.approx(0.03)
+    assert _effective_warmup(args) == pytest.approx(0.03)
     assert args.weight_decay == pytest.approx(0.0)
     assert args.max_grad_norm == pytest.approx(1.0)
     assert str(args.lr_scheduler_type) == "cosine" or args.lr_scheduler_type == "cosine"
@@ -104,7 +116,7 @@ def test_run_qat_overrides_training_defaults(tmp_path, patched_trainer):
     )
     train_mod.run_qat(cfg)
     args = patched_trainer.last_args
-    assert args.warmup_ratio == pytest.approx(0.1)
+    assert _effective_warmup(args) == pytest.approx(0.1)
     assert args.weight_decay == pytest.approx(0.01)
     assert args.max_grad_norm == pytest.approx(0.5)
     assert str(args.lr_scheduler_type) == "linear" or args.lr_scheduler_type == "linear"
