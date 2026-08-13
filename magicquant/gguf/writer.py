@@ -417,6 +417,55 @@ def _is_f32_required_ssm_operand(name: str) -> bool:
     return bool(_SSM_F32_REQUIRED_NAME_RE.search(name))
 
 
+# Tensor names llama.cpp's own quantizer refuses to quantize outright,
+# regardless of shape -- mirrored from tensor_allows_quantization() in
+# llama.cpp's src/llama-quant.cpp (~lines 289-366, current checkout).
+# This is what covers e.g. nemotron_h_moe's blk.*.ssm_norm.weight: it's
+# 2-D (so the 1D-F32 rule below doesn't fire) with ne[0]=512 (both
+# 32- and 256-divisible, so the block-size fallback below doesn't fire
+# either), so an un-mirrored writer quantizes it to Q8_0 and llama.cpp
+# later aborts in ggml-cpu binary_op on the f32/q8_0 operand mismatch
+# (ssm_norm feeds ggml_mul via build_norm in mamba-base.cpp).
+#
+# This is a DIFFERENT and weaker constraint than
+# _is_f32_required_ssm_operand above: that one applies even to float
+# targets (BF16/F16) because the CUDA ssm_conv kernel hard-asserts a
+# float row stride, whereas this one only ever overrides an actually
+# -quantized target (see the `target_ggml_name != "F32"` guard at the
+# call site) -- upstream is happy to leave these tensors at BF16/F16.
+# Keep both checks; this list intentionally includes "ssm_conv1d" and
+# "shortconv.conv.weight" too so a group-"S" mismatch doesn't slip
+# past both, even though _is_f32_required_ssm_operand already forces
+# those to F32 first.
+_NEVER_QUANTIZE_NAME_SUBSTRINGS = (
+    "_norm.weight",             # do not quantize norm tensors
+    "ffn_gate_inp.weight",      # expert gating
+    "ffn_gate_tid2eid.weight",  # DeepSeek-V4 i32 routing table
+    "altup",
+    "laurel",
+    "per_layer_model_proj",
+    "ssm_conv1d",
+    "shortconv.conv.weight",
+    "indexer.k_proj.weight",
+    "indexer.q_proj.weight",
+    "time_mix_first.weight",
+    "time_mix_w0.weight",
+    "time_mix_w1.weight",
+    "time_mix_w2.weight",
+    # Positional embeddings / token types: upstream matches these via
+    # LLM_TN(arch)(LLM_TENSOR_POS_EMBD/TOKEN_TYPES, "weight"), which is
+    # arch-templated per-architecture tensor naming. This writer has no
+    # such per-arch table, so match on the GGUF canonical name instead.
+    "position_embd.weight",
+    "token_types.weight",
+)
+
+
+def _is_never_quantized(name: str) -> bool:
+    """Does llama.cpp's own quantizer refuse to quantize ``name`` by name?"""
+    return any(substr in name for substr in _NEVER_QUANTIZE_NAME_SUBSTRINGS)
+
+
 # IEEE 754 half precision (F16): max finite magnitude. Values with |v| >
 # this overflow to +/-Inf on conversion -- the hazard this check exists to
 # catch (see the writer's own warning: "Out-of-F16-range values may become
@@ -868,9 +917,9 @@ class GGUFWriter:
         """Pass 1: compute target ggml types and offsets for every tensor,
         no data reading. Extracted verbatim from create_hybrid_gguf's Pass-1
         loop -- see the module docstring and the inline [COMPAT] comments
-        for the five-stage type-mutation pipeline (SSM-F32, 1D-F32,
-        BF16->F16/Q8_0, block-32 fallback, can_decode passthrough) this
-        loop runs in strict order for every tensor.
+        for the six-stage type-mutation pipeline (SSM-F32, never-quantize
+        -name, 1D-F32, BF16->F16/Q8_0, block-32 fallback, can_decode
+        passthrough) this loop runs in strict order for every tensor.
         """
         tensor_entries: List[Dict[str, Any]] = []
         data_offset = 0
@@ -898,14 +947,15 @@ class GGUFWriter:
             target_ggml_name = scheme_map.get(scheme, "Q4_0")
             target_ggml_id = GGML_TYPE.get(target_ggml_name, GGML_TYPE["Q4_0"])
             # Captured BEFORE the compat-mutation chain below (SSM-F32
-            # force, 1D-F32, BF16->F16/Q8_0, block-32 fallback, the
-            # can_decode passthrough overwrite) so the bad_tensors gate
-            # further down can read the tensor's PRE-compat desired type
-            # directly off the entry instead of re-deriving scheme
-            # resolution from tensor_overrides/group_schemes/base_quant a
-            # second time. Do not move this past any of the mutations
-            # below -- see the bad_tensors gate's comment for why the
-            # post-compat value would silently disable that check.
+            # force, never-quantize-name, 1D-F32, BF16->F16/Q8_0,
+            # block-32 fallback, the can_decode passthrough overwrite) so
+            # the bad_tensors gate further down can read the tensor's
+            # PRE-compat desired type directly off the entry instead of
+            # re-deriving scheme resolution from tensor_overrides/
+            # group_schemes/base_quant a second time. Do not move this
+            # past any of the mutations below -- see the bad_tensors
+            # gate's comment for why the post-compat value would
+            # silently disable that check.
             desired_ggml_name = target_ggml_name
 
             # SSM conv-weight operands (ssm_conv1d / ssm_conv1d_{q,k,v})
@@ -925,6 +975,32 @@ class GGUFWriter:
                     "requested": target_ggml_name,
                     "actual": "F32",
                     "reason": "f32-required-operand",
+                })
+                target_ggml_name = "F32"
+                target_ggml_id = GGML_TYPE["F32"]
+
+            # Never-quantize-by-name tensors (see
+            # _NEVER_QUANTIZE_NAME_SUBSTRINGS): mirrors llama.cpp's own
+            # quantizer so a tensor upstream refuses to quantize doesn't
+            # slip through here just because its shape happens to pass
+            # every shape-based check (1D-F32, block-size). Guarded on
+            # target_ggml_name != "F32" so this never overwrites (or
+            # re-logs under a different reason) a tensor the SSM check
+            # above already forced to F32. Must run BEFORE the
+            # block-size fallback below for the same reason as that
+            # check: a float target has block_size==1 and skips it
+            # entirely, which would let a quantizable-looking BF16/F16
+            # scheme through untouched.
+            if target_ggml_name != "F32" and _is_never_quantized(name):
+                if verbose:
+                    print(f"  [COMPAT] {name}: llama.cpp never quantizes this "
+                          f"tensor by name, keeping at F32")
+                self._fallbacks.append({
+                    "tensor": name,
+                    "group": group,
+                    "requested": target_ggml_name,
+                    "actual": "F32",
+                    "reason": "never-quantize-name",
                 })
                 target_ggml_name = "F32"
                 target_ggml_id = GGML_TYPE["F32"]
@@ -1135,15 +1211,15 @@ class GGUFWriter:
                 # Recognized but pre-quantized: error only if the user
                 # wanted a different type than the source already is.
                 # Reads the PRE-compat desired type captured in Pass 1
-                # (entry["_desired_ggml_name"], set before the SSM-F32/
-                # 1D-F32/BF16->F16/block-32/can_decode compat mutations)
-                # rather than re-deriving scheme resolution from
-                # tensor_overrides/group_schemes/base_quant a second
-                # time -- so an override can't get silently ignored by
-                # two independent copies of "what scheme did the user
-                # actually ask for" drifting apart. The entry's
-                # POST-compat "_target_ggml_name" is unusable here: on
-                # the not-can_decode path it has already been overwritten
+                # (entry["_desired_ggml_name"], set before the
+                # SSM-F32/never-quantize-name/1D-F32/BF16->F16/block-32/
+                # can_decode compat mutations) rather than re-deriving
+                # scheme resolution from tensor_overrides/group_schemes/
+                # base_quant a second time -- so an override can't get
+                # silently ignored by two independent copies of "what
+                # scheme did the user actually ask for" drifting apart.
+                # The entry's POST-compat "_target_ggml_name" is unusable
+                # here: on the not-can_decode path it has already been overwritten
                 # to the source type, which would make this comparison
                 # always false and disable the gate silently.
                 desired_ggml_name = entry["_desired_ggml_name"]
@@ -1325,8 +1401,8 @@ class GGUFWriter:
 
         # Data-integrity notice: surface fallbacks even when
         # verbose=False. self._fallbacks now carries more than one
-        # reason (block-size, f32-required-operand, and
-        # bf16-f16-out-of-range) -- a single line hardcoding
+        # reason (block-size, f32-required-operand, never-quantize-name,
+        # and bf16-f16-out-of-range) -- a single line hardcoding
         # "due to block-size" misattributed every non-block-size
         # fallback observed live. Group by reason and summarize each
         # group with one example, instead of blaming them all on the
