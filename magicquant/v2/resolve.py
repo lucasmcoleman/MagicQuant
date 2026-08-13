@@ -20,6 +20,7 @@ from magicquant.gguf.writer import (
     SCHEME_TO_GGML,
     _block32_fallback,
     _is_f32_required_ssm_operand,
+    _is_never_quantized,
     _tensor_n_elements,
 )
 from magicquant.quant.converters import GGML_BLOCK_SIZE, ggml_tensor_data_size
@@ -38,7 +39,8 @@ def resolve_tensor_type(
 
     Returns ``(actual_ggml_type_name, reason)`` where ``reason`` is None
     when the requested scheme maps through unchanged, else one of
-    ``"f32-required-operand" | "1d-f32" | "bf16-downgrade" | "block-size"``.
+    ``"f32-required-operand" | "never-quantize-name" | "1d-f32" |
+    "bf16-downgrade" | "block-size"``.
 
     Raises ValueError for a scheme name unknown to the writer's map (the
     writer would silently default it to Q4_0; planning must never do that).
@@ -56,15 +58,23 @@ def resolve_tensor_type(
     if group == "S" and target != "F32" and _is_f32_required_ssm_operand(name):
         return "F32", "f32-required-operand"
 
-    # 2. 1-D tensors (norms/biases) stay F32.
+    # 2. Never-quantize-by-name tensors (llama.cpp's own quantizer refuses
+    #    these regardless of shape/group -- see writer.py's
+    #    _NEVER_QUANTIZE_NAME_SUBSTRINGS). Checked before the 1-D and
+    #    block-size rules for the same reason as #1: this can be the only
+    #    thing catching a 2-D, block-compatible tensor like ssm_norm.weight.
+    if target != "F32" and _is_never_quantized(name):
+        return "F32", "never-quantize-name"
+
+    # 3. 1-D tensors (norms/biases) stay F32.
     if n_dims <= 1 and target != "F32":
         return "F32", "1d-f32"
 
-    # 3. BF16 is written as F16 (llama.cpp compute-graph limitation).
+    # 4. BF16 is written as F16 (llama.cpp compute-graph limitation).
     if target == "BF16":
         target, reason = "F16", "bf16-downgrade"
 
-    # 4. Block-size fallback for non-divisible rows.
+    # 5. Block-size fallback for non-divisible rows.
     row_size = shape[-1] if len(shape) >= 1 else 1
     block_size = GGML_BLOCK_SIZE.get(target, 1)
     if block_size > 1 and row_size % block_size != 0:

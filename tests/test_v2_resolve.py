@@ -44,11 +44,15 @@ def test_resolution_parity_with_writer(tmp_path, monkeypatch):
         _f32_tensor("blk.0.ffn_up.weight", (256, 192)),   # 192 % 256 != 0 -> block fallback for K-quants
         _f32_tensor("blk.0.attn_norm.weight", (256,)),    # 1-D -> F32
         _f32_tensor("output.weight", (256, 256)),
+        # 2-D, block-compatible (256 is 32- and 256-divisible), classifies
+        # into group N (not S) -- only the never-quantize-name rule catches
+        # this; neither the 1-D rule nor the block-size rule would.
+        _f32_tensor("blk.0.ssm_norm.weight", (4, 256)),
     ]
     quant_config = {
         "base": "Q8_0",
         "groups": {"E": "BF16", "H": "Q6_K", "Q": "Q4_K_M", "D": "MXFP4_MOE",
-                   "U": "Q4_K_M", "N": "BF16"},
+                   "U": "Q4_K_M", "N": "Q8_0"},
     }
     reader = _build(tmp_path, tensors, quant_config, monkeypatch)
     try:
@@ -88,10 +92,36 @@ def test_bf16_downgrade_and_1d_rules():
         "token_embd.weight", [256, 256], 2, "E", "BF16"
     )
     assert actual == "F16" and reason == "bf16-downgrade"
+    # A 1-D tensor whose name does NOT match the never-quantize-name list
+    # (an attention bias, not a norm) exercises the 1D-F32 rule in
+    # isolation -- a "_norm.weight"-named 1-D tensor now hits the
+    # never-quantize-name rule first (see test_never_quantize_name_rule
+    # below), since that rule runs before this one.
+    actual, reason = resolve_tensor_type(
+        "blk.0.attn_q.bias", [256], 1, "Q", "Q8_0"
+    )
+    assert actual == "F32" and reason == "1d-f32"
+
+
+def test_never_quantize_name_rule():
+    # A 1-D norm's name alone is enough to route it to F32 via the
+    # never-quantize-name rule, which runs BEFORE the 1D-F32 rule -- so a
+    # "_norm.weight"-suffixed tensor reports this reason, not "1d-f32",
+    # even though the end result (F32) is identical. Mirrors writer.py's
+    # _is_never_quantized (single source of truth, imported not copied).
     actual, reason = resolve_tensor_type(
         "blk.0.attn_norm.weight", [256], 1, "N", "Q8_0"
     )
-    assert actual == "F32" and reason == "1d-f32"
+    assert actual == "F32" and reason == "never-quantize-name"
+
+    # And this is what catches the exact-bug shape: 2-D, block-compatible
+    # (256 is 32- and 256-divisible), group N not S -- see
+    # tests/test_writer_never_quantize_names.py for the writer-side
+    # equivalent of this exact case.
+    actual, reason = resolve_tensor_type(
+        "blk.0.ssm_norm.weight", [4, 256], 2, "N", "Q8_0"
+    )
+    assert actual == "F32" and reason == "never-quantize-name"
 
 
 def test_block_fallback_rule():
