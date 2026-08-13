@@ -179,7 +179,10 @@ def compute_distortion_table(
             probe_actual, probe_reason = resolve_tensor_type(
                 name, shape, n_dims, group, schemes[0]
             )
-            if probe_reason in ("f32-required-operand", "never-quantize-name", "1d-f32"):
+            if probe_reason in (
+                "f32-required-operand", "not-a-weight-tensor",
+                "never-quantize-name", "1d-f32",
+            ):
                 entry["fixed"] = True
                 entry["choices"]["F32"] = {
                     "actual": "F32",

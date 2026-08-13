@@ -456,6 +456,50 @@ def _is_f32_required_ssm_operand(name: str) -> bool:
     return bool(_SSM_F32_REQUIRED_NAME_RE.search(name))
 
 
+def _is_quantizable_by_name(name: str) -> bool:
+    """Mirror of llama.cpp's FIRST quantization gate, before any of its
+    name-based refusals::
+
+        bool quantize = name.rfind("weight") == name.size() - 6;
+
+    A tensor whose name does not end in ``weight`` is not a quantization
+    candidate at all upstream -- it is copied through at its source dtype,
+    which for these is F32.
+
+    This is the structural form of a rule that had been accumulating as
+    special cases. Three members of one family were missed in turn by the
+    hand-maintained name patterns: ``ssm_norm.weight`` (2026-08-13 morning,
+    aborted llama.cpp in a binary op), then ``ssm_a`` and ``ssm_d``. The
+    previous guard, ``_is_f32_required_ssm_operand``, matched only
+    ``conv1d`` AND was gated on ``group == "S"`` -- and ``ssm_norm.weight``
+    classifies into group ``N``, so the gate had already failed on its own
+    terms before the pattern did.
+
+    ``ssm_a`` and ``ssm_d`` are the reason this is not merely cosmetic. Both
+    are 2-D ``(64, 1)``, so the 1-D rule does not fire; ``ne[0] == 1`` is not
+    32-divisible, so a QUANTIZED target falls back to F32 and looks safe --
+    but a FLOAT target has ``block_size == 1``, skips the block-size check
+    entirely, and is written F16. llama.cpp then aborts: ``ssm_a`` is src3 of
+    ``ggml_ssm_scan``, which asserts ``nb[0] == sizeof(float)``
+    (ggml-cpu/ops.cpp:9655), and ``ssm_d`` is src1 of a ``ggml_mul``
+    (mamba-base.cpp:136,267). v1 probing never hit either because it holds
+    groups at Q8_0 -- a quantized keep-scheme. v2 holds them at BF16, which
+    is how it found both.
+
+    MEASURED BLAST RADIUS on nemotron_h_moe, every non-``weight`` tensor::
+
+        exp_probs_b.bias   x24  (128,)     1-D -> already F32
+        ssm_conv1d.bias    x23  (6144,)    1-D -> already F32
+        ssm_dt.bias        x23  (64,)      1-D -> already F32
+        ssm_a              x23  (64, 1)    2-D -> CHANGES: F16 -> F32
+        ssm_d              x23  (64, 1)    2-D -> CHANGES: F16 -> F32
+
+    So this rule widens behaviour by exactly the two tensors it exists to
+    fix; every other non-weight tensor is already F32 via the 1-D rule.
+    """
+    return name.endswith("weight")
+
+
 # Tensor names llama.cpp's own quantizer refuses to quantize outright,
 # regardless of shape -- mirrored from the `quantize &= name.find(...)`
 # chain in llama.cpp's src/llama-quant.cpp (llama_model_quantize_impl,
@@ -1079,6 +1123,27 @@ class GGUFWriter:
             # check: a float target has block_size==1 and skips it
             # entirely, which would let a quantizable-looking BF16/F16
             # scheme through untouched.
+            # Not a "weight" tensor at all -> llama.cpp never quantizes it and
+            # copies it at source dtype (F32). Must run BEFORE the block-size
+            # fallback for the same reason as the SSM check above: a float
+            # target has block_size == 1 and skips that check entirely, which
+            # is exactly how ssm_a/ssm_d reached llama.cpp as F16 and aborted
+            # it. See _is_quantizable_by_name for the measured blast radius.
+            if target_ggml_name != "F32" and not _is_quantizable_by_name(name):
+                if verbose:
+                    print(f"  [COMPAT] {name}: not a 'weight' tensor; "
+                          f"llama.cpp never quantizes these, keeping at F32")
+                if n_dims >= 2:
+                    self._fallbacks.append({
+                        "tensor": name,
+                        "group": group,
+                        "requested": target_ggml_name,
+                        "actual": "F32",
+                        "reason": "not-a-weight-tensor",
+                    })
+                target_ggml_name = "F32"
+                target_ggml_id = GGML_TYPE["F32"]
+
             if target_ggml_name != "F32" and _is_never_quantized(name):
                 if verbose:
                     print(f"  [COMPAT] {name}: llama.cpp never quantizes this "

@@ -21,6 +21,7 @@ from magicquant.gguf.writer import (
     _block32_fallback,
     _is_f32_required_ssm_operand,
     _is_never_quantized,
+    _is_quantizable_by_name,
     _tensor_n_elements,
 )
 from magicquant.quant.converters import GGML_BLOCK_SIZE, ggml_tensor_data_size
@@ -39,7 +40,8 @@ def resolve_tensor_type(
 
     Returns ``(actual_ggml_type_name, reason)`` where ``reason`` is None
     when the requested scheme maps through unchanged, else one of
-    ``"f32-required-operand" | "never-quantize-name" | "1d-f32" |
+    ``"f32-required-operand" | "not-a-weight-tensor" |
+    "never-quantize-name" | "1d-f32" |
     "bf16-downgrade" | "block-size"``.
 
     Raises ValueError for a scheme name unknown to the writer's map (the
@@ -58,7 +60,15 @@ def resolve_tensor_type(
     if group == "S" and target != "F32" and _is_f32_required_ssm_operand(name):
         return "F32", "f32-required-operand"
 
-    # 2. Never-quantize-by-name tensors (llama.cpp's own quantizer refuses
+    # 2. Not a "weight" tensor -- llama.cpp's first quantization gate. Must
+    #    precede the 1-D and block-size rules for the same reason as #1:
+    #    ssm_a/ssm_d are 2-D with ne[0]=1, so only a quantized target hits
+    #    the block-size fallback; a float target slips through as F16 and
+    #    aborts llama.cpp. See writer._is_quantizable_by_name.
+    if target != "F32" and not _is_quantizable_by_name(name):
+        return "F32", "not-a-weight-tensor"
+
+    # 3. Never-quantize-by-name tensors (llama.cpp's own quantizer refuses
     #    these regardless of shape/group -- see writer.py's
     #    _NEVER_QUANTIZE_NAME_SUBSTRINGS). Checked before the 1-D and
     #    block-size rules for the same reason as #1: this can be the only
@@ -66,15 +76,15 @@ def resolve_tensor_type(
     if target != "F32" and _is_never_quantized(name):
         return "F32", "never-quantize-name"
 
-    # 3. 1-D tensors (norms/biases) stay F32.
+    # 4. 1-D tensors (norms/biases) stay F32.
     if n_dims <= 1 and target != "F32":
         return "F32", "1d-f32"
 
-    # 4. BF16 is written as F16 (llama.cpp compute-graph limitation).
+    # 5. BF16 is written as F16 (llama.cpp compute-graph limitation).
     if target == "BF16":
         target, reason = "F16", "bf16-downgrade"
 
-    # 5. Block-size fallback for non-divisible rows.
+    # 6. Block-size fallback for non-divisible rows.
     row_size = shape[-1] if len(shape) >= 1 else 1
     block_size = GGML_BLOCK_SIZE.get(target, 1)
     if block_size > 1 and row_size % block_size != 0:

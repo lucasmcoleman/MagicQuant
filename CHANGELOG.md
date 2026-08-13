@@ -2,6 +2,52 @@
 
 ## [Unreleased]
 
+### Fixed (2026-08-13, second field report — v2 probe abort)
+
+- **v2 probes aborted llama.cpp on `nemotron_h_moe`; `ssm_a` AND `ssm_d` were
+  written F16.** v2 holds groups at `keep_scheme="BF16"`; the writer emits
+  BF16 as F16; llama.cpp then aborts — `ssm_a` is src3 of `ggml_ssm_scan`,
+  which asserts `nb[0] == sizeof(float)` (ggml-cpu/ops.cpp:9655), and `ssm_d`
+  is src1 of a `ggml_mul` (mamba-base.cpp:136,267). Both are 2-D `(64,1)`: the
+  1-D rule misses them, and `ne[0]=1` is not 32-divisible so a QUANTIZED
+  scheme falls back to F32 and looks safe — but a FLOAT scheme has
+  `block_size == 1` and skips the block-size check entirely. v1 never hit it
+  because it holds groups at Q8_0. `ssm_d` was found in review, one probe
+  before production.
+- **Fixed structurally, not with another name.** The previous guard
+  (`_is_f32_required_ssm_operand`) matched only `conv1d` and was gated on
+  `group == "S"` — and `ssm_norm.weight` classifies into group `N`, so the
+  gate had already failed on its own terms before the pattern did. Three
+  members of one family were missed in turn by hand-maintained patterns.
+  Replaced with a mirror of llama.cpp's own FIRST quantization gate,
+  `bool quantize = name.rfind("weight") == name.size() - 6` — a tensor not
+  ending in `weight` is not a quantization candidate at all upstream.
+
+**Measured blast radius** (every non-`weight` tensor on nemotron_h_moe):
+
+    exp_probs_b.bias  x24  (128,)    1-D -> already F32   (reason string only)
+    ssm_conv1d.bias   x23  (6144,)   1-D -> already F32   (reason string only)
+    ssm_dt.bias       x23  (64,)     1-D -> already F32   (reason string only)
+    ssm_a             x23  (64,1)    2-D -> F16 -> F32    CHANGES
+    ssm_d             x23  (64,1)    2-D -> F16 -> F32    CHANGES
+
+**Exhaustive resolved-type delta: 46 tensors** (23 `ssm_a` + 23 `ssm_d`),
+and only under a FLOAT keep-scheme — under quantized schemes they already
+resolved F32 via the block-size fallback. **5.8 KiB.** So the structural rule
+widens behaviour by exactly the two tensors it exists to fix.
+
+**Audited and CLEARED** (checked, not changed): `ssm_in.weight` and
+`ssm_out.weight` resolve to F16 under a float keep but are `build_lora_mm`
+operands where F16 is legal — forcing them to F32 would roughly double them.
+Of the six operands `ggml_ssm_scan` asserts F32 stride on, only `A`/src3 is a
+persisted weight; the other five are runtime activations the writer never
+emits. `ssm_conv1d.*` and `ssm_norm.weight` were already covered. The family
+is closed.
+
+Also marked `not-a-weight-tensor` as a fixed-unit reason in `v2/sensitivity.py`,
+so the allocator is no longer offered scheme choices for tensors whose type is
+predetermined.
+
 ### Fixed (2026-08-13 field-report response)
 
 - **Measurement subprocess could hang for hours after its child already exited.**

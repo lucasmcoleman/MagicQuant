@@ -92,13 +92,18 @@ def test_bf16_downgrade_and_1d_rules():
         "token_embd.weight", [256, 256], 2, "E", "BF16"
     )
     assert actual == "F16" and reason == "bf16-downgrade"
-    # A 1-D tensor whose name does NOT match the never-quantize-name list
-    # (an attention bias, not a norm) exercises the 1D-F32 rule in
-    # isolation -- a "_norm.weight"-named 1-D tensor now hits the
-    # never-quantize-name rule first (see test_never_quantize_name_rule
-    # below), since that rule runs before this one.
+    # A bias is 1-D AND does not end in "weight", and the weight-suffix gate
+    # (llama.cpp's own first check) now runs before the 1-D rule -- so it is
+    # reported as not-a-weight-tensor. Same F32 outcome, more accurate reason.
     actual, reason = resolve_tensor_type(
         "blk.0.attn_q.bias", [256], 1, "Q", "Q8_0"
+    )
+    assert actual == "F32" and reason == "not-a-weight-tensor"
+
+    # The 1-D rule in isolation needs a 1-D tensor that DOES end in "weight"
+    # and is not a norm (norms hit the never-quantize-name rule first).
+    actual, reason = resolve_tensor_type(
+        "blk.0.some_scale.weight", [256], 1, "Q", "Q8_0"
     )
     assert actual == "F32" and reason == "1d-f32"
 
@@ -131,3 +136,32 @@ def test_block_fallback_rule():
     )
     assert reason == "block-size"
     assert actual != "Q4_K"
+
+
+def test_not_a_weight_tensor_rule_covers_ssm_a_and_ssm_d():
+    """The 2026-08-13 v2 abort. ssm_a is src3 of ggml_ssm_scan, which asserts
+    nb[0] == sizeof(float) (ggml-cpu/ops.cpp:9655); ssm_d is src1 of a
+    ggml_mul (mamba-base.cpp:136,267). Both are 2-D (64,1), so the 1-D rule
+    misses them, and ne[0]=1 is not 32-divisible so a QUANTIZED target falls
+    back to F32 and looks safe -- but a FLOAT target has block_size == 1,
+    skips the block-size check, and is written F16, which aborts llama.cpp.
+
+    v1 never hit this because it holds groups at Q8_0; v2 holds them at BF16.
+    So both keep-schemes must now resolve to F32.
+    """
+    for name in ("blk.0.ssm_a", "blk.0.ssm_d"):
+        for keep in ("BF16", "F16", "Q8_0", "Q4_K_M"):
+            actual, reason = resolve_tensor_type(name, [64, 1], 2, "S", keep)
+            assert actual == "F32", f"{name} @ {keep} -> {actual}"
+            assert reason == "not-a-weight-tensor"
+
+
+def test_ssm_matmul_operands_are_NOT_forced_to_f32():
+    """The cleared half of the audit. ssm_in/ssm_out end in 'weight' and are
+    build_lora_mm operands -- F16 is legal there. Forcing them to F32 would
+    roughly double them (10304x2688 and 2688x4096) for no reason."""
+    for name in ("blk.0.ssm_in.weight", "blk.0.ssm_out.weight"):
+        actual, _ = resolve_tensor_type(name, [10304, 2688], 2, "S", "BF16")
+        assert actual == "F16", f"{name} must stay F16 under a BF16 keep"
+        actual, _ = resolve_tensor_type(name, [10304, 2688], 2, "S", "Q8_0")
+        assert actual == "Q8_0", f"{name} must stay quantizable"

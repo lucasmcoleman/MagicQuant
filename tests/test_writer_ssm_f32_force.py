@@ -172,3 +172,80 @@ def test_non_ssm_bf16_tensor_still_passes_through_as_bf16_designated(tmp_path, m
         assert info["data_type"] == 1  # F16 id (BF16 on-disk downgrade), not F32
     finally:
         reader.close()
+
+
+# ── the 2026-08-13 v2 abort: non-"weight" tensors ───────────────────────────
+
+def test_ssm_a_and_ssm_d_forced_f32_under_a_FLOAT_scheme(tmp_path, monkeypatch):
+    """The bug v2 found and v1 could not.
+
+    ssm_a is src3 of ggml_ssm_scan, which asserts nb[0] == sizeof(float);
+    ssm_d is src1 of a ggml_mul. Both are 2-D (64,1): the 1-D rule misses
+    them, and ne[0]=1 is not 32-divisible so a QUANTIZED scheme falls back to
+    F32 and looks safe. A FLOAT scheme has block_size == 1, skips the
+    block-size check entirely, and was written F16 -- 2-byte stride, abort.
+
+    v1 probing holds groups at Q8_0 (quantized) and never saw it; v2 holds
+    them at BF16 and aborted on the first probe.
+    """
+    import numpy as np
+    import magicquant.gguf.source as source_mod
+    from magicquant.gguf.reader import GGUFReader
+    from tests.test_writer import StubSource
+
+    def _t(name, shape):
+        n = 1
+        for d in shape:
+            n *= d
+        return (name, np.random.randn(n).astype(np.float32), shape)
+
+    src = StubSource([_t("blk.0.ssm_a", (1, 64)), _t("blk.0.ssm_d", (1, 64))])
+    monkeypatch.setattr(source_mod, "open_model_source", lambda *a, **k: src)
+
+    writer = GGUFWriter(str(tmp_path / "h.gguf"))
+    writer.create_hybrid_gguf(
+        "ignored", {"base": "BF16", "groups": {"S": "BF16"}}, verbose=False,
+    )
+
+    reader = GGUFReader(str(tmp_path / "h.gguf"))
+    reader.open()
+    try:
+        for name in ("blk.0.ssm_a", "blk.0.ssm_d"):
+            info = reader.get_tensor_info(name)
+            assert info["data_type"] == 0, (
+                f"{name} written as type {info['data_type']}, not F32 -- "
+                "llama.cpp will abort on a non-float stride"
+            )
+    finally:
+        reader.close()
+
+
+def test_weight_suffix_gate_does_not_touch_real_weight_tensors(tmp_path, monkeypatch):
+    """The cleared half: ssm_in/ssm_out end in 'weight' and are matmul
+    operands where F16 is legal. Forcing them to F32 would roughly double
+    them for no reason."""
+    import numpy as np
+    import magicquant.gguf.source as source_mod
+    from magicquant.gguf.reader import GGUFReader
+    from tests.test_writer import StubSource
+
+    def _t(name, shape):
+        n = 1
+        for d in shape:
+            n *= d
+        return (name, np.random.randn(n).astype(np.float32), shape)
+
+    src = StubSource([_t("blk.0.ssm_in.weight", (256, 256))])
+    monkeypatch.setattr(source_mod, "open_model_source", lambda *a, **k: src)
+
+    writer = GGUFWriter(str(tmp_path / "h.gguf"))
+    writer.create_hybrid_gguf(
+        "ignored", {"base": "Q8_0", "groups": {}}, verbose=False,
+    )
+    reader = GGUFReader(str(tmp_path / "h.gguf"))
+    reader.open()
+    try:
+        assert reader.get_tensor_info("blk.0.ssm_in.weight")["data_type"] != 0, \
+            "a real weight tensor must remain quantizable"
+    finally:
+        reader.close()
