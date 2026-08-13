@@ -65,6 +65,22 @@
   explicit per-tensor override only, like `Q4_0`/`Q4_1`.
 
 ### Changed
+- **v2's choice set is hand-maintained, so registering a scheme is not enough to
+  reach it.** `v2/search.py::DEFAULT_SCHEMES` is a literal list, not a registry
+  read, so a budget run on the very model Q5_0/Q5_1 were added for came back with
+  the old nine schemes — and nothing looked wrong, because the distortion-table
+  cache then correctly HIT on the old scheme-set key (no recompute, no warning).
+  `_select_schemes` now appends them when the source model actually has
+  block-32-only tensors; gated rather than unconditional because widening the set
+  forces a full table recompute (~90 min on a 30B) and on a 256-divisible model
+  the table would only confirm Q5_K dominates Q5_0 at identical bpw. `q4nx` and
+  explicit `cfg.schemes` are never widened. The v1 path was checked and is NOT
+  affected — it draws from the registry.
+- **The `gguf>=0.19.0` floor has a THIRD environment to update.** Foundry has its
+  own venv (`/server/programming/Foundry/.venv`) and imports `magicquant` from the
+  editable install, so the bump broke every Foundry pipeline stage at import
+  (`REQUIRED_STOCK_NAMES` gained `NVFP4`; that venv was still on 0.18.0). Noted in
+  CLAUDE.md.
 
 - `gguf` floor `>=0.18.0` → `>=0.19.0`; `requires-python` `>=3.9` → `>=3.10`
   (forced by that floor). **`Q2_0` remains unavailable** — id 42 exists in

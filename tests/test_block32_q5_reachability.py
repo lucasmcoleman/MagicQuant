@@ -208,3 +208,70 @@ def test_q5_pair_is_not_dominated_by_mxfp4():
         s = get_scheme_by_name(name)
         assert s.bits_per_weight > mxfp4.bits_per_weight
         assert s.noise_factor < mxfp4.noise_factor
+
+
+# ── v2 choice set ───────────────────────────────────────────────────────────
+#
+# Registering the schemes was NOT enough to reach the v2/budget path.
+# v2/search.py's DEFAULT_SCHEMES is a hand-maintained list, not a registry
+# read, so a budget run on the very model these were added for came back with
+# the old nine and nothing looked wrong -- the distortion-table cache then
+# correctly HIT on the old scheme-set key, so no recompute and no warning.
+# That is exactly the failure mode where "I checked for a cache miss" would
+# have confirmed the feature was working when it was not.
+
+def _v2_cfg(tmp_path, model_path, **kw):
+    from magicquant.v2.search import V2Config
+    return V2Config(
+        source_model_path=str(model_path), output_dir=str(tmp_path), budget_gb=1.0, **kw
+    )
+
+
+def test_v2_adds_the_q5_pair_when_the_model_is_block32_only(tmp_path, monkeypatch):
+    from magicquant.v2 import search as v2search
+
+    monkeypatch.setattr(v2search, "_model_has_block32_only_tensors", lambda p: True)
+    schemes = v2search._select_schemes(_v2_cfg(tmp_path, "m.gguf"), imatrix_active=True)
+    assert {"Q5_0", "Q5_1"} <= set(schemes)
+
+
+def test_v2_leaves_the_choice_set_alone_for_a_256_divisible_model(tmp_path, monkeypatch):
+    """Widening the choice set forces a full distortion-table recompute
+    (~90 min on a 30B) and on a 256-divisible model the table would only ever
+    confirm Q5_K dominates Q5_0 at identical bpw."""
+    from magicquant.v2 import search as v2search
+
+    monkeypatch.setattr(v2search, "_model_has_block32_only_tensors", lambda p: False)
+    schemes = v2search._select_schemes(_v2_cfg(tmp_path, "m.gguf"), imatrix_active=True)
+    assert not ({"Q5_0", "Q5_1"} & set(schemes))
+    assert schemes == list(v2search.DEFAULT_SCHEMES)
+
+
+def test_v2_q4nx_profile_is_never_widened(tmp_path, monkeypatch):
+    """q4nx exists so the output packs losslessly for the FLM NPU converter.
+    Q5_0/Q5_1 are not in that profile and must not be smuggled into it."""
+    from magicquant.v2 import search as v2search
+
+    monkeypatch.setattr(v2search, "_model_has_block32_only_tensors", lambda p: True)
+    schemes = v2search._select_schemes(
+        _v2_cfg(tmp_path, "m.gguf", target_profile="q4nx"), imatrix_active=True
+    )
+    assert schemes == list(v2search.Q4NX_PROFILE_SCHEMES)
+
+
+def test_v2_explicit_scheme_list_is_never_widened(tmp_path, monkeypatch):
+    from magicquant.v2 import search as v2search
+
+    monkeypatch.setattr(v2search, "_model_has_block32_only_tensors", lambda p: True)
+    schemes = v2search._select_schemes(
+        _v2_cfg(tmp_path, "m.gguf", schemes=["BF16", "Q8_0"]), imatrix_active=True
+    )
+    assert schemes == ["BF16", "Q8_0"]
+
+
+def test_v2_detection_fails_closed_on_an_unreadable_model(tmp_path):
+    """Inability to inspect must never widen the set -- that would spend a
+    ~90 min recompute on a guess."""
+    from magicquant.v2 import search as v2search
+
+    assert v2search._model_has_block32_only_tensors("/nonexistent/model.gguf") is False

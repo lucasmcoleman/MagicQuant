@@ -31,6 +31,14 @@ an unrelated shim without pytest — it exits 0 having run nothing):
 .venv/bin/ruff check --select F magicquant/ tools/ tests/   # BLOCKING in CI — keep at zero
 ```
 
+**A THIRD environment consumes this package: `/server/programming/Foundry/.venv`.**
+It is not used to run these tests, but Foundry imports `magicquant` from the
+editable install, so a dependency-floor bump here breaks Foundry until that venv
+is upgraded too. This is not hypothetical: the 2026-08 `gguf>=0.19.0` bump made
+`ggml_facts` raise `ImportError` at import for every Foundry pipeline stage,
+because `REQUIRED_STOCK_NAMES` gained `NVFP4` and Foundry's venv was still on
+0.18.0. When changing a floor in `pyproject.toml`, upgrade all three.
+
 Torch-gated tests (`test_qat_*`, `test_fake_quant`, LoRA differential) skip in
 `.venv` and run in `.venv-qat`. Any change under `magicquant/qat/` must be
 verified in `.venv-qat`. If `.venv-qat` shows 3 failures in

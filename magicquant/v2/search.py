@@ -83,8 +83,44 @@ class V2Config:
     enable_iq: bool = False
 
 
+def _model_has_block32_only_tensors(source_model_path: str) -> bool:
+    """Does this model contain any tensor whose rows are 32- but not
+    256-divisible?
+
+    If so, every block-256 K-quant assigned to those tensors is rewritten by
+    the writer's block-size fallback, and the block-32 family is the only one
+    that can actually hold a size between Q4_1 (5.0 bpw) and Q8_0 (8.5) --
+    which is the gap that left nemotron_h_moe's Q5 and Q6 tier bands
+    structurally empty.
+
+    Returns False on any read failure: an inability to inspect the model is
+    never grounds to widen the choice set (and widening it costs a full
+    distortion-table recompute).
+    """
+    try:
+        from magicquant.gguf.source import open_model_source
+        from magicquant.gguf.writer import is_block32_only_tensor
+
+        src = open_model_source(source_model_path)
+        try:
+            for info in src.get_all_tensors_info():
+                shape = tuple(info["shape"])
+                if is_block32_only_tensor(info["name"], shape, len(shape)):
+                    return True
+        finally:
+            src.close()
+    except Exception as exc:
+        log.warning(
+            "could not inspect model for block-32-only tensors; leaving the "
+            "v2 choice set unchanged", error=str(exc),
+        )
+    return False
+
+
 def _select_schemes(cfg: V2Config, imatrix_active: bool) -> List[str]:
-    from magicquant.quant.schemes import get_scheme_by_name, IQ_SCHEME_NAMES
+    from magicquant.quant.schemes import (
+        get_scheme_by_name, IQ_SCHEME_NAMES, BLOCK32_Q5_SCHEME_NAMES,
+    )
 
     if cfg.schemes is not None:
         names = list(cfg.schemes)
@@ -96,6 +132,23 @@ def _select_schemes(cfg: V2Config, imatrix_active: bool) -> List[str]:
             names += ROCMFPX_SCHEMES
         if cfg.enable_iq:
             names += sorted(IQ_SCHEME_NAMES - _V2_SUB_2BIT_IQ_NAMES)
+        # Q5_0/Q5_1, shape-gated -- the v2 mirror of what v1's sampler does
+        # per group. DEFAULT_SCHEMES is a hand-maintained list rather than a
+        # registry read, so registering the schemes was NOT enough to make
+        # them reachable here: a budget run on the very model they were added
+        # for came back with the old nine and nothing looked wrong, because
+        # the distortion-table cache then correctly HIT on the old scheme-set
+        # key. Gated on the model rather than added unconditionally because
+        # widening the choice set forces a full table recompute (~90 min on a
+        # 30B), and on a 256-divisible model the table would only ever confirm
+        # that Q5_K dominates Q5_0 at identical bpw.
+        if _model_has_block32_only_tensors(cfg.source_model_path):
+            names += sorted(BLOCK32_Q5_SCHEME_NAMES)
+            log.info(
+                "v2: model has block-32-only tensors; adding the block-32 Q5 "
+                "schemes to the choice set",
+                stage="init", added=sorted(BLOCK32_Q5_SCHEME_NAMES),
+            )
 
     kept: List[str] = []
     for n in names:
