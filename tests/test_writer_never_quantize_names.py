@@ -167,3 +167,68 @@ def test_ssm_conv1d_still_reports_f32_required_operand_not_never_quantize(tmp_pa
         r["tensor"] == "blk.0.ssm_conv1d.weight" and r["reason"] == "never-quantize-name"
         for r in writer._fallbacks
     )
+
+
+# ── telemetry: the fallback summary must surface the cases that matter ──────
+
+def test_1d_never_quantize_match_is_not_recorded_as_a_fallback(tmp_path, monkeypatch):
+    """A 1-D norm matches the never-quantize list, but it would land at F32
+    one rule below anyway (the 1D-F32 rule), so recording it here tells an
+    operator nothing.
+
+    It is not harmless noise: the build summary prints ONE example per
+    reason, and group N falls to base_quant on essentially every generated
+    config, so a handful of ordinary norms ahead of a real 2-D case makes
+    the build advertise "output_norm.weight" and bury the ssm_norm.weight
+    this rule exists to catch. The F32 override itself stays unconditional
+    -- only the record is filtered.
+    """
+    src = StubSource([
+        _tensor("blk.0.attn_norm.weight", (256,)),     # 1-D: overridden, unrecorded
+        _tensor("blk.0.ssm_norm.weight", (4, 256)),    # 2-D: overridden AND recorded
+    ])
+    monkeypatch.setattr(source_mod, "open_model_source", lambda *a, **k: src)
+
+    writer = GGUFWriter(str(tmp_path / "h.gguf"))
+    writer.create_hybrid_gguf(
+        "ignored", {"base": "Q4_K_M", "groups": {"N": "Q8_0"}}, verbose=False,
+    )
+
+    never = [r for r in writer._fallbacks if r["reason"] == "never-quantize-name"]
+    assert [r["tensor"] for r in never] == ["blk.0.ssm_norm.weight"]
+
+    # ...and the 1-D tensor is still F32 on disk -- filtering telemetry must
+    # not have changed what was written.
+    from magicquant.gguf.reader import GGUFReader
+    reader = GGUFReader(str(tmp_path / "h.gguf"))
+    reader.open()
+    try:
+        assert reader.get_tensor_info("blk.0.attn_norm.weight")["data_type"] == 0
+        assert reader.get_tensor_info("blk.0.ssm_norm.weight")["data_type"] == 0
+    finally:
+        reader.close()
+
+
+def test_time_mix_lerp_fused_is_not_quantized(tmp_path, monkeypatch):
+    """The abort-class omission the first transcription of the list missed.
+
+    RWKV6/7 feed blk.*.time_mix_lerp_fused.weight to ggml_mul as src1
+    (rwkv7-base.cpp:53), and ggml binary ops need float operands. Its real
+    geometry is ne=(n_embd,1,1,6): 4-D, so the 1-D rule misses, and n_embd
+    is 256-divisible, so the block-size fallback misses too -- precisely the
+    hole ssm_norm.weight fell through.
+    """
+    src = StubSource([_tensor("blk.0.time_mix_lerp_fused.weight", (6, 1, 1, 256))])
+    monkeypatch.setattr(source_mod, "open_model_source", lambda *a, **k: src)
+
+    writer = GGUFWriter(str(tmp_path / "h.gguf"))
+    writer.create_hybrid_gguf(
+        "ignored", {"base": "Q4_K_M", "groups": {}}, verbose=False,
+    )
+
+    record = next(
+        r for r in writer._fallbacks
+        if r["tensor"] == "blk.0.time_mix_lerp_fused.weight"
+    )
+    assert record["actual"] == "F32"
+    assert record["reason"] == "never-quantize-name"

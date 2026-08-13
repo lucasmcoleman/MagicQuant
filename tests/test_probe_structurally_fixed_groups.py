@@ -243,3 +243,123 @@ def test_no_fixed_groups_leaves_search_groups_untouched(tmp_path):
     orch._exclude_fixed_groups(verbose=False)
 
     assert orch._search_groups == original
+
+
+# ---------------------------------------------------------------------------
+# Un-probeable is not the same as un-optimizable.
+# ---------------------------------------------------------------------------
+
+class _NonDivisibleReader:
+    """A group whose every tensor has a row width that isn't 32-divisible.
+
+    Shapes lifted from a real SigLIP-2 mmproj on this box: ffn_down rows are
+    4304 wide, and 4304 % 32 == 16.
+    """
+
+    _INFO = {
+        "v.blk.0.ffn_down.weight": {"n_dims": 2, "shape": [1152, 4304]},
+        "v.blk.1.ffn_down.weight": {"n_dims": 2, "shape": [1152, 4304]},
+    }
+
+    def open(self):
+        pass
+
+    def close(self):
+        pass
+
+    def get_tensor_names(self):
+        return list(self._INFO)
+
+    def get_tensor_info(self, name):
+        info = self._INFO.get(name)
+        return dict(info, name=name) if info else None
+
+
+def test_non_32_divisible_group_is_fixed_but_not_scheme_invariant(tmp_path, monkeypatch):
+    """No QUANTIZED scheme can move this group -- the writer sends a
+    non-32-divisible row to F32 -- so its probe is correctly skipped. But
+    BF16 has block_size == 1, sails past the writer's block-size fallback,
+    and is written F16 at half the F32 bytes. So the group is NOT
+    structurally fixed in the sense that licenses dropping it from the
+    search; marking it scheme-invariant would silently delete a real
+    half-size option.
+    """
+    monkeypatch.setattr(
+        "magicquant.gguf.reader.GGUFReader", lambda *a, **k: _NonDivisibleReader()
+    )
+    prober = _prober(tmp_path)
+    prober.probe_all_groups(groups=["D"], verbose=False)
+
+    assert prober.resolutions["D"] == PROBE_FIXED       # probe still skipped
+    assert prober.fixed_groups["D"]["reason"] == "non-32-divisible row"
+    assert prober.fixed_groups["D"]["scheme_invariant"] is False
+
+
+def test_never_quantize_group_is_scheme_invariant(tmp_path, monkeypatch):
+    """The contrast case: name-based and 1-D reasons hold for EVERY target
+    type, including BF16, so group R really is fixed for all schemes."""
+    monkeypatch.setattr(
+        "magicquant.gguf.reader.GGUFReader", lambda *a, **k: _RouterReader()
+    )
+    prober = _prober(tmp_path)
+    prober.probe_all_groups(groups=["R"], verbose=False)
+
+    assert prober.fixed_groups["R"]["scheme_invariant"] is True
+
+
+# ── the orchestrator honours the distinction ────────────────────────────────
+
+def _bare_orchestrator(fixed_groups, search_groups):
+    """Build just enough orchestrator to exercise _exclude_fixed_groups
+    without running its real constructor."""
+    from magicquant.orchestrator import MagicQuantOrchestrator
+
+    orch = MagicQuantOrchestrator.__new__(MagicQuantOrchestrator)
+    orch.fixed_groups = fixed_groups
+    orch._search_groups = list(search_groups)
+    return orch
+
+
+def test_scheme_invariant_group_is_dropped_from_the_search():
+    orch = _bare_orchestrator(
+        {"R": {"reason": "ffn_gate_inp.weight", "tensor_count": 4,
+               "scheme_invariant": True}},
+        ["Q", "K", "R", "U"],
+    )
+    orch._exclude_fixed_groups(verbose=False)
+    assert orch._search_groups == ["Q", "K", "U"]
+
+
+def test_scheme_dependent_group_keeps_its_search_slot():
+    orch = _bare_orchestrator(
+        {"D": {"reason": "non-32-divisible row", "tensor_count": 2,
+               "scheme_invariant": False}},
+        ["Q", "K", "D", "U"],
+    )
+    orch._exclude_fixed_groups(verbose=False)
+    assert orch._search_groups == ["Q", "K", "D", "U"]
+
+
+def test_mixed_fixed_groups_drop_only_the_scheme_invariant_one():
+    orch = _bare_orchestrator(
+        {
+            "R": {"reason": "ffn_gate_inp.weight", "tensor_count": 4,
+                  "scheme_invariant": True},
+            "D": {"reason": "non-32-divisible row", "tensor_count": 2,
+                  "scheme_invariant": False},
+        },
+        ["Q", "R", "D", "U"],
+    )
+    orch._exclude_fixed_groups(verbose=False)
+    assert orch._search_groups == ["Q", "D", "U"]
+
+
+def test_pre_branch_checkpoint_without_the_key_keeps_old_exclusion_behaviour():
+    """A checkpoint written before scheme_invariant existed has no such key.
+    Defaulting it to True preserves exactly what that run would have done."""
+    orch = _bare_orchestrator(
+        {"R": {"reason": "ffn_gate_inp.weight", "tensor_count": 4}},
+        ["Q", "R", "U"],
+    )
+    orch._exclude_fixed_groups(verbose=False)
+    assert orch._search_groups == ["Q", "U"]

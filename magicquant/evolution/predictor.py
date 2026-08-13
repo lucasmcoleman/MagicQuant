@@ -62,6 +62,7 @@ class PredictiveScorer:
         baseline_tps: float = 0,
         imatrix_active: bool = False,
         calibration_source: str = "",
+        effective_bpw: Optional[Dict[str, Dict[str, float]]] = None,
     ):
         self.sensitivity_weights = sensitivity_weights
         self.parameter_counts = parameter_counts or {}
@@ -81,6 +82,26 @@ class PredictiveScorer:
         # historical lookup exactly -- required for the seed-pinned
         # regression fixture, which builds PredictiveScorer directly.
         self.calibration_source = calibration_source
+        # {group: {scheme: real_bpw}} -- what each (group, scheme) pair will
+        # actually cost once the writer's compat chain has had its say on THIS
+        # model, supplied by the orchestrator. Only groups/schemes whose real
+        # cost differs from the registry's advertised bpw need appear; see
+        # _bpw_for, which falls through to the registry for everything else.
+        #
+        # None (default) is the pre-2026-08 behaviour exactly, which is what
+        # the seed-pinned regression fixture and every direct-construction
+        # caller rely on.
+        #
+        # Deliberately NOT paired with an effective-NOISE table. On a
+        # block-32-only model a Q5_K assignment ships as Q8_0, so its true
+        # noise is 1.0 while the predictor keeps a pessimistic 3.0. That is
+        # directionally safe -- Q5_K then looks both large AND noisy, so it is
+        # correctly abandoned in favour of Q8_0 or the Q5_0/Q5_1 pair that
+        # really do hold that size band -- but it does mean predicted_loss is
+        # wrong for those configs and will show up as inflated residuals in
+        # the measured-search active-learning loop. Fixing that properly needs
+        # a measured noise number per rewritten pair, not an inferred one.
+        self.effective_bpw = effective_bpw or {}
 
         # Learnable residual cache for active learning
         self.residual_cache: Dict[str, float] = {}
@@ -134,8 +155,7 @@ class PredictiveScorer:
 
         for group, scheme in group_schemes.items():
             params_in_group = self.parameter_counts.get(group, 0)
-            compression = self._compression_for(scheme)
-            bits = 16.0 / compression
+            bits = self._bpw_for(group, scheme)
             total_weighted_bits += params_in_group * bits
 
         if total_params > 0:
@@ -235,8 +255,7 @@ class PredictiveScorer:
 
         for group, scheme in group_schemes.items():
             dist = param_dist.get(group, 0.05)
-            compression = self._compression_for(scheme)
-            bpw = 16.0 / compression
+            bpw = self._bpw_for(group, scheme)
             total_weighted_bpw += dist * bpw
             total_dist += dist
 
@@ -287,6 +306,35 @@ class PredictiveScorer:
             return get_scheme_by_name(scheme).compression_ratio
         except ValueError:
             return 2.0
+
+    def _bpw_for(self, group: str, scheme: str) -> float:
+        """Bits-per-weight this (group, scheme) pair will ACTUALLY cost on the
+        model being searched, not what the registry advertises.
+
+        The two diverge whenever the writer's compat chain rewrites a scheme.
+        The case this exists for: on a model whose rows are 32- but not
+        256-divisible, a Q5_K assignment is rewritten to Q8_0 by the
+        block-size fallback, so it costs 8.5 bpw and not 5.5. Without this,
+        the predictor prices Q5_K at 5.5, believes it is both smaller and
+        cleaner than Q5_0 (5.5 bpw, noise 3.4), and picks it every time --
+        while the actual write silently produces an 8.5 bpw tensor. The Q5_0
+        entry would then exist in the registry and never once be selected, and
+        the empty-tier-band problem it was added to solve would remain,
+        looking like the schemes simply were not competitive.
+
+        Falls through to the registry's own ratio -- the exact historical
+        expression, `16.0 / self._compression_for(scheme)` -- whenever the
+        orchestrator could not supply a table (no model open, read failed, or
+        this group/scheme was not priced). Unknown means "behave exactly as
+        before", never "guess".
+        """
+        if self.effective_bpw:
+            per_group = self.effective_bpw.get(group)
+            if per_group:
+                bpw = per_group.get(scheme)
+                if bpw is not None:
+                    return bpw
+        return 16.0 / self._compression_for(scheme)
 
     def _speed_for(self, scheme: str) -> float:
         """Prefer an empirically calibrated speed_multiplier (from

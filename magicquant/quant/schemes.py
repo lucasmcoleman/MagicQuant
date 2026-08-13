@@ -247,6 +247,25 @@ Q2_K = QuantizationScheme(
 # upgrade_neighbor=None for both, and no EXISTING scheme's upgrade_neighbor
 # is changed to point at them -- the default mutation (Protector/Crusher)
 # neighbor-walk can never reach these from any v1-reachable scheme.
+#
+# uses_imatrix=True, verified against ggml rather than assumed from the
+# "legacy" label. ggml_quantize_chunk routes GGML_TYPE_Q4_0/Q4_1 to
+# quantize_q4_0/quantize_q4_1, which fall through to the unweighted _ref
+# encoders ONLY under `if (!quant_weights)`; given a non-NULL imatrix they
+# call quantize_row_q4_0_impl / _q4_1_impl (ggml-quants.c:1893/1936), which
+# build weight[j] = qw[j] * sqrtf(sigma2 + x[j]^2) and feed
+# make_qx_quants / make_qkx3_quants -- the same weighted machinery the
+# K-quants use. Measured through the live libggml: 159/227 differing bytes
+# and weighted MSE -22.7% / -39.9% with an imatrix versus without.
+#
+# This was registered False until 2026-08. Nothing shipped wrong -- the
+# encoder passes the imatrix through unconditionally, so the BYTES were
+# always weighted; `uses_imatrix` has exactly one functional consumer,
+# effective_noise_factor, reached only from PredictiveScorer, which cannot
+# see these schemes while they stay out of v1 sampling. It was wrong
+# metadata one line away from mattering. tests/test_legacy_q4_schemes.py
+# pinned the wrong value; the registry-wide behavioural cross-check in
+# tests/test_uses_imatrix_matches_ggml.py is what keeps it honest now.
 
 Q4_0 = QuantizationScheme(
     name="Q4_0",
@@ -256,7 +275,7 @@ Q4_0 = QuantizationScheme(
     noise_factor=5.0,
     speed_multiplier=3.4,   # ~parity with Q4_K_M; both are 4-bit block quants
     category="legacy_q",
-    uses_imatrix=False,
+    uses_imatrix=True,      # see the imatrix note above the Q4_0 block
     requires_imatrix=False,
     upgrade_neighbor=None,
     downgrade_neighbor=None,
@@ -269,6 +288,146 @@ Q4_1 = QuantizationScheme(
     bits_per_weight=5.0,
     noise_factor=4.7,
     speed_multiplier=3.4,   # ~parity with Q4_K_M; both are 4-bit block quants
+    category="legacy_q",
+    uses_imatrix=True,      # see the imatrix note above the Q4_0 block
+    requires_imatrix=False,
+    upgrade_neighbor=None,
+    downgrade_neighbor=None,
+)
+
+
+# ── Block-32 Q5 quants ───────────────────────────────────────────────
+# The reason these exist: a model whose rows are not 256-divisible sends
+# every block-256 scheme through the writer's block-size fallback, so the
+# achievable sizes collapse to whatever the block-32 family offers. That
+# family ran Q4_1 (5.0 bpw) -> Q8_0 (8.5 bpw) with nothing between, which
+# is a hole exactly wide enough to swallow the Q5 and Q6 tier bands. On
+# nemotron_h_moe (hidden_size 2688, moe_intermediate_size 1856 -- neither
+# 256-divisible) both bands came out structurally EMPTY: nothing could land
+# between 19.91 GiB and 32.54 GiB. Q5_0 at 5.5 bpw lands inside Q5.
+#
+# bpw from the real ggml block structs (ggml-common.h):
+#   Q5_0 = 22B/32 = 5.5 bpw  (block_q5_0: d + qh[4] + qs[16])
+#   Q5_1 = 24B/32 = 6.0 bpw  (block_q5_1: d + m + qh[4] + qs[16])
+#
+# uses_imatrix=True, verified in ggml-quants.c the same way Q4_0/Q4_1 were
+# (see the note above Q4_0): quantize_q5_0/quantize_q5_1 fall through to the
+# unweighted _ref encoders only under `if (!quant_weights)`; with an imatrix
+# they call quantize_row_q5_0_impl (make_qx_quants) / _q5_1_impl
+# (make_qkx3_quants). Confirmed behaviourally by
+# tests/test_uses_imatrix_matches_ggml.py, which encodes every registry
+# scheme with and without an imatrix and asserts the bytes differ iff this
+# flag says they should. Do NOT copy Q4_0's pre-2026-08 value here.
+#
+# noise_factor: measured, not interpolated by eye. Encode->decode through
+# the real libggml and take the imatrix-weighted squared error relative to
+# Q8_0 (v2.sensitivity._weighted_sq_err -- the same metric v2 prices tensors
+# with), then interpolate on ln(ratio) between the two bracketing anchors
+# already in this registry, Q5_K (3.00) and Q4_K_M (4.50):
+#     Q5_1  ratio  48.6 -> 3.10        Q5_0  ratio  63.4 -> 3.39
+# Measured on two models -- nemotron_h_moe 30B-A3B and a 235GB bf16 -- whose
+# ratios agreed within 4% for every scalar block quant. The CONTROL that
+# makes those numbers usable: recovering Q6_K by the same interpolation from
+# only Q8_0/Q5_K gives 2.26 against its registered 2.20. A global log-linear
+# fit across the whole 8.5->2.6 bpw range is NOT good (RMS 2.17), so this is
+# an interpolation between tight anchors and must not be extrapolated.
+#
+# Two schemes were deliberately excluded from that fit, and the exclusion is
+# the point rather than a convenience: MXFP4's ratio moved 441 -> 1072
+# between the two models while every scalar quant moved <5%, and IQ4_NL's
+# reconstruction error famously does not track its perplexity (see the
+# imatrix invariants in CLAUDE.md). Reconstruction-error pricing is only
+# defensible WITHIN the scalar block-quant family, which is what Q5_0/Q5_1
+# are. Independent unweighted rel-RMS derivations landed on 3.3/3.1, i.e.
+# within 0.1 of the above.
+#
+# Sanity of the resulting order, which is the real test: Q5_0 (5.5 bpw,
+# legacy) at 3.40 is noisier than Q5_K (5.5 bpw, K-quant) at 3.00 -- the
+# same "legacy loses to the K-quant at equal bpw" relationship the registry
+# already encodes for Q4_0 (5.00) vs Q4_K_M (4.50). And neither is dominated
+# by MXFP4 (4.25 bpw / 4.00), which is what makes the search able to pick
+# them at all.
+#
+# speed_multiplier is NOT derived -- 2.7 is slotted between Q6_K and Q4_K_M
+# by bpw. Nothing in this registry has a benchmarked speed multiplier; do not
+# single these two out for correction.
+#
+# REACHABILITY: like Q4_0/Q4_1 these are orphans in the STATIC chain, and no
+# existing scheme's neighbour is re-pointed at them here. They become
+# reachable only through EvolutionarySurvivor's runtime overlay, and only
+# for groups whose tensors are block-32-only on the model actually being
+# searched. A static re-point would change the neighbour walk for every
+# model, including the 256-divisible ones where Q5_K is strictly better than
+# Q5_0 at identical bpw.
+
+Q5_0 = QuantizationScheme(
+    name="Q5_0",
+    ggml_type_name="Q5_0",
+    ggml_type_id=6,
+    bits_per_weight=5.5,    # 22 B/block * 8 / 32
+    noise_factor=3.4,
+    speed_multiplier=2.7,   # not benchmarked -- see note above
+    category="legacy_q",
+    uses_imatrix=True,
+    requires_imatrix=False,
+    upgrade_neighbor="Q5_1",
+    downgrade_neighbor="Q5_K",
+)
+
+Q5_1 = QuantizationScheme(
+    name="Q5_1",
+    ggml_type_name="Q5_1",
+    ggml_type_id=7,
+    bits_per_weight=6.0,    # 24 B/block * 8 / 32
+    noise_factor=3.1,
+    speed_multiplier=2.7,   # not benchmarked -- see note above
+    category="legacy_q",
+    uses_imatrix=True,
+    requires_imatrix=False,
+    upgrade_neighbor="Q6_K",
+    downgrade_neighbor="Q5_0",
+)
+
+
+# ── NVFP4 ────────────────────────────────────────────────────────────
+# NVIDIA FP4: block 64 with a UE4M3 scale per 16-element sub-block
+# (QK_NVFP4=64, QK_NVFP4_SUB=16, block_nvfp4 = 4 + 32 = 36 B -> 4.5 bpw).
+# Upstream ggml type 40, not a fork type.
+#
+# OPT-IN, default off (ENABLE via enable_nvfp4). Three separate reasons, all
+# verified on this box rather than assumed:
+#
+#  1. uses_imatrix=False, and it means it. quantize_nvfp4 opens with
+#     GGML_UNUSED(quant_weights) and calls quantize_row_nvfp4_ref, whose
+#     signature (x, y, k) has no weights parameter at all. Unlike Q2_0/Q1_0 --
+#     which merely LOOK imatrix-aware because they branch on quant_weights
+#     before calling the unweighted kernel in both arms -- NVFP4 does not even
+#     pretend. An uncalibrated scheme competing in an imatrix-on search is the
+#     exact situation that cost IQ4_NL all 11 of its measured comparisons.
+#
+#  2. The bound libggml can ENCODE it but not DECODE it (dequantize_row_nvfp4
+#     is absent from this build; verified live). So v2's distortion table
+#     cannot price it, and the encode->decode method used to derive the
+#     Q5_0/Q5_1 noise factors cannot measure it here either. noise_factor 3.7
+#     is therefore NOT locally verified -- it comes from an external
+#     derivation and should be treated as provisional until this build gains
+#     a dequant path.
+#
+#  3. The llama-perplexity on PATH (linuxbrew b7090) has no nvfp4 symbols, so
+#     it cannot LOAD an NVFP4 GGUF. A measured search that selects NVFP4 will
+#     fail at measurement time on the default runtime. gfx1151 compute kernels
+#     do exist in the newer checkout, so this is a tooling gap, not a hardware
+#     one -- but it is why this must not be reachable by default.
+#
+# Orphaned in the chain (no neighbours, nothing points at it) for the same
+# reason as Q4_0/Q4_1: reachability is opt-in, never incidental.
+NVFP4 = QuantizationScheme(
+    name="NVFP4",
+    ggml_type_name="NVFP4",
+    ggml_type_id=40,
+    bits_per_weight=4.5,    # 36 B/block * 8 / 64
+    noise_factor=3.7,       # provisional -- see (2) above
+    speed_multiplier=3.5,   # not benchmarked
     category="legacy_q",
     uses_imatrix=False,
     requires_imatrix=False,
@@ -513,6 +672,9 @@ _REGISTRY: Dict[str, QuantizationScheme] = {
     "Q2_K": Q2_K,
     "Q4_0": Q4_0,
     "Q4_1": Q4_1,
+    "Q5_0": Q5_0,
+    "Q5_1": Q5_1,
+    "NVFP4": NVFP4,
     "ROCMFP8": ROCMFP8,
     "ROCMFP6": ROCMFP6,
     "ROCMFP4": ROCMFP4,
@@ -535,6 +697,22 @@ ROCMFPX_SCHEME_NAMES = frozenset({"ROCMFP8", "ROCMFP6", "ROCMFP4", "ROCMFP3"})
 # survival.py's _generate_random_config). Reserved for explicit per-tensor
 # scheme overrides (writer.py's "tensors" key), not the evolutionary sampler.
 LEGACY_Q4_SCHEME_NAMES = frozenset({"Q4_0", "Q4_1"})
+
+# Block-32 Q5 scheme names. Like LEGACY_Q4_SCHEME_NAMES these are kept out of
+# v1's default sampling pool, but for a narrower reason: they are added back
+# for a specific GROUP when that group's tensors on THIS model are
+# block-32-only (32-divisible rows that aren't 256-divisible), which is the
+# only situation where they beat the K-quant of the same bpw. On an ordinary
+# 256-divisible model Q5_K is strictly better than Q5_0 at identical 5.5 bpw,
+# so making them globally reachable would make ordinary searches worse -- and
+# would churn the seed-pinned fixture. See EvolutionarySurvivor's
+# block32_only_groups and _BLOCK32_Q5_CHAIN_OVERLAY.
+BLOCK32_Q5_SCHEME_NAMES = frozenset({"Q5_0", "Q5_1"})
+
+# NVFP4: opt-in only (enable_nvfp4). Excluded from the default sampling pool
+# for the reasons in the NVFP4 block above -- imatrix-blind, unpriceable on
+# this build (no dequant), and unloadable by the llama-perplexity on PATH.
+NVFP4_SCHEME_NAMES = frozenset({"NVFP4"})
 
 # Sub-4-bit IQ scheme names (opt-in; excluded from the default search pool).
 # Deliberately does NOT include IQ4_NL, which is gated separately by

@@ -308,6 +308,45 @@ def _block32_fallback(target_ggml_name: str, row_size: int, group: str) -> str:
     return "MXFP4" if low_bit else "Q8_0"
 
 
+def _is_quantization_candidate(name: str, shape: tuple, n_dims: int) -> bool:
+    """Is this tensor one the search can meaningfully assign a scheme to?
+
+    False for everything Pass 1 forces to F32 irrespective of scheme -- 1-D
+    tensors, F32-required SSM conv operands, and the never-quantize-by-name
+    list -- and for rows too narrow for any block quant at all. Lives beside
+    _block32_fallback so the two cannot drift: this answers "does the scheme
+    choice matter for this tensor", that answers "what does it become".
+    """
+    if n_dims <= 1:
+        return False
+    if _is_f32_required_ssm_operand(name) or _is_never_quantized(name):
+        return False
+    row_size = shape[-1] if shape else 0
+    return row_size % 32 == 0
+
+
+def is_block32_only_tensor(name: str, shape: tuple, n_dims: int) -> bool:
+    """Is this tensor a real quantization candidate whose row width admits a
+    block-32 quant but NOT a block-256 K-quant?
+
+    Public (no underscore) because the search consumes it -- the orchestrator
+    uses it to decide which groups get Q5_0/Q5_1 offered. Deliberately placed
+    next to ``_block32_fallback``, whose rule it has to agree with: a tensor
+    this returns True for is exactly one where any K-quant assignment gets
+    rewritten by that fallback, so the registry's advertised bpw for a
+    K-quant is a lie about this tensor's real cost.
+
+    Note the asymmetry with ``_is_never_quantized``: a never-quantized tensor
+    is not "block-32-only", it is not a candidate at all, so it returns False
+    rather than True. Treating it as block-32-only would let a group made
+    entirely of norms qualify for Q5_0/Q5_1, which can never take effect.
+    """
+    if not _is_quantization_candidate(name, shape, n_dims):
+        return False
+    row_size = shape[-1] if shape else 0
+    return row_size % 256 != 0
+
+
 def _encode_entry(source, entry, imatrix=None) -> bytes:
     """Read one tensor from ``source`` and encode it per its Pass-1 target.
 
@@ -418,8 +457,12 @@ def _is_f32_required_ssm_operand(name: str) -> bool:
 
 
 # Tensor names llama.cpp's own quantizer refuses to quantize outright,
-# regardless of shape -- mirrored from tensor_allows_quantization() in
-# llama.cpp's src/llama-quant.cpp (~lines 289-366, current checkout).
+# regardless of shape -- mirrored from the `quantize &= name.find(...)`
+# chain in llama.cpp's src/llama-quant.cpp (llama_model_quantize_impl,
+# the block starting at `bool quantize = name.rfind("weight") == ...`).
+# tests/test_never_quantize_upstream_parity.py re-derives that chain
+# from a real llama.cpp checkout and fails if this tuple falls behind
+# it -- the first transcription of this list stopped 11 rules short.
 # This is what covers e.g. nemotron_h_moe's blk.*.ssm_norm.weight: it's
 # 2-D (so the 1D-F32 rule below doesn't fire) with ne[0]=512 (both
 # 32- and 256-divisible, so the block-size fallback below doesn't fire
@@ -427,12 +470,23 @@ def _is_f32_required_ssm_operand(name: str) -> bool:
 # later aborts in ggml-cpu binary_op on the f32/q8_0 operand mismatch
 # (ssm_norm feeds ggml_mul via build_norm in mamba-base.cpp).
 #
-# This is a DIFFERENT and weaker constraint than
-# _is_f32_required_ssm_operand above: that one applies even to float
-# targets (BF16/F16) because the CUDA ssm_conv kernel hard-asserts a
-# float row stride, whereas this one only ever overrides an actually
-# -quantized target (see the `target_ggml_name != "F32"` guard at the
-# call site) -- upstream is happy to leave these tensors at BF16/F16.
+# This is a DIFFERENT constraint from _is_f32_required_ssm_operand
+# above: that one is about a CUDA kernel hard-asserting a float row
+# stride, this one mirrors what upstream's quantizer will and won't
+# touch by name.
+#
+# Note what the `target_ggml_name != "F32"` guard at the call site does
+# and does NOT mean. It only skips re-logging a tensor the SSM rule
+# already pinned; a BF16/F16 target still gets overridden to F32 here.
+# That is a deliberate divergence from upstream, which copies a
+# non-quantized tensor verbatim at its source dtype
+# (llama-quant.cpp's `!quantize` branch). For "_norm.weight" the F32 is
+# load-bearing -- the norm weight is src1 of ggml_mul and
+# ggml-cpu/binary-ops.cpp accepts src1 only as F32 against an f32
+# src0/dst, so "preserve the source dtype" would abort on f16 exactly
+# as it did on q8_0. For the gemma3n-only names (altup*, laurel*,
+# per_layer_model_proj) it is pure size: they are ggml_mul_mat operands
+# where F16 would be legal, and forcing F32 costs ~106 MB on E4B.
 # Keep both checks; this list intentionally includes "ssm_conv1d" and
 # "shortconv.conv.weight" too so a group-"S" mismatch doesn't slip
 # past both, even though _is_f32_required_ssm_operand already forces
@@ -448,16 +502,50 @@ _NEVER_QUANTIZE_NAME_SUBSTRINGS = (
     "shortconv.conv.weight",
     "indexer.k_proj.weight",
     "indexer.q_proj.weight",
+    # RWKV time-mix operands. The full upstream set, not a prefix of it --
+    # "time_mix_lerp_fused.weight" in particular is abort-class, not a
+    # quality nicety: rwkv7-base.cpp:53 / rwkv6-base.cpp:70 feed it to
+    # ggml_mul as src1, and it carries ne=(n_embd,1,1,6), so n_dims==4
+    # dodges the 1-D rule while a 256-divisible ne[0] dodges the
+    # block-size fallback -- exactly the hole ssm_norm.weight fell through.
     "time_mix_first.weight",
     "time_mix_w0.weight",
     "time_mix_w1.weight",
     "time_mix_w2.weight",
+    "time_mix_v0.weight",
+    "time_mix_v1.weight",
+    "time_mix_v2.weight",
+    "time_mix_a0.weight",
+    "time_mix_a1.weight",
+    "time_mix_a2.weight",
+    "time_mix_g1.weight",
+    "time_mix_g2.weight",
+    "time_mix_decay_w1.weight",
+    "time_mix_decay_w2.weight",
+    "time_mix_lerp_fused.weight",
+    "attn_rel_b.weight",
     # Positional embeddings / token types: upstream matches these via
     # LLM_TN(arch)(LLM_TENSOR_POS_EMBD/TOKEN_TYPES, "weight"), which is
     # arch-templated per-architecture tensor naming. This writer has no
     # such per-arch table, so match on the GGUF canonical name instead.
     "position_embd.weight",
     "token_types.weight",
+    # Vision / audio projector operands. Most of these are already forced
+    # to F32 by the block-size fallback in practice (real .patch_embd rows
+    # are 14/16 wide, .patch_merger 2), but "mm.a.code_embd.weight"
+    # classifies into group E with a 32-divisible row and WOULD be
+    # quantized here while upstream refuses it. Mirrored as a set so the
+    # drift tripwire below keeps them current rather than rediscovering
+    # them one incident at a time.
+    ".position_embd",
+    "sam.pos_embd",
+    "sam.neck.",
+    "sam.net_",
+    ".rel_pos",
+    ".patch_embd",
+    ".patch_merger",
+    "a.rvq.codebook",
+    "mm.a.code_embd",
 )
 
 
@@ -995,13 +1083,24 @@ class GGUFWriter:
                 if verbose:
                     print(f"  [COMPAT] {name}: llama.cpp never quantizes this "
                           f"tensor by name, keeping at F32")
-                self._fallbacks.append({
-                    "tensor": name,
-                    "group": group,
-                    "requested": target_ggml_name,
-                    "actual": "F32",
-                    "reason": "never-quantize-name",
-                })
+                # Record only 2-D+ matches. A 1-D match (every ordinary
+                # norm/bias, and group N falls to base_quant on essentially
+                # every generated config) would land at F32 one rule below
+                # anyway, so logging it here says nothing an operator can
+                # act on -- but it does crowd out the 2-D cases inside this
+                # bucket. The summary line prints one example per reason, so
+                # 17 trivial norms ahead of a real ssm_norm.weight means the
+                # build advertises "output_norm.weight" and buries the tensor
+                # this rule exists to catch. The F32 override itself stays
+                # unconditional; only the telemetry is filtered.
+                if n_dims >= 2:
+                    self._fallbacks.append({
+                        "tensor": name,
+                        "group": group,
+                        "requested": target_ggml_name,
+                        "actual": "F32",
+                        "reason": "never-quantize-name",
+                    })
                 target_ggml_name = "F32"
                 target_ggml_id = GGML_TYPE["F32"]
 
@@ -1154,7 +1253,19 @@ class GGUFWriter:
                     # data is written.
                     target_ggml_id = -1
 
-            expected_size = ggml_tensor_data_size(target_ggml_name, n_elems)
+            if target_ggml_id == -1:
+                # No block/type-size fact exists for an unrecognized type, and
+                # ggml_tensor_data_size now raises rather than guessing one
+                # (guessing silently corrupts blocked types -- see
+                # ggml_facts.expected_size). Size this entry at 0: the
+                # bad_tensors pass a few lines below raises a ValueError
+                # naming the tensor and its UNKNOWN type before any offset is
+                # used or any byte is written, so the value is never read.
+                # Computing it here would raise a KeyError first and replace
+                # that specific, actionable error with an opaque one.
+                expected_size = 0
+            else:
+                expected_size = ggml_tensor_data_size(target_ggml_name, n_elems)
             aligned_offset = _align(data_offset)
 
             tensor_entries.append({

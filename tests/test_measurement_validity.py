@@ -106,7 +106,17 @@ def test_impossible_candidate_measurement_is_flagged_invalid(tmp_path, monkeypat
     # test_all_invalid_measurements_raises_instead_of_completing_with_zero_tiers),
     # which is exactly what lets this test isolate the flagging behavior on
     # its own.
-    tools = _ControlledLlamaTools(baseline, [2.74, 2.6, 40.0, 41.0])
+    # INTERLEAVED invalid/valid rather than grouped-then-grouped. The stub
+    # hands these out in order and cycles the last, so a grouped sequence
+    # ([2.74, 2.6, 40.0, 41.0]) only yields the required mix when the search
+    # happens to measure at least 3 candidates. That made this test depend on
+    # candidate COUNT, which is not what it is testing -- and it broke when
+    # effective-bpw pricing landed: on a stub whose rows are 64/128 wide,
+    # every K-quant config now prices to the same rewritten cost (they really
+    # do render to identical files), so distinct configs collapse and fewer
+    # candidates get measured. Interleaving makes the mix hold at any count
+    # >= 2 while testing exactly the same flagging behaviour.
+    tools = _ControlledLlamaTools(baseline, [2.6, 40.0, 2.74, 41.0])
     orch = _make_orchestrator(tmp_path, monkeypatch, tools)
 
     orch.run_measured_search(

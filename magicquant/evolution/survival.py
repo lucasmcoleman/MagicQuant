@@ -13,7 +13,7 @@ with the evolutionary pressure finding which tensor groups can tolerate
 MXFP4 and which need protection at higher precision.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 import random
 import copy
 
@@ -53,7 +53,39 @@ class EvolutionarySurvivor:
 
     DEFAULT_GROUPS = ['E', 'H', 'Q', 'K', 'O', 'U', 'D']
 
-    def _walk(self, scheme: str, attr: str) -> Optional[str]:
+    # Runtime re-points that splice Q5_0/Q5_1 into the neighbour chain, applied
+    # ONLY for a group listed in self.block32_only_groups. Deliberately an
+    # overlay rather than an edit to the registry's own upgrade/downgrade
+    # fields: a static re-point would reroute the mutation walk for every
+    # model, and on a 256-divisible model that means offering Q5_0 where Q5_K
+    # is strictly better at the same 5.5 bpw. It would also churn
+    # tests/fixtures/refactor_regression_seed42.json.
+    #
+    # Effective chain for a qualifying group:
+    #     Q6_K <-> Q5_1 <-> Q5_0 <-> Q5_K
+    # (the Q5_1/Q5_0 halves of that come from their own registry entries;
+    # only the two existing schemes need overriding here).
+    _BLOCK32_Q5_CHAIN_OVERLAY = {
+        ("Q6_K", "downgrade_neighbor"): "Q5_1",
+        ("Q5_K", "upgrade_neighbor"): "Q5_0",
+    }
+
+    def _neighbor(self, scheme: str, attr: str, group: Optional[str]) -> Optional[str]:
+        """The *attr* neighbour of *scheme*, with the block-32 Q5 overlay
+        applied when *group* qualifies.
+
+        ``group=None`` means "no group context" and always yields the plain
+        registry answer -- that default is what keeps every existing caller
+        and test (e.g. tests/test_iq_schemes.py's direct _walk calls)
+        behaving exactly as before.
+        """
+        if group is not None and group in self.block32_only_groups:
+            override = self._BLOCK32_Q5_CHAIN_OVERLAY.get((scheme, attr))
+            if override is not None:
+                return override
+        return getattr(get_scheme_by_name(scheme), attr)
+
+    def _walk(self, scheme: str, attr: str, group: Optional[str] = None) -> Optional[str]:
         """Follow the up/downgrade chain one usable step, or None at the end.
 
         Two different exclusions, handled differently on purpose:
@@ -72,7 +104,7 @@ class EvolutionarySurvivor:
         current = scheme
         while True:
             try:
-                neighbor = getattr(get_scheme_by_name(current), attr)
+                neighbor = self._neighbor(current, attr, group)
             except ValueError:
                 return None
             if neighbor is None or neighbor in seen:
@@ -89,13 +121,17 @@ class EvolutionarySurvivor:
                 continue
             return neighbor
 
-    def _upgrade(self, scheme: str) -> Optional[str]:
-        """Return the next-better usable scheme, or None if at the top."""
-        return self._walk(scheme, "upgrade_neighbor")
+    def _upgrade(self, scheme: str, group: Optional[str] = None) -> Optional[str]:
+        """Return the next-better usable scheme, or None if at the top.
 
-    def _downgrade(self, scheme: str) -> Optional[str]:
+        *group* opts into the block-32 Q5 chain overlay; omitting it gives the
+        plain registry chain, which is what every pre-existing caller wants.
+        """
+        return self._walk(scheme, "upgrade_neighbor", group)
+
+    def _downgrade(self, scheme: str, group: Optional[str] = None) -> Optional[str]:
         """Return the next-smaller usable scheme, or None if at the bottom."""
-        return self._walk(scheme, "downgrade_neighbor")
+        return self._walk(scheme, "downgrade_neighbor", group)
 
     # Groups that are sensitive to quantization ("brain" layers)
     # Cross-reference: magicquant.evolution.predictor.PredictiveScorer.HIGH_SENSITIVITY_GROUPS
@@ -137,6 +173,7 @@ class EvolutionarySurvivor:
         stream_aware: bool = False,
         objective_weights: Optional[Tuple[float, float, float]] = None,
         use_bytes_tps: bool = False,
+        block32_only_groups: Optional[Iterable[str]] = None,
     ):
         self.predictor = predictor
         self.baseline_config = baseline_config
@@ -161,6 +198,20 @@ class EvolutionarySurvivor:
         # False, which is the honest default -- the search threads no imatrix
         # unless the caller says otherwise.
         self.has_imatrix = has_imatrix
+        # Groups whose tensors on THIS model are block-32-only: 32-divisible
+        # rows that are not 256-divisible, so every block-256 scheme assigned
+        # to them is rewritten by the writer's block-size fallback. Only for
+        # these does the Q5_0/Q5_1 pair join the sampling pool -- they are the
+        # only registry schemes that land between Q4_1 (5.0 bpw) and Q8_0
+        # (8.5 bpw) at block 32, which is the gap that made nemotron_h_moe's
+        # Q5 and Q6 tier bands come out structurally empty.
+        #
+        # Empty by default, and empty means byte-for-byte today's behaviour --
+        # that is deliberate. A static re-point of the neighbour chain, or a
+        # global pool addition, would change the search for EVERY model,
+        # including 256-divisible ones where Q5_K beats Q5_0 at identical
+        # 5.5 bpw, and would churn tests/fixtures/refactor_regression_seed42.json.
+        self.block32_only_groups = frozenset(block32_only_groups or ())
         # When True, random-config sampling for the 'H' (output.weight /
         # LM head) group ONLY is reweighted toward the smaller K-quants
         # (Q6_K/Q5_K/Q8_0) and away from BF16 -- output.weight streams in
@@ -548,6 +599,7 @@ class EvolutionarySurvivor:
         from magicquant.quant.schemes import (
             get_all_schemes, ROCMFPX_SCHEME_NAMES, IQ_SCHEME_NAMES,
             LEGACY_Q4_SCHEME_NAMES, IMATRIX_DEPENDENT_SCHEME_NAMES,
+            BLOCK32_Q5_SCHEME_NAMES, NVFP4_SCHEME_NAMES,
         )
 
         config: Dict[str, str] = {}
@@ -565,6 +617,17 @@ class EvolutionarySurvivor:
         # Q4_0/Q4_1: v2-only allocation choices; excluded from v1 sampling to
         # keep the seed-pinned fixture stable.
         all_schemes = [s for s in all_schemes if s.name not in LEGACY_Q4_SCHEME_NAMES]
+        # Q5_0/Q5_1 come out of the DEFAULT pool for a different reason than
+        # Q4_0/Q4_1: they are added back per-group below, but only for groups
+        # whose tensors on this model are block-32-only. On a 256-divisible
+        # model Q5_K is strictly better than Q5_0 at identical 5.5 bpw, so
+        # leaving them in globally would make ordinary searches worse.
+        # NVFP4: opt-in only. Imatrix-blind, unpriceable on this build (no
+        # dequant path), and unloadable by the llama-perplexity on PATH -- see
+        # the NVFP4 block in schemes.py. Never sampled by default.
+        all_schemes = [s for s in all_schemes if s.name not in NVFP4_SCHEME_NAMES]
+        block32_q5 = [s for s in all_schemes if s.name in BLOCK32_Q5_SCHEME_NAMES]
+        all_schemes = [s for s in all_schemes if s.name not in BLOCK32_Q5_SCHEME_NAMES]
         # Schemes that require an importance matrix are ALWAYS excluded: the
         # search threads no imatrix, so encoding one would hard-error the
         # writer. This applies regardless of enable_iq.
@@ -580,6 +643,18 @@ class EvolutionarySurvivor:
             ]
 
         for g in groups:
+            # Per-group pool. Identical object list, in identical order, to
+            # the pre-2026-08 `all_schemes` whenever the gate is empty -- which
+            # is what keeps the seed-pinned fixture byte-stable. Pool SIZE is
+            # safe to vary because random.choices(population, weights=...)
+            # draws exactly one random() per pick regardless of len(population),
+            # so a longer pool cannot shift the RNG stream for later groups.
+            pool = (
+                all_schemes + block32_q5
+                if g in self.block32_only_groups
+                else all_schemes
+            )
+
             if self.stream_aware and g in self._STREAM_AWARE_GROUPS:
                 # Streamed matmul group: shift BF16/F16 mass onto Q8_0. Takes
                 # precedence over head_aggressive for 'H' (Q8_0 is the measured
@@ -602,13 +677,13 @@ class EvolutionarySurvivor:
             # normalize within the category so each category's *total*
             # sampling mass equals its documented cat_weight regardless of
             # how many schemes share it.
-            inv_noise = [1.0 / (1.0 + s.noise_factor) for s in all_schemes]
+            inv_noise = [1.0 / (1.0 + s.noise_factor) for s in pool]
             cat_inv_noise_totals: Dict[str, float] = {}
-            for s, w in zip(all_schemes, inv_noise):
+            for s, w in zip(pool, inv_noise):
                 cat_inv_noise_totals[s.category] = cat_inv_noise_totals.get(s.category, 0.0) + w
 
             scheme_weights = []
-            for s, w in zip(all_schemes, inv_noise):
+            for s, w in zip(pool, inv_noise):
                 cat_weight = class_weights.get(s.category, 0.0)
                 cat_total = cat_inv_noise_totals.get(s.category, 0.0)
                 if cat_total > 0:
@@ -618,10 +693,10 @@ class EvolutionarySurvivor:
 
             # Avoid all-zeros pathology
             if sum(scheme_weights) == 0:
-                scheme_weights = [1.0] * len(all_schemes)
+                scheme_weights = [1.0] * len(pool)
 
             picked = random.choices(
-                [s.name for s in all_schemes],
+                [s.name for s in pool],
                 weights=scheme_weights,
             )[0]
 
@@ -733,7 +808,7 @@ class EvolutionarySurvivor:
             # Protector: upgrade the most sensitive unprotected brain layer
             target = self._find_protector_target(config, groups)
             if target:
-                new_scheme = self._upgrade(target['scheme'])
+                new_scheme = self._upgrade(target['scheme'], target['group'])
                 if new_scheme and new_scheme != target['scheme']:
                     c = config.copy()
                     c[target['group']] = new_scheme
@@ -742,7 +817,7 @@ class EvolutionarySurvivor:
             # Crusher: downgrade the most robust high-precision FFN layer
             target = self._find_crusher_target(config, groups)
             if target:
-                new_scheme = self._downgrade(target['scheme'])
+                new_scheme = self._downgrade(target['scheme'], target['group'])
                 if new_scheme and new_scheme != target['scheme']:
                     c = config.copy()
                     c[target['group']] = new_scheme
@@ -799,7 +874,7 @@ class EvolutionarySurvivor:
                 continue
             scheme = config.get(g, "MXFP4_MOE")
             # Can we push it lower? (Skip if already at the bottom of registry)
-            if self._downgrade(scheme) is not None and scheme != self._min_scheme_for_class('robust'):
+            if self._downgrade(scheme, g) is not None and scheme != self._min_scheme_for_class('robust'):
                 sensitivity = self.predictor.sensitivity_weights.get(g, 0.5)
                 candidates.append({
                     'group': g, 'scheme': scheme, 'sensitivity': sensitivity,

@@ -21,6 +21,7 @@ from magicquant.evolution.predictor import PredictiveScorer
 from magicquant.evolution.survival import EvolutionarySurvivor
 from magicquant.evolution.probing import SensitivityProber
 from magicquant.gguf.tensor_groups import TensorGroupClassifier
+from magicquant.gguf.writer import _is_quantization_candidate, is_block32_only_tensor
 from magicquant.utils.naming import generate_name, config_key as _naming_config_key
 from magicquant.utils.llamacpp import (
     LlamaCppTools,
@@ -115,6 +116,21 @@ class MagicQuantOrchestrator:
         # fed to PredictiveScorer so MoE size/speed predictions use the real
         # (mostly-experts) distribution instead of the dense fallback.
         self._param_counts: Dict[str, int] = {}
+
+        # Groups whose every quantization candidate on THIS model has a row
+        # width that is 32- but not 256-divisible, so any K-quant assigned to
+        # them is rewritten by the writer's block-size fallback. Populated by
+        # _estimate_model_size (same pass, no extra I/O) and handed to
+        # EvolutionarySurvivor, which uses it to offer Q5_0/Q5_1 for exactly
+        # those groups. Empty for every ordinary 256-divisible model, and
+        # empty means byte-identical behaviour to before this existed.
+        self.block32_only_groups: set = set()
+        # {group: {scheme: real_bpw}} for pairs whose actual cost differs from
+        # the registry's advertised bpw once the writer's compat chain has run
+        # -- handed to PredictiveScorer. Without this the predictor prices a
+        # rewritten Q5_K at 5.5 bpw instead of the 8.5 it really costs, always
+        # prefers it to Q5_0, and the block-32 schemes never get chosen.
+        self._effective_bpw: Dict[str, Dict[str, float]] = {}
 
         # Detected search groups (includes X/R/S when present), populated by
         # the search methods and passed to run_evolution.
@@ -1148,6 +1164,7 @@ class MagicQuantOrchestrator:
                 stream_aware=stream_aware,
                 objective_weights=objective_weights,
                 use_bytes_tps=use_bytes_tps,
+                block32_only_groups=self.block32_only_groups,
             )
 
             round_configs = survivor.run_evolution(
@@ -1504,14 +1521,29 @@ class MagicQuantOrchestrator:
         """
         if not self.fixed_groups:
             return
+        # Only groups fixed for a SCHEME-INVARIANT reason may be dropped. A
+        # group fixed solely because its rows aren't 32-divisible still has
+        # BF16 available (block_size == 1 skips the writer's block-size
+        # fallback, so it is written F16 at half the F32 bytes) -- dropping
+        # it would silently delete a real size choice. Such a group still
+        # gets its probe skipped; it just keeps its search slot. Defaults to
+        # True so a checkpoint written before this key existed keeps its
+        # previous exclusion behaviour.
+        excludable = {
+            g for g, info in self.fixed_groups.items()
+            if info.get("scheme_invariant", True)
+        }
+        if not excludable:
+            return
         self._search_groups = [
-            g for g in self._search_groups if g not in self.fixed_groups
+            g for g in self._search_groups if g not in excludable
         ]
         if verbose:
             log.info(
                 "Excluding structurally-fixed groups from the search",
                 stage="probing",
-                fixed_groups=sorted(self.fixed_groups),
+                fixed_groups=sorted(excludable),
+                probe_skipped_only=sorted(set(self.fixed_groups) - excludable),
             )
 
     def _build_predictor(self, calibration_source, baseline_size_gb: float) -> PredictiveScorer:
@@ -1527,6 +1559,11 @@ class MagicQuantOrchestrator:
             baseline_tps=360,
             imatrix_active=self._imatrix is not None,
             calibration_source=calibration_source,
+            # Real per-(group, scheme) bpw on THIS model, so a K-quant that
+            # the writer will rewrite to Q8_0 is priced at what it actually
+            # costs. Empty for ordinary models, which is exactly the
+            # historical behaviour.
+            effective_bpw=self._effective_bpw,
         )
 
     def _record_candidate_measurement(
@@ -2674,6 +2711,7 @@ class MagicQuantOrchestrator:
             stream_aware=stream_aware,
             objective_weights=self._build_objective_weights(speed_weight),
             use_bytes_tps=use_bytes_tps,
+            block32_only_groups=self.block32_only_groups,
         )
 
         best_configs = survivor.run_evolution(
@@ -3230,6 +3268,64 @@ class MagicQuantOrchestrator:
                 result[tier] = max(by_tier[tier], key=lambda x: x.get('composite_score', 0))
         return result
 
+    def _build_effective_bpw(
+        self, group_tensors: Dict[str, List[Dict[str, Any]]]
+    ) -> Dict[str, Dict[str, float]]:
+        """Price every (group, scheme) pair at what it will REALLY cost on this
+        model, by asking the writer's own resolution rule rather than the
+        registry's advertised bpw.
+
+        Routes through ``v2.resolve.resolve_tensor_type`` -- the parity-tested
+        mirror of the writer's Pass-1 chain -- instead of re-deriving those
+        rules a third time. Only pairs whose real bpw differs from the
+        advertised one are recorded, so the table stays small and
+        ``PredictiveScorer._bpw_for`` falls through to the registry for
+        everything else.
+
+        Any failure here leaves the table empty, which the predictor treats as
+        "no information, behave exactly as before". A wrong size prediction is
+        worse than none.
+        """
+        from magicquant.quant.schemes import get_all_schemes
+        from magicquant.quant.ggml_facts import expected_size
+        from magicquant.v2.resolve import resolve_tensor_type
+
+        table: Dict[str, Dict[str, float]] = {}
+        schemes = [s.name for s in get_all_schemes()]
+        for group, infos in group_tensors.items():
+            per_scheme: Dict[str, float] = {}
+            for scheme in schemes:
+                total_bits = 0
+                total_elems = 0
+                for info in infos:
+                    shape = tuple(info["shape"])
+                    n = 1
+                    for d in shape:
+                        n *= d
+                    try:
+                        actual, _reason = resolve_tensor_type(
+                            info["name"], shape, len(shape), group, scheme
+                        )
+                        total_bits += expected_size(actual, n) * 8
+                    except Exception:
+                        total_bits = 0
+                        break
+                    total_elems += n
+                if total_bits and total_elems:
+                    real = total_bits / total_elems
+                    try:
+                        from magicquant.quant.schemes import get_scheme_by_name
+                        advertised = get_scheme_by_name(scheme).bits_per_weight
+                    except ValueError:
+                        continue
+                    # Only record a genuine divergence; equality means the
+                    # registry already tells the truth for this pair.
+                    if abs(real - advertised) > 1e-6:
+                        per_scheme[scheme] = real
+            if per_scheme:
+                table[group] = per_scheme
+        return table
+
     def _estimate_model_size(self, model_path: str) -> float:
         """Compute BF16 baseline size in GB from the total parameter count.
 
@@ -3249,6 +3345,16 @@ class MagicQuantOrchestrator:
                 classifier = TensorGroupClassifier()
                 param_counts: Dict[str, int] = defaultdict(int)
                 total_elements = 0
+                # Block-32-only bookkeeping rides along on this same pass --
+                # it already opens the source and visits every tensor's shape,
+                # so this costs no extra I/O. A group qualifies only if EVERY
+                # one of its tensors does (strict, matching probing.py's
+                # _group_fixed_reason doctrine): a group mixing 32-only and
+                # 256-divisible tensors would otherwise get Q5_0 offered for
+                # the 256-divisible half too, where Q5_K is genuinely better
+                # at identical bpw.
+                block32_candidates: Dict[str, bool] = {}
+                group_tensors: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
                 for info in src.get_all_tensors_info():
                     n = 1
                     for d in info["shape"]:
@@ -3256,6 +3362,21 @@ class MagicQuantOrchestrator:
                     total_elements += n
                     group = classifier.classify_tensor(info["name"])
                     param_counts[group] += n
+                    group_tensors[group].append(info)
+                    if is_block32_only_tensor(
+                        info["name"], tuple(info["shape"]), len(info["shape"])
+                    ):
+                        block32_candidates.setdefault(group, True)
+                    elif _is_quantization_candidate(
+                        info["name"], tuple(info["shape"]), len(info["shape"])
+                    ):
+                        # A real candidate that is NOT block-32-only
+                        # disqualifies the whole group.
+                        block32_candidates[group] = False
+                self.block32_only_groups = {
+                    g for g, ok in block32_candidates.items() if ok
+                }
+                self._effective_bpw = self._build_effective_bpw(group_tensors)
                 # Store for the predictor (drop UNKNOWN so it doesn't skew
                 # group-relative shares; its weights still count toward size).
                 self._param_counts = {

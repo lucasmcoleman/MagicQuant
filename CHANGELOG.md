@@ -2,6 +2,79 @@
 
 ## [Unreleased]
 
+### Fixed (2026-08-13 field-report response)
+
+- **Measurement subprocess could hang for hours after its child already exited.**
+  `subprocess.run` waits for pipe EOF, not child exit; EOF only arrives when the
+  LAST writer closes the descriptor, so a leaked descriptor in another process
+  pinned the parent for the full timeout. Observed live: zombie `llama-perplexity`,
+  parent in `poll_schedule_timeout`, six other processes holding the write ends,
+  70 minutes at 0% CPU. Since `_measure_timeout` now scales with file size, a
+  62 GB probe would have sat ~4h (~8h on a KL leg). Replaced with
+  `llamacpp._run_captured`: own session/process group, liveness poll, bounded
+  post-exit grace, then kills the group. Applied to the perplexity path, imatrix
+  capture and QAT validate. **v1 was lucky, not safe** — it shares the single
+  `calculate_perplexity` implementation and spawn path with v2.
+- **`ggml_facts.expected_size` failed OPEN on an unknown type**, pricing it as
+  block-1 / 2-bytes-per-element. For a blocked type that is silent, total
+  corruption: computed size and llama.cpp's row arithmetic agree, the file writes
+  and loads, no guard fires, and every row after the first dequantizes from a
+  non-block boundary. Now raises. Blocked registering any new ggml type.
+- **The never-quantize-by-name mirror covered 15 of upstream's 35 rules.**
+  `time_mix_lerp_fused.weight` was abort-class (RWKV feeds it to `ggml_mul`;
+  4-D dodges the 1-D rule, 256-divisible dodges the block-size fallback).
+  Completed, plus `tests/test_never_quantize_upstream_parity.py`, which
+  re-derives the list from a real llama.cpp checkout rather than pinning a
+  second copy.
+- **`Q4_0`/`Q4_1` were registered `uses_imatrix=False`.** ggml runs them through
+  the weighted `make_qx_quants`/`make_qkx3_quants` path. Shipped bytes were always
+  correct (the encoder passes the imatrix through unconditionally); only the
+  predictor's quality credit was wrong. `tests/test_legacy_q4_schemes.py` pinned
+  the wrong value. Added `tests/test_uses_imatrix_matches_ggml.py`, which encodes
+  every registry scheme with and without an imatrix and asserts the bytes differ
+  iff the flag says so — asserting against a constant is how this drifted.
+
+### Added
+
+- **`Q5_0` (5.5 bpw) and `Q5_1` (6.0 bpw)**, with shape-aware reachability. A model
+  whose rows are 32- but not 256-divisible sends every K-quant through the
+  block-size fallback, so the achievable block-32 prices jumped Q4_1 (5.0) →
+  Q8_0 (8.5) and the Q5/Q6 tier bands came out structurally EMPTY (nemotron_h_moe:
+  hidden 2688, moe_intermediate 1856). These fill the gap. Reachable ONLY for
+  groups whose tensors are block-32-only on the model being searched — on a
+  256-divisible model Q5_K is strictly better at identical 5.5 bpw, so global
+  reachability would make ordinary searches worse. `refactor_regression_seed42.json`
+  is byte-identical. `noise_factor` 3.4/3.1 measured (encode→decode through
+  libggml, imatrix-weighted squared error, interpolated between the registry's own
+  Q5_K/Q4_K_M anchors; control recovers Q6_K as 2.26 vs its registered 2.20),
+  confirmed on two models and again under a real activation-derived imatrix.
+- **`PredictiveScorer(effective_bpw=...)`** — real per-(group, scheme) cost on the
+  model being searched. Without it a rewritten Q5_K is priced at 5.5 bpw instead of
+  the 8.5 it really costs, always beats Q5_0, and the new schemes would never once
+  be selected.
+- **`LlamaCppTools.verify_model_loads`** — bounded load check
+  (`llama-perplexity -c 512 --chunks 1`). Catches `wrong number of tensors`,
+  `unknown model architecture`, `key ... has wrong type` in seconds, where the only
+  existing validation was a full PPL smoke test minutes-to-tens-of-minutes later.
+  NOT `llama-cli`: it enters its interactive loop even with stdin at /dev/null and
+  once wrote a 16 GB log; `-no-cnv` still waits on stdin.
+- **`NVFP4`** (ggml id 40, 4.5 bpw), registered but excluded from the default search
+  pool. It is imatrix-blind (`GGML_UNUSED(quant_weights)`), cannot be DECODED by the
+  bound libggml (so v2 cannot price it and its noise factor is not locally
+  verifiable), and the `llama-perplexity` on PATH cannot load it. Available for
+  explicit per-tensor override only, like `Q4_0`/`Q4_1`.
+
+### Changed
+
+- `gguf` floor `>=0.18.0` → `>=0.19.0`; `requires-python` `>=3.9` → `>=3.10`
+  (forced by that floor). **`Q2_0` remains unavailable** — id 42 exists in
+  llama.cpp's `ggml.h` but is NOT in the released `gguf` package.
+- `Q1_0` was evaluated and **rejected**: not imatrix-aware (both arms of
+  `quantize_q1_0` call the unweighted `_ref` kernel), and quality-dominated by
+  IQ1_M on both metrics on both tensors at 1.75 bpw vs 1.125 — IQ1_M does not
+  require an imatrix (only IQ2_XXS/IQ2_XS/IQ1_S do), so the "only reachable
+  sub-2-bit rung" premise does not hold.
+
 Systematic behavior-preserving cleanup pass in progress on branch `cleanup/2026-08` (plan and audit trail: `docs/cleanup-2026-08-plan.md`). Entries are appended per commit and record files touched and how the change was verified.
 
 ### Added

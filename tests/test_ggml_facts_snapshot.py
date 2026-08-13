@@ -242,3 +242,44 @@ def test_id_to_name_is_consistent_inverse():
     )
     for name, type_id in ggml_facts.NAME_TO_ID.items():
         assert ggml_facts.ID_TO_NAME[type_id] == name
+
+
+# ── the size formula must fail closed on an unknown type ────────────────────
+
+def test_expected_size_raises_on_an_unknown_type():
+    """`expected_size` used to default an unrecognized name to block=1 /
+    2 B-per-element. That is the single most dangerous possible default for a
+    blocked type: MagicQuant's computed size and llama.cpp's own row-size
+    arithmetic AGREE, the file writes, the file loads, no guard fires, and
+    every row after the first is dequantized from a non-block boundary --
+    silent, total corruption. Q2_0 (block 64, 18 B) was priced at 2 B/elem
+    this way before the tables knew about it.
+    """
+    import pytest
+
+    from magicquant.quant.ggml_facts import expected_size
+
+    with pytest.raises(KeyError) as exc:
+        expected_size("Q2_0_NOT_REGISTERED_YET", 4096)
+    # The message has to say what to do, not just that a key was missing.
+    assert "Q2_0_NOT_REGISTERED_YET" in str(exc.value)
+    assert "ggml_facts" in str(exc.value)
+
+
+def test_block_and_type_size_tables_cover_the_same_names():
+    """The tightened lookup reads both tables and reports one error. If the
+    two ever diverge, a name could resolve in one and not the other, which is
+    the state that made the old silent default reachable."""
+    from magicquant.quant.ggml_facts import BLOCK_SIZE, TYPE_SIZE
+
+    assert set(BLOCK_SIZE) == set(TYPE_SIZE)
+
+
+def test_every_registry_scheme_has_size_facts():
+    """No registered scheme may depend on a fallback that no longer exists."""
+    from magicquant.quant.ggml_facts import expected_size
+    from magicquant.quant.schemes import get_all_schemes
+
+    for scheme in get_all_schemes():
+        # Must not raise. 4096 is divisible by every block size in play.
+        assert expected_size(scheme.ggml_type_name, 4096) > 0, scheme.name

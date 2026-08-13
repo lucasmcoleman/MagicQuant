@@ -14,8 +14,9 @@ QAT lowered perplexity, i.e. improved quality).
 from __future__ import annotations
 
 import os
-import subprocess
 from typing import Dict
+
+from magicquant.utils.llamacpp import _run_captured
 
 
 def parse_perplexity(output: str) -> float:
@@ -54,7 +55,9 @@ def _run_perplexity(
         "--ctx-size", str(ctx_size),
         "--threads", str(os.cpu_count() or 4),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    # _run_captured, not subprocess.run -- same abandoned-pipe exposure as
+    # every other long-running llama.cpp spawn (see llamacpp._run_captured).
+    proc = _run_captured(cmd, timeout=timeout)
     if proc.returncode != 0:
         raise RuntimeError(
             f"llama-perplexity failed (rc={proc.returncode}) for {gguf_path}:\n"

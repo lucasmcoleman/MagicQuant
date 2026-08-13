@@ -46,7 +46,6 @@ from magicquant.quant import calibration
 from magicquant.quant.schemes import get_scheme_by_name
 from magicquant.gguf.writer import (
     _is_f32_required_ssm_operand,
-    _is_never_quantized,
     _NEVER_QUANTIZE_NAME_SUBSTRINGS,
 )
 from magicquant.utils.measurement import (
@@ -91,6 +90,22 @@ def _never_quantize_match(name: str) -> Optional[str]:
     return None
 
 
+# A tensor can be un-probeable without being un-optimizable, and the two
+# must not be conflated. The writer's block-size fallback is gated on
+# `block_size > 1` (writer.py Pass 1), and BF16 -- the registry's only
+# category="float" scheme -- has block_size == 1, so it sails past that
+# check and is written F16 at 2 B/elem instead of F32 at 4. Every OTHER
+# reason below (SSM operand, never-quantize-by-name, 1-D) holds for every
+# target type, which is what "structurally fixed" actually means.
+#
+# So a group that is fixed only for this reason still gets its probe
+# skipped -- no quantized scheme can move it, so the probe would measure
+# nothing and _verify_probe_artifact would refuse it -- but it must STAY
+# in the mutable search set, because BF16 is a real, reachable, half-size
+# choice for it. Dropping it would silently delete that option.
+_SCHEME_DEPENDENT_FIXED_REASON = "non-32-divisible row"
+
+
 def _tensor_fixed_reason(
     name: str, tensor_info: Optional[Dict[str, Any]]
 ) -> Optional[str]:
@@ -109,6 +124,9 @@ def _tensor_fixed_reason(
     (this tensor's shape) isn't available. Absence of proof is not proof
     of absence: an unconfirmed tensor is treated as a legitimate
     candidate, never as fixed.
+
+    Not every reason here is scheme-invariant -- see
+    ``_SCHEME_DEPENDENT_FIXED_REASON``.
     """
     if _is_f32_required_ssm_operand(name):
         return "f32-required-ssm-operand"
@@ -667,7 +685,14 @@ class SensitivityProber:
             names = names_by_group.get(group, [])
             reason = self._group_fixed_reason(names, get_tensor_info)
             if reason is not None:
-                fixed[group] = {"reason": reason, "tensor_count": len(names)}
+                fixed[group] = {
+                    "reason": reason,
+                    "tensor_count": len(names),
+                    # Whether this group may also be dropped from the mutable
+                    # search set, or only skipped for probing -- see
+                    # _reason_is_scheme_invariant.
+                    "scheme_invariant": self._reason_is_scheme_invariant(reason),
+                }
         return fixed
 
     @staticmethod
@@ -692,6 +717,19 @@ class SensitivityProber:
             if reason not in reasons:
                 reasons.append(reason)
         return " / ".join(reasons)
+
+    @staticmethod
+    def _reason_is_scheme_invariant(reason: str) -> bool:
+        """Does *reason* (as returned by ``_group_fixed_reason``) hold for
+        EVERY target type, or only for quantized ones?
+
+        Only a scheme-invariant group may be dropped from the mutable
+        search set -- see ``_SCHEME_DEPENDENT_FIXED_REASON``. A group fixed
+        even partly for the scheme-dependent reason still skips its probe
+        (nothing quantized can move it) but keeps its search slot, because
+        BF16 remains a real half-size choice for it.
+        """
+        return _SCHEME_DEPENDENT_FIXED_REASON not in reason
 
     def _probe_single_group(
         self,
