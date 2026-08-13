@@ -98,6 +98,14 @@ class MagicQuantOrchestrator:
         # per-group resolution states behind it.
         self.resolved_mass_fraction: float = 0.0
         self.probe_resolutions: Dict[str, str] = {}
+        # Groups probing found STRUCTURALLY unquantizable on this model
+        # (every tensor forced to F32 by writer policy regardless of
+        # scheme -- see SensitivityProber._detect_fixed_groups), copied
+        # from SensitivityProber.fixed_groups / a resumed checkpoint right
+        # after probing. Subtracted from self._search_groups before the
+        # evolutionary search runs, so no candidate wastes a slot mutating
+        # a scheme that can never take effect.
+        self.fixed_groups: Dict[str, Dict] = {}
         self.predictor: Optional[PredictiveScorer] = None
 
         # Track all measured configs across rounds
@@ -1016,6 +1024,7 @@ class MagicQuantOrchestrator:
             self.sensitivity_weights = checkpoint["sensitivity_weights"]
             self.probing_provenance = checkpoint["probing_provenance"]
             self.weights_degenerate = checkpoint.get("weights_degenerate", False)
+            self.fixed_groups = checkpoint.get("fixed_groups", {})
             if verbose:
                 log.info(
                     "Resumed sensitivity weights from checkpoint", stage="resume",
@@ -1061,6 +1070,7 @@ class MagicQuantOrchestrator:
             # from one steered by rounding.
             self.resolved_mass_fraction = prober.resolved_mass_fraction
             self.probe_resolutions = dict(prober.resolutions)
+            self.fixed_groups = dict(prober.fixed_groups)
             prober.save_results(str(self.output_dir / "sensitivity.json"))
 
             if verbose:
@@ -1069,6 +1079,14 @@ class MagicQuantOrchestrator:
                     stage="probing",
                     weights={g: round(w, 3) for g, w in self.sensitivity_weights.items()},
                 )
+
+        # Structurally-fixed groups (see SensitivityProber._detect_fixed_groups)
+        # can never take a scheme other than what the writer already forces
+        # (F32) -- drop them from the mutable set BEFORE incumbent seeding /
+        # run_evolution so no candidate wastes a slot on a choice that can
+        # never take effect. Applies whether the weights above came from a
+        # fresh probe or a resumed checkpoint.
+        self._exclude_fixed_groups(verbose)
 
         # MAJOR 4: a search whose probing came back with no reliable signal
         # (suspect provenance / degenerate uniform weights) must not
@@ -1469,6 +1487,32 @@ class MagicQuantOrchestrator:
         # varies X/R/S (otherwise it falls back to DEFAULT_GROUPS).
         self._search_groups = groups
         return groups
+
+    def _exclude_fixed_groups(self, verbose: bool) -> None:
+        """Drop any group in ``self.fixed_groups`` (set right after probing,
+        live or resumed -- see SensitivityProber._detect_fixed_groups) from
+        ``self._search_groups``. Byte-identical block previously duplicated
+        in run_measured_search and run_full_search.
+
+        A structurally-fixed group's scheme can never take effect (the
+        writer forces F32 regardless), so leaving it in the mutable set
+        would waste candidate-generation slots on choices with zero real
+        effect and mislead size prediction (a candidate "shrinking" R to
+        Q4_K_M would predict bytes saved that the actual write never
+        realizes). Must run AFTER self.fixed_groups is populated and
+        BEFORE _build_incumbent_seeds / run_evolution read self._search_groups.
+        """
+        if not self.fixed_groups:
+            return
+        self._search_groups = [
+            g for g in self._search_groups if g not in self.fixed_groups
+        ]
+        if verbose:
+            log.info(
+                "Excluding structurally-fixed groups from the search",
+                stage="probing",
+                fixed_groups=sorted(self.fixed_groups),
+            )
 
     def _build_predictor(self, calibration_source, baseline_size_gb: float) -> PredictiveScorer:
         """Construct this search's PredictiveScorer. Byte-identical
@@ -2306,6 +2350,11 @@ class MagicQuantOrchestrator:
             "baseline_ppl": self.baseline_ppl,
             "baseline_provenance": self.baseline_provenance,
             "probing_provenance": getattr(self, "probing_provenance", "unknown"),
+            # Groups probing found structurally unquantizable on this model
+            # (never-quantize-by-name / 1-D / non-32-divisible / SSM-F32) and
+            # excluded from the mutable search -- see
+            # SensitivityProber._detect_fixed_groups.
+            "fixed_groups": getattr(self, "fixed_groups", {}),
             "seed": self._search_seed,
             "measurement": self._measurement_metadata(),
             # Additive key: the Kendall-tau predicted-vs-measured ranking
@@ -2586,7 +2635,13 @@ class MagicQuantOrchestrator:
         self.sensitivity_weights = prober.get_normalized_weights()
         self.probing_provenance = prober.probing_provenance
         self.weights_degenerate = prober.weights_degenerate
+        self.fixed_groups = dict(prober.fixed_groups)
         prober.save_results(str(self.output_dir / "sensitivity.json"))
+
+        # Structurally-fixed groups can never take a scheme other than what
+        # the writer already forces (F32) -- see the same exclusion in
+        # run_measured_search.
+        self._exclude_fixed_groups(verbose)
 
         # MAJOR 4: same gate as run_measured_search -- "suspect"/degenerate
         # provenance can occur here too whenever a real llama_tools was
@@ -3124,6 +3179,9 @@ class MagicQuantOrchestrator:
             # So a resumed run's _enforce_probing_signal_gate sees the same
             # signal a fresh run would have -- see MAJOR 4.
             "weights_degenerate": getattr(self, "weights_degenerate", False),
+            # So a resumed run drops the same groups from self._search_groups
+            # a fresh run would have -- see SensitivityProber.fixed_groups.
+            "fixed_groups": getattr(self, "fixed_groups", {}),
             "kl": {
                 "enabled": bool(self._kl_base_logits_path),
                 "base_logits_path": self._kl_base_logits_path,
