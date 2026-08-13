@@ -105,10 +105,14 @@ _STOCK_BLOCK_SIZE, _STOCK_TYPE_SIZE = _build_stock_size_tables()
 REQUIRED_STOCK_NAMES: FrozenSet[str] = frozenset({
     "F32", "F16", "BF16",
     "Q8_0", "Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K",
-    "Q4_0", "Q4_1",
+    "Q4_0", "Q4_1", "Q5_0", "Q5_1",
     "IQ4_NL", "IQ4_XS", "IQ3_S", "IQ3_XXS", "IQ2_S", "IQ2_XS", "IQ2_XXS",
     "IQ1_M", "IQ1_S",
     "MXFP4",
+    # gguf >= 0.19.0 (floor bumped 2026-08). Q2_0 (id 42) exists in
+    # llama.cpp's ggml.h but is NOT in the released gguf package, so it
+    # cannot be listed here yet.
+    "NVFP4",
 })
 
 
@@ -258,14 +262,45 @@ def expected_size(name: str, n_elements: int) -> int:
     """Return the encoded byte size for `n_elements` scalars of ggml type
     `name`.
 
-    Fallback defaults are semantic, not sloppy: an unrecognized type name is
-    treated as block=1 (no blocking) / type_size=2 bytes/element (F16-like).
-    Do NOT tighten this to a KeyError -- this reproduces the exact fallback
-    behavior of the two pre-fold copies (converters.ggml_tensor_data_size and
-    ggml_binding._expected_size), and a behavior-preserving fold must keep it
-    even though no current caller is known to hit it.
+    Raises KeyError for a type name absent from the fact tables.
+
+    This function used to fall back to block=1 / type_size=2 for an
+    unrecognized name, carried over verbatim from the two pre-fold copies
+    (converters.ggml_tensor_data_size and ggml_binding._expected_size) on the
+    reasoning that a behavior-preserving fold must keep it "even though no
+    current caller is known to hit it". That fallback is now removed, because
+    the second half of that sentence was the only thing making it safe and it
+    stops being true the moment anyone registers a new ggml type.
+
+    What the fallback actually does to a new type: it prices it as a
+    2-bytes-per-element unblocked type. For Q2_0 (block 64, 18 B) on a
+    128x2880 tensor that is not a loud wrong answer -- MagicQuant's computed
+    size and llama.cpp's own row-size arithmetic AGREE end to end, the file
+    writes, the file loads, no guard fires, and every row after the first is
+    dequantized from a non-block boundary. Silent, total corruption of the
+    weights with nothing anywhere reporting an error. An exception at the
+    point of the missing fact is the only failure mode that is actually
+    detectable.
+
+    Tightening is safe for every type in use today: BLOCK_SIZE and TYPE_SIZE
+    are derived from the same source and have identical key sets (37 types,
+    covering every float, int, K-quant, IQ, MXFP4 and ROCmFPX name the
+    registry can reach), so nothing that resolved before resolves differently
+    now -- see tests/test_ggml_facts_snapshot.py.
     """
-    block_size = BLOCK_SIZE.get(name, 1)
-    type_size = TYPE_SIZE.get(name, 2)
+    try:
+        block_size = BLOCK_SIZE[name]
+        type_size = TYPE_SIZE[name]
+    except KeyError:
+        raise KeyError(
+            f"ggml type {name!r} has no block/type-size fact, so its encoded "
+            "size cannot be computed. This is almost always a half-registered "
+            "type: add it to the installed `gguf` package's "
+            "GGMLQuantizationType (bump the floor if upstream has it and the "
+            "pinned build does not), then re-derive the tables in "
+            "magicquant.quant.ggml_facts. Do NOT reintroduce a default here -- "
+            "guessing block=1/2B silently corrupts every row of a blocked "
+            "type while every size check still agrees."
+        ) from None
     n_blocks = (n_elements + block_size - 1) // block_size
     return n_blocks * type_size

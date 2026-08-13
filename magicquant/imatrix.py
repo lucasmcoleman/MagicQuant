@@ -34,11 +34,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Union
 
 import numpy as np
+
+from magicquant.utils.llamacpp import _run_captured
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,12 @@ def capture_imatrix(
         *extra_args,
     ]
     logger.info("capturing imatrix: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    # _run_captured, not subprocess.run: llama-imatrix is a long-running
+    # llama.cpp process with captured pipes, i.e. the same exposure that let a
+    # measurement child exit while a leaked descriptor held its stdout open
+    # and pinned the parent for the whole timeout (2026-08-13 field report;
+    # see llamacpp._run_captured and tests/test_measurement_pipe_stall.py).
+    proc = _run_captured(cmd, timeout=timeout)
     if proc.returncode != 0 or not output_path.exists():
         raise RuntimeError(
             f"llama-imatrix failed (rc={proc.returncode}):\n"

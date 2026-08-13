@@ -31,7 +31,12 @@ def test_legacy_q4_scheme_metadata(name, ggml_type_name, bpw):
     assert s.ggml_type_name == ggml_type_name
     assert s.bits_per_weight == bpw
     assert s.category == "legacy_q"
-    assert s.uses_imatrix is False
+    # "legacy" is about the block layout, not about imatrix support. Both of
+    # these run ggml's weighted make_qx_quants / make_qkx3_quants path when an
+    # imatrix is supplied -- see the note above the Q4_0 entry in schemes.py,
+    # and tests/test_uses_imatrix_matches_ggml.py, which asserts this against
+    # the live library instead of against a constant.
+    assert s.uses_imatrix is True
     assert s.requires_imatrix is False
 
 

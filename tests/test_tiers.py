@@ -71,9 +71,12 @@ def test_matches_orchestrator_classify_tier():
 _EXPECTED_TIER = {
     "BF16": "Q8", "Q8_0": "Q8", "ROCMFP8": "Q8",
     "Q6_K": "Q6", "ROCMFP6": "Q6",
-    "Q5_K": "Q5",
+    # Q5_0 = 5.5/16 = 0.34375 and Q5_1 = 6.0/16 = 0.375 both land in Q5's
+    # band (0.328, 0.375] -- Q5_1 sits exactly on the closed upper bound, so
+    # Q6's `0.375 < 0.375` is False and it classifies Q5.
+    "Q5_K": "Q5", "Q5_0": "Q5", "Q5_1": "Q5",
     "Q4_1": "Q4", "Q4_K_M": "Q4", "IQ4_NL": "Q4", "Q4_0": "Q4",
-    "ROCMFP4": "Q4", "MXFP4_MOE": "Q4", "IQ4_XS": "Q4",
+    "ROCMFP4": "Q4", "MXFP4_MOE": "Q4", "IQ4_XS": "Q4", "NVFP4": "Q4",
     "ROCMFP3": "Q3", "Q3_K": "Q3", "IQ3_S": "Q3", "IQ3_XXS": "Q3",
     "Q2_K": "Q2", "IQ2_S": "Q2", "IQ2_XS": "Q2", "IQ2_XXS": "Q2",
     "IQ1_M": "Q2", "IQ1_S": "Q2",

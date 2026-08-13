@@ -36,7 +36,7 @@ Q8_0 is near-lossless, block-scaled, roughly half the bytes of F16, and
 keeps every tensor on a path llama.cpp actually executes.
 """
 
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 import os
 import json
 import tempfile
@@ -44,8 +44,13 @@ import logging
 
 from magicquant.quant import calibration
 from magicquant.quant.schemes import get_scheme_by_name
+from magicquant.gguf.writer import (
+    _is_f32_required_ssm_operand,
+    _NEVER_QUANTIZE_NAME_SUBSTRINGS,
+)
 from magicquant.utils.measurement import (
     DEFAULT_RELATIVE_EPS,
+    PROBE_FIXED,
     PROBE_RESOLVED,
     PROBE_UNRESOLVED,
     classify_probe_signal,
@@ -72,6 +77,72 @@ BROKEN_PROBE_RATIO = 50.0
 # line carries no "+/- err" term. Real per-group readings on this hardware sit
 # around 0.10-0.16 nats with errors near 0.002.
 MIN_KL_SIGNAL = 0.001
+
+
+def _never_quantize_match(name: str) -> Optional[str]:
+    """Which llama.cpp never-quantize-by-name substring matched *name*, if
+    any -- the same list ``_is_never_quantized`` checks, exposed here so a
+    structurally-fixed-group log line can name the actual pattern (e.g.
+    "ffn_gate_inp.weight") instead of a generic label."""
+    for substr in _NEVER_QUANTIZE_NAME_SUBSTRINGS:
+        if substr in name:
+            return substr
+    return None
+
+
+# A tensor can be un-probeable without being un-optimizable, and the two
+# must not be conflated. The writer's block-size fallback is gated on
+# `block_size > 1` (writer.py Pass 1), and BF16 -- the registry's only
+# category="float" scheme -- has block_size == 1, so it sails past that
+# check and is written F16 at 2 B/elem instead of F32 at 4. Every OTHER
+# reason below (SSM operand, never-quantize-by-name, 1-D) holds for every
+# target type, which is what "structurally fixed" actually means.
+#
+# So a group that is fixed only for this reason still gets its probe
+# skipped -- no quantized scheme can move it, so the probe would measure
+# nothing and _verify_probe_artifact would refuse it -- but it must STAY
+# in the mutable search set, because BF16 is a real, reachable, half-size
+# choice for it. Dropping it would silently delete that option.
+_SCHEME_DEPENDENT_FIXED_REASON = "non-32-divisible row"
+
+
+def _tensor_fixed_reason(
+    name: str, tensor_info: Optional[Dict[str, Any]]
+) -> Optional[str]:
+    """Why is *name* unquantizable by KNOWN writer policy, if any?
+
+    Mirrors the writer's Pass-1 compat chain closely enough to tell a
+    STRUCTURALLY unquantizable tensor (never-quantize-by-name,
+    F32-required SSM operand, 1-D, or a non-32-divisible row -- see
+    gguf/writer.py's Pass-1 loop) from one that merely CAME BACK
+    untouched from a probe. The latter is the original bug
+    ``_verify_probe_artifact`` exists to catch and must keep catching --
+    this function must never blur the two.
+
+    Returns a short human-readable token, or ``None`` if *name* is a
+    legitimate quantization candidate -- including when *tensor_info*
+    (this tensor's shape) isn't available. Absence of proof is not proof
+    of absence: an unconfirmed tensor is treated as a legitimate
+    candidate, never as fixed.
+
+    Not every reason here is scheme-invariant -- see
+    ``_SCHEME_DEPENDENT_FIXED_REASON``.
+    """
+    if _is_f32_required_ssm_operand(name):
+        return "f32-required-ssm-operand"
+    substr = _never_quantize_match(name)
+    if substr is not None:
+        return substr
+    if tensor_info is None:
+        return None
+    n_dims = tensor_info.get("n_dims", len(tensor_info.get("shape") or ()))
+    if n_dims <= 1:
+        return "1-D"
+    shape = tensor_info.get("shape") or ()
+    row_size = shape[-1] if shape else 1
+    if row_size % 32 != 0:
+        return "non-32-divisible row"
+    return None
 
 
 class ProbeMeasurementError(RuntimeError):
@@ -190,6 +261,17 @@ class SensitivityProber:
         # get_normalized_weights().
         self.weights_degenerate: bool = False
 
+        # Groups probe_all_groups determined are STRUCTURALLY unquantizable
+        # on this model -- every tensor classified into the group is forced
+        # to F32 by writer policy regardless of scheme (see
+        # _detect_fixed_groups) -- mapped to {"reason": <str>,
+        # "tensor_count": <int>}. Populated by probe_all_groups; empty until
+        # then. The orchestrator reads this to drop these groups from the
+        # evolutionary search's mutable-group set (no scheme choice for a
+        # fixed group can ever take effect) and threads it into
+        # search_results.json for downstream visibility.
+        self.fixed_groups: Dict[str, Dict[str, Any]] = {}
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -232,6 +314,18 @@ class SensitivityProber:
             print(f"Baseline PPL: {self.baseline_ppl}")
             print()
 
+        # Some groups can be STRUCTURALLY unquantizable on this model --
+        # every tensor classified into them is forced to F32 by writer
+        # policy (never-quantize-by-name, 1-D, non-32-divisible row, or an
+        # F32-required SSM operand) no matter what scheme this search would
+        # otherwise assign. A probe of such a group is numerically identical
+        # to the baseline on EVERY scheme, on every run -- the exact signal
+        # _verify_probe_artifact exists to catch as a bug, except here it
+        # isn't one. Detect and skip those up front rather than let each one
+        # build a real probe GGUF only to have _verify_probe_artifact refuse
+        # it (correctly, but for the wrong reason).
+        self.fixed_groups = self._detect_fixed_groups(groups)
+
         # Tolerance below which a real (measured) probe PPL coming in under
         # baseline is still plausible measurement noise rather than a
         # physically impossible reading (a quantized probe cannot genuinely
@@ -243,6 +337,35 @@ class SensitivityProber:
         measured_count = 0
         clamped_count = 0
         for group in groups:
+            fixed = self.fixed_groups.get(group)
+            if fixed is not None:
+                _log.info(
+                    "group '%s': all %d tensors are never-quantizable "
+                    "(%s) -- skipping probe, sensitivity fixed at 0.0",
+                    group, fixed["tensor_count"], fixed["reason"],
+                )
+                if verbose:
+                    print(
+                        f"  Group '{group}': all {fixed['tensor_count']} "
+                        f"tensors are never-quantizable ({fixed['reason']}) "
+                        f"-- skipping probe, sensitivity fixed at 0.0"
+                    )
+                self.resolutions[group] = PROBE_FIXED
+                self.sensitivity_results[group] = 0.0
+                self.probe_models.append({
+                    "group": group,
+                    "aggressive_scheme": aggressive_scheme,
+                    "probe_ppl": None,
+                    "delta": None,
+                    "sensitivity": 0.0,
+                    "resolution": PROBE_FIXED,
+                    "measured": False,
+                    "clamped": False,
+                    "fixed": True,
+                    "fixed_reason": fixed["reason"],
+                })
+                continue
+
             ppl, measured = self._probe_single_group(
                 group, aggressive_scheme, keep_scheme, verbose
             )
@@ -367,7 +490,10 @@ class SensitivityProber:
                 print(f"  Group '{group}': {metric}={ppl:.6f}, "
                       f"Sensitivity={sensitivity:.6f} [{resolution}]")
 
-        total = len(groups)
+        # Fixed groups were never candidates for measurement -- excluded so
+        # a model with one structurally-fixed group doesn't get downgraded
+        # from "measured" to "partial" for correctly skipping it.
+        total = len(groups) - len(self.fixed_groups)
         if measured_count == total:
             self.probing_provenance = "measured"
         elif measured_count == 0:
@@ -500,6 +626,7 @@ class SensitivityProber:
             "weights_degenerate": self.weights_degenerate,
             "probes": self.probe_models,
             "probing_provenance": self.probing_provenance,
+            "fixed_groups": self.fixed_groups,
         }
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w") as f:
@@ -508,6 +635,101 @@ class SensitivityProber:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _detect_fixed_groups(self, groups: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Which of *groups* are structurally unquantizable on this model:
+        every tensor classified into the group is forced to F32 by writer
+        policy (see ``_tensor_fixed_reason``) regardless of whatever scheme
+        this search would otherwise assign it, so no probe of it can ever
+        measure anything -- ``_verify_probe_artifact`` would refuse it on
+        every scheme, on every run, forever.
+
+        Requires a real, readable base model -- same gate
+        ``_probe_single_group`` uses for whether to attempt a real probe at
+        all. Returns ``{}`` (defer entirely to the normal per-group probe
+        path) when there's no calculator, no real file, or the read fails
+        for any reason: an inability to inspect the model is never grounds
+        to call a group fixed.
+        """
+        if not (
+            self.perplexity_calculator is not None
+            and os.path.isfile(self.base_model_path)
+        ):
+            return {}
+
+        from magicquant.gguf.reader import GGUFReader
+        from magicquant.gguf.tensor_groups import TensorGroupClassifier
+
+        try:
+            reader = GGUFReader(self.base_model_path)
+            reader.open()
+            classifier = TensorGroupClassifier()
+            names_by_group: Dict[str, List[str]] = {}
+            for name in reader.get_tensor_names():
+                names_by_group.setdefault(
+                    classifier.classify_tensor(name), []
+                ).append(name)
+            reader.close()
+        except Exception:
+            # Can't inspect this model up front -- the normal probe path
+            # (which opens the same reader again) will surface whatever the
+            # real problem is; this pre-check just declines to guess.
+            return {}
+
+        get_tensor_info = getattr(reader, "get_tensor_info", None)
+        if not callable(get_tensor_info):
+            get_tensor_info = None
+
+        fixed: Dict[str, Dict[str, Any]] = {}
+        for group in groups:
+            names = names_by_group.get(group, [])
+            reason = self._group_fixed_reason(names, get_tensor_info)
+            if reason is not None:
+                fixed[group] = {
+                    "reason": reason,
+                    "tensor_count": len(names),
+                    # Whether this group may also be dropped from the mutable
+                    # search set, or only skipped for probing -- see
+                    # _reason_is_scheme_invariant.
+                    "scheme_invariant": self._reason_is_scheme_invariant(reason),
+                }
+        return fixed
+
+    @staticmethod
+    def _group_fixed_reason(tensor_names: List[str], get_tensor_info) -> Optional[str]:
+        """If every one of *tensor_names* is unquantizable for a KNOWN
+        reason (see ``_tensor_fixed_reason``), return a short summary of the
+        distinct reasons seen (e.g. ``"ffn_gate_inp.weight / 1-D"``). Returns
+        ``None`` if the group is empty, or has ANY tensor that is -- or
+        might be, if *get_tensor_info* can't confirm its shape -- a
+        legitimate quantization candidate. That is the original bug
+        ``_verify_probe_artifact`` exists to catch, so this must fall
+        through to the normal probe path rather than guess.
+        """
+        if not tensor_names:
+            return None
+        reasons: List[str] = []
+        for name in tensor_names:
+            info = get_tensor_info(name) if get_tensor_info is not None else None
+            reason = _tensor_fixed_reason(name, info)
+            if reason is None:
+                return None
+            if reason not in reasons:
+                reasons.append(reason)
+        return " / ".join(reasons)
+
+    @staticmethod
+    def _reason_is_scheme_invariant(reason: str) -> bool:
+        """Does *reason* (as returned by ``_group_fixed_reason``) hold for
+        EVERY target type, or only for quantized ones?
+
+        Only a scheme-invariant group may be dropped from the mutable
+        search set -- see ``_SCHEME_DEPENDENT_FIXED_REASON``. A group fixed
+        even partly for the scheme-dependent reason still skips its probe
+        (nothing quantized can move it) but keeps its search slot, because
+        BF16 remains a real half-size choice for it.
+        """
+        return _SCHEME_DEPENDENT_FIXED_REASON not in reason
 
     def _probe_single_group(
         self,

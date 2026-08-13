@@ -8,7 +8,7 @@ version = "0.3.0"
 description = "Evolutionary Tensor Search for Optimal LLM GGUF Hybrid Quantization"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.21.0",
     # pydantic-settings loads .env internally, so python-dotenv is not needed.
@@ -31,7 +31,7 @@ dependencies = [
     # failing loudly. ggml_facts.REQUIRED_STOCK_NAMES's import-time guard
     # enforces this floor at runtime too (raises ImportError naming any
     # missing member), so an accidental pin-back is caught immediately.
-    "gguf>=0.18.0",
+    "gguf>=0.19.0",
 ]
 
 [project.optional-dependencies]

@@ -131,6 +131,14 @@ def measurement_eps(
 PROBE_RESOLVED = "resolved"        # signal is distinguishable from zero
 PROBE_UNRESOLVED = "unresolved"    # inside the noise floor -- no information
 PROBE_IMPLAUSIBLE = "implausible"  # below zero by more than noise -- broken
+# Structurally unquantizable (every tensor in the group is forced to F32 by
+# writer policy -- never-quantize-by-name, 1-D, non-32-divisible row, or an
+# F32-required SSM operand -- regardless of scheme). Sensitivity is KNOWN to
+# be zero, not merely unmeasured: this is a DIFFERENT fact than
+# PROBE_UNRESOLVED (noise floor, no information) and must not share its
+# representation, for the same reason PROBE_RESOLVED/UNRESOLVED are kept
+# apart from each other. See magicquant.evolution.probing._detect_fixed_groups.
+PROBE_FIXED = "fixed"
 
 # Multiple of the reported error a probe signal must clear to count as real.
 # Nine groups are probed per run, so the largest of nine pure-noise readings
@@ -208,16 +216,25 @@ def resolution_coverage(
     if not resolutions:
         return 0.0
 
-    if not parameter_counts:
-        resolved = sum(1 for s in resolutions.values() if s == PROBE_RESOLVED)
-        return resolved / len(resolutions)
+    # PROBE_FIXED groups never needed resolving -- their sensitivity is
+    # KNOWN (zero), not merely unmeasured. Counting their mass in the
+    # denominator would make an otherwise fully-resolved run look
+    # partially blind; counting it in the numerator would credit the
+    # probes with signal they never measured. Excluded from both.
+    countable = {g: s for g, s in resolutions.items() if s != PROBE_FIXED}
+    if not countable:
+        return 0.0
 
-    total = sum(parameter_counts.get(g, 0) for g in resolutions)
+    if not parameter_counts:
+        resolved = sum(1 for s in countable.values() if s == PROBE_RESOLVED)
+        return resolved / len(countable)
+
+    total = sum(parameter_counts.get(g, 0) for g in countable)
     if total <= 0:
         return 0.0
     resolved = sum(
         parameter_counts.get(g, 0)
-        for g, state in resolutions.items()
+        for g, state in countable.items()
         if state == PROBE_RESOLVED
     )
     return resolved / total

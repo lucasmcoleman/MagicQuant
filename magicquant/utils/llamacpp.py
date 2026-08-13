@@ -5,11 +5,13 @@ llama.cpp integration - Wrapper for calling llama.cpp quantization tools.
 import json
 import logging
 import math
+import signal
 import subprocess
 import os
 import re
+import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -49,11 +51,173 @@ _BENCH_TIMEOUT = 300       # 5 minutes for llama-bench pp/tg speed measurement
 # llama-perplexity throughput on this box, so a run still making progress
 # never hits this cap, while a real 0 B/s hang still times out eventually.
 _MIN_MEASURE_BANDWIDTH = 4_000_000  # 4 MB/s
+# How often, while waiting on a measurement subprocess, to check whether the
+# child is actually still alive. Purely a liveness poll: the real wait is
+# still bounded by the caller's timeout, this just lets us notice a dead
+# child long before that timeout fires.
+_LIVENESS_POLL_INTERVAL = 30  # seconds
+# Once the child has exited, how long to keep draining its pipes before
+# declaring them abandoned. A healthy child's pipes reach EOF the instant the
+# last writer closes them, so this only has to cover the gap between "child
+# reaped" and "buffered output read". 60s is enormous for that and still
+# nothing next to a multi-hour measurement timeout.
+_ABANDONED_PIPE_GRACE = 60  # seconds
 # A real saved-logits (--kl-divergence-base) file is tens of MB even for a
 # tiny model/corpus; a corpus too short for the requested ctx_size*chunks
 # makes llama-perplexity exit 0 but write only a ~12-byte header stub. 4 KiB
 # comfortably separates "real" from "stub" without depending on model size.
 _MIN_LOGITS_FILE_BYTES = 4096
+# Ceiling for the bounded load check (LlamaCppTools.verify_model_loads). This
+# is deliberately NOT _measure_timeout: loading a model and running a single
+# 512-token chunk is I/O-bound setup, not a measurement, so it gets a tight
+# ceiling and a much more optimistic bandwidth floor. A load check that can
+# run for hours defeats its own purpose.
+_LOAD_CHECK_TIMEOUT = 600           # 10 minutes
+_LOAD_CHECK_BANDWIDTH = 50_000_000  # 50 MB/s -- read throughput, not compute
+
+
+def _kill_process_group(proc: "subprocess.Popen", pgid: Optional[int]) -> None:
+    """SIGKILL the process group *pgid*, then *proc* itself.
+
+    The group matters: the failure this exists for is a grandchild that
+    outlived the child and inherited its stdout/stderr write end. Killing
+    only the child leaves that grandchild holding the pipe forever.
+    ``_run_captured`` spawns with ``start_new_session=True`` precisely so the
+    group is the child's own and this can never reach back into MagicQuant's
+    own process group.
+
+    *pgid* MUST be the value captured right after the spawn, not looked up
+    here. By the time this runs the child is typically already reaped -- that
+    is the whole premise of the abandoned-pipe path -- and
+    ``os.getpgid(proc.pid)`` then raises ``ProcessLookupError`` for the dead
+    leader, so a lookup here silently skips the kill and leaves exactly the
+    grandchild we came to remove. (Caught by
+    tests/test_measurement_pipe_stall.py, which failed only on the NEXT run
+    because the surviving grandchild wrote its marker 30s later.)
+    """
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
+def _run_captured(
+    cmd: List[str],
+    timeout: int,
+    check: bool = False,
+) -> subprocess.CompletedProcess:
+    """``subprocess.run(cmd, capture_output=True, text=True, timeout=...)``
+    that cannot hang past the death of its own child.
+
+    Why this is not just ``subprocess.run``: ``run`` waits for the pipes to
+    reach EOF, not for the child to exit. EOF arrives only when the LAST
+    writer closes the write end -- and if anything else inherited that
+    descriptor, the child can exit and be left unreaped while the parent
+    sits in ``poll()`` until the full timeout expires.
+
+    Observed 2026-08-13 on a ``--magicquant-budget-gib`` run: child
+    ``llama-perplexity`` in state ``Z`` (exited, never reaped), parent in
+    ``poll_schedule_timeout`` holding two read ends, six other processes
+    still holding the write ends, 70 minutes of no output at 0% CPU on the
+    measurement. Because ``_measure_timeout`` now scales with file size, a
+    62 GB probe would have sat there ~4h (~8h for a KL leg) instead of the
+    old flat 2h -- the size scaling is correct, but it turns this stall from
+    expensive into most of a day.
+
+    This does NOT try to prevent the descriptor leak -- ``close_fds=True``
+    has been Python's default since 3.2 and is already in force, so the
+    inheriting processes are not ones MagicQuant spawns through
+    ``subprocess``. It bounds the damage instead: once the child is gone,
+    its output is complete, so waiting longer than ``_ABANDONED_PIPE_GRACE``
+    can only ever return the same bytes.
+
+    Contract is deliberately identical to ``subprocess.run`` so callers and
+    their tests do not change: raises ``subprocess.TimeoutExpired`` on the
+    real timeout AND on an abandoned-pipe stall (the callers that degrade
+    gracefully -- ``_run_subprocess_or_none`` -- already catch exactly that),
+    ``subprocess.CalledProcessError`` when *check* and the exit status is
+    non-zero, and lets ``OSError``/``FileNotFoundError`` from the spawn
+    itself propagate untouched (``tests/test_orchestrator_measurement.py``
+    pins that escape path -- never widen it).
+    """
+    deadline = time.monotonic() + timeout
+    # start_new_session: give the child its own process group so a stall can
+    # be cleaned up wholesale (see _kill_process_group) without signalling
+    # anything of MagicQuant's own.
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    # Captured NOW, while the leader is certainly alive. Looking it up later
+    # fails once the child is reaped -- see _kill_process_group.
+    try:
+        pgid: Optional[int] = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        pgid = None
+
+    child_exited_at: Optional[float] = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _kill_process_group(proc, pgid)
+            out, err = proc.communicate()
+            raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+
+        try:
+            out, err = proc.communicate(timeout=min(_LIVENESS_POLL_INTERVAL, remaining))
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            # Normal path: pipes hit EOF and the child is reaped.
+            if check and proc.returncode:
+                raise subprocess.CalledProcessError(
+                    proc.returncode, cmd, output=out, stderr=err
+                )
+            return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+        # Pipes are still open. Is the child even alive?
+        if proc.poll() is None:
+            child_exited_at = None
+            continue
+
+        now = time.monotonic()
+        if child_exited_at is None:
+            child_exited_at = now
+            continue
+        if now - child_exited_at < _ABANDONED_PIPE_GRACE:
+            continue
+
+        # Child is gone and the pipes STILL have not closed, so a descriptor
+        # we do not own is holding the write end. Nothing further can ever
+        # arrive; waiting out the remaining (possibly hours of) timeout would
+        # buy exactly nothing.
+        _log.error(
+            "measurement subprocess %s exited (rc=%s) but its stdout/stderr "
+            "stayed open for %ds afterwards -- a leaked descriptor in another "
+            "process is holding the write end. Abandoning the read instead of "
+            "waiting out the remaining %ds of timeout. Command: %s",
+            proc.pid, proc.returncode, _ABANDONED_PIPE_GRACE,
+            int(deadline - now), " ".join(cmd),
+        )
+        _kill_process_group(proc, pgid)
+        raise subprocess.TimeoutExpired(
+            cmd,
+            timeout,
+            output=(
+                f"measurement subprocess exited rc={proc.returncode} but its "
+                f"pipes were held open by another process for "
+                f"{_ABANDONED_PIPE_GRACE}s; output is unrecoverable"
+            ),
+            stderr=None,
+        )
 
 
 def _find_tool_in_dirs(possible_names: List[str], search_dirs: List[Path]) -> Optional[str]:
@@ -657,14 +821,85 @@ class LlamaCppTools:
 
         Retries up to 3 times with exponential backoff on
         CalledProcessError (e.g. transient GPU OOM or file lock).
+
+        Goes through ``_run_captured`` rather than ``subprocess.run`` so a
+        child that exits while something else still holds its pipe open
+        cannot burn the whole (now size-scaled, multi-hour) timeout -- see
+        that function.
         """
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=timeout,
-        )
+        return _run_captured(cmd, timeout=timeout, check=True)
+
+    def verify_model_loads(
+        self,
+        model_path: str,
+        *,
+        data_file: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        """Cheaply answer "does llama.cpp accept this GGUF at all?".
+
+        Returns ``(ok, detail)``. ``detail`` is the tail of the tool's output
+        when it fails, and "" when it loads.
+
+        This is a LOAD check, not a quality gate -- it deliberately does not
+        look at the perplexity value. The point is that the errors worth
+        catching early are all raised while the file is being opened::
+
+            done_getting_tensors: wrong number of tensors; expected 417, got 408
+            unknown model architecture: 'muse-glimmer'
+            key split.count has wrong type u32 but expected type u16
+
+        A full perplexity pass catches those too, but only after minutes to
+        tens of minutes, and typically an hour downstream of the write that
+        caused them -- by which point the diagnosis is no longer obvious.
+        Running this immediately after a GGUF is written fails at the point
+        where the cause is unambiguous. Keep the existing PPL smoke test as
+        the separate quality gate it already is; this does not replace it.
+
+        Implementation notes that matter:
+
+        * ``llama-perplexity ... -c 512 --chunks 1``, NOT ``llama-cli``.
+          ``llama-cli`` enters its interactive loop even with stdin at
+          /dev/null -- it once spun and wrote a 16 GB log before anyone
+          noticed. ``-no-cnv`` is not a fix; it still waits on stdin. The
+          perplexity tool loads, runs exactly one chunk, and exits with a
+          non-zero status on any load failure.
+        * ``--chunks 1`` keeps the compute at one 512-token window, so the
+          runtime is dominated by reading the file.
+        * goes through ``_run_captured`` so a child that dies while something
+          else holds its pipe cannot hang this either.
+        """
+        resolved = self._resolve_data_file(data_file)
+        if resolved is None:
+            return False, "no calibration/eval corpus available for a load check"
+
+        if timeout is None:
+            try:
+                size_bytes = os.path.getsize(model_path)
+            except (OSError, TypeError):
+                size_bytes = 0
+            timeout = max(_LOAD_CHECK_TIMEOUT, size_bytes // _LOAD_CHECK_BANDWIDTH)
+
+        cmd = [
+            self.perplexity_tool,
+            "-m", model_path,
+            "-f", resolved,
+            "--ctx-size", "512",
+            "--chunks", "1",
+        ] + self._gpu_flags()
+
+        try:
+            proc = _run_captured(cmd, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired:
+            return False, f"load check timed out after {timeout}s"
+        # OSError/FileNotFoundError deliberately NOT caught: a missing or
+        # wrong-arch binary is a caller problem, not a bad model, and every
+        # other site in this file lets it propagate for that reason.
+
+        if proc.returncode == 0:
+            return True, ""
+        combined = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+        return False, _tail(combined, 15)
 
     def _effective_chunks(self, chunks: int) -> str:
         """``--chunks`` value shared by ``save_base_logits`` and
