@@ -374,6 +374,17 @@ def ensure_imatrix(
                 imatrix_bin=imatrix_bin,
                 timeout=timeout,
             )
+        except (TypeError, AttributeError, NameError, ImportError):
+            # A bug in OUR code is not a capture failure, and degrading to
+            # unweighted quantization on one is how a defect ships as an
+            # artifact. 2026-08-14: _run_captured rejected the documented
+            # ``timeout=None`` default with a TypeError *before spawning
+            # anything*; the blanket ``except Exception`` below logged it as a
+            # capture failure, and a Qwen3.8-27B run requested with
+            # ``use_imatrix: true`` quantized unweighted for want of a
+            # traceback anyone would act on. Environmental failure is
+            # tolerable and stays tolerated; a broken call signature is not.
+            raise
         except Exception:
             logger.warning(
                 "ensure_imatrix: capture failed for %s; continuing without "

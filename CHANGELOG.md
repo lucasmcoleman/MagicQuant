@@ -2,6 +2,36 @@
 
 ## [Unreleased]
 
+### Fixed (2026-08-14 — imatrix capture broken by the deadlock fix)
+
+- **`_run_captured(timeout=None)` raised `TypeError` before spawning, breaking
+  EVERY imatrix capture that used the documented default.** The
+  leaked-descriptor fix introduced `_run_captured` with a docstring promising
+  "contract is deliberately identical to `subprocess.run`", but `subprocess.run`
+  accepts `timeout=None` (wait forever) while `_run_captured` computed
+  `time.monotonic() + timeout` unconditionally. `capture_imatrix`'s `timeout`
+  is declared `Optional[float] = None`, so the default path was the broken one.
+  Fixed by treating `None` as "no deadline" and making the parameter optional
+  in the signature; the abandoned-pipe bound is unaffected, since that guard
+  keys on the child being gone rather than on elapsed time.
+- **`ensure_imatrix` laundered that programming error into a graceful
+  degrade.** A bare `except Exception` reported the `TypeError` as
+  "capture failed; continuing without an imatrix", so a Qwen3.8-27B campaign
+  submitted with `use_imatrix: true` quantized **unweighted** with a single
+  warning line as the only evidence. Narrowed to re-raise
+  `TypeError`/`AttributeError`/`NameError`/`ImportError` — a bug in our own
+  code is not a capture failure. Environmental failure (missing binary,
+  non-zero exit, timeout) still degrades to `None` as before: imatrix remains
+  optional by doctrine.
+- Files: `magicquant/utils/llamacpp.py`, `magicquant/imatrix.py`,
+  `tests/test_run_captured_timeout_none.py` (new).
+  Verified: 7 new regression tests covering both halves (the `None` default,
+  the error contract under `None`, a real timeout still firing, programming
+  errors propagating, environmental failures still degrading); full suite
+  1211 passed / 20 skipped in `.venv`; `ruff check --select F` clean;
+  `test_measurement_pipe_stall.py` + `test_orchestrator_measurement.py`
+  re-run (77 passed) to confirm the deadlock bound did not regress.
+
 ### Fixed (2026-08-14 — backlog change-set, S2)
 
 - **Active learning fed a dimensionally invalid residual, collapsing search

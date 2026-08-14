@@ -108,7 +108,7 @@ def _kill_process_group(proc: "subprocess.Popen", pgid: Optional[int]) -> None:
 
 def _run_captured(
     cmd: List[str],
-    timeout: int,
+    timeout: Optional[float] = None,
     check: bool = False,
 ) -> subprocess.CompletedProcess:
     """``subprocess.run(cmd, capture_output=True, text=True, timeout=...)``
@@ -145,7 +145,18 @@ def _run_captured(
     itself propagate untouched (``tests/test_orchestrator_measurement.py``
     pins that escape path -- never widen it).
     """
-    deadline = time.monotonic() + timeout
+    # ``timeout=None`` means "no deadline", exactly as in ``subprocess.run``.
+    # Getting this wrong is not theoretical: the first version computed
+    # ``time.monotonic() + timeout`` unconditionally, so every caller that took
+    # the documented default raised ``TypeError: unsupported operand type(s)
+    # for +: 'float' and 'NoneType'`` before spawning anything. That broke
+    # ``capture_imatrix`` (whose ``timeout`` defaults to None) on the
+    # Qwen3.8-27B campaign, and because ``ensure_imatrix`` catches capture
+    # failures and continues, the only trace was a warning -- the run went on
+    # to quantize UNWEIGHTED against an explicit ``use_imatrix: true``.
+    # The abandoned-pipe bound below still applies when there is no deadline;
+    # that guard is about the child being gone, not about elapsed time.
+    deadline = None if timeout is None else time.monotonic() + timeout
     # start_new_session: give the child its own process group so a stall can
     # be cleaned up wholesale (see _kill_process_group) without signalling
     # anything of MagicQuant's own.
@@ -165,14 +176,18 @@ def _run_captured(
 
     child_exited_at: Optional[float] = None
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            _kill_process_group(proc, pgid)
-            out, err = proc.communicate()
-            raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+        if deadline is None:
+            poll_for = _LIVENESS_POLL_INTERVAL
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_process_group(proc, pgid)
+                out, err = proc.communicate()
+                raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+            poll_for = min(_LIVENESS_POLL_INTERVAL, remaining)
 
         try:
-            out, err = proc.communicate(timeout=min(_LIVENESS_POLL_INTERVAL, remaining))
+            out, err = proc.communicate(timeout=poll_for)
         except subprocess.TimeoutExpired:
             pass
         else:
@@ -203,9 +218,10 @@ def _run_captured(
             "measurement subprocess %s exited (rc=%s) but its stdout/stderr "
             "stayed open for %ds afterwards -- a leaked descriptor in another "
             "process is holding the write end. Abandoning the read instead of "
-            "waiting out the remaining %ds of timeout. Command: %s",
+            "waiting out the remaining %s of timeout. Command: %s",
             proc.pid, proc.returncode, _ABANDONED_PIPE_GRACE,
-            int(deadline - now), " ".join(cmd),
+            "unbounded time" if deadline is None else f"{int(deadline - now)}s",
+            " ".join(cmd),
         )
         _kill_process_group(proc, pgid)
         raise subprocess.TimeoutExpired(
