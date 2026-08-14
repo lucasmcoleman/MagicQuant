@@ -38,12 +38,45 @@ TABLE_VERSION = 1
 _FLOAT_TYPES = ("F32", "F16", "BF16")
 
 
+# Bumped whenever the RESOLUTION logic changes -- i.e. anything that alters
+# what `resolve_tensor_type` returns. The distortion table's contents are
+# encode->decode error per tensor at its RESOLVED type, so a resolution change
+# silently invalidates every cached entry while the key still matches. That
+# happened: the 2026-08-13 weight-suffix gate changed ssm_a/ssm_d from F16 to
+# F32, and nothing in the key could see it. TABLE_VERSION covers the table's
+# SCHEMA; this covers its SEMANTICS. Bump it, don't reason about whether the
+# delta was small enough to ignore.
+RESOLUTION_VERSION = 1
+
+
 def _model_identity(path: Path) -> Dict[str, Any]:
+    """Identify the MODEL, not where it happens to sit.
+
+    Deliberately excludes the absolute path. Keying on it meant any directory
+    reorganisation invalidated the cache and cost a full recompute (~90 min on
+    a 30B) for a file whose bytes never changed -- which is exactly what the
+    2026-08-13 run-directory rename would have triggered.
+
+    size+mtime alone would be too weak: two different models can collide, and
+    a touch would falsely invalidate. So a cheap content hash anchors it --
+    the first 1 MiB covers the GGUF magic, the full KV metadata block and most
+    of the tensor-info table, which is the part that differs between models.
+    Reading 1 MiB is negligible against building the table it guards.
+    """
     try:
         st = path.stat()
-        return {"path": str(path), "size": st.st_size, "mtime": st.st_mtime}
+        head = hashlib.sha256()
+        with open(path, "rb") as fh:
+            head.update(fh.read(1024 * 1024))
+        return {
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+            "head_sha256": head.hexdigest()[:16],
+        }
     except OSError:
-        return {"path": str(path), "size": None, "mtime": None}
+        # Unreadable -> no identity. Returning a path-derived stand-in would
+        # let two unreadable models share a cache entry.
+        return {"size": None, "mtime": None, "head_sha256": None}
 
 
 def _imatrix_identity(imatrix: Optional[Dict[str, np.ndarray]]) -> Dict[str, Any]:
@@ -68,6 +101,7 @@ def _cache_key(
     payload = json.dumps(
         {
             "v": TABLE_VERSION,
+            "resolution_v": RESOLUTION_VERSION,
             "model": model_id,
             "schemes": sorted(schemes),
             "imatrix": imatrix_id,

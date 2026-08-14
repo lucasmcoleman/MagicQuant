@@ -2273,7 +2273,30 @@ def open_model_source(
         has_st = any(f.endswith(".safetensors") for f in os.listdir(path))
         if has_st:
             return SafetensorsSource(path)
-        gguf_files = [f for f in os.listdir(path) if f.endswith(".gguf")]
+        gguf_files = sorted(f for f in os.listdir(path) if f.endswith(".gguf"))
+        if len(gguf_files) > 1:
+            # FAIL CLOSED. This used to take gguf_files[0] from an UNORDERED
+            # os.listdir, so a directory holding several GGUFs silently
+            # resolved to an arbitrary one -- not even deterministically
+            # across machines. Observed 2026-08-13: a Foundry run directory
+            # held model-bf16.gguf (417 tensors) beside model-bf16-nomtp.gguf
+            # (401 tensors, MTP block removed) and the directory resolved to
+            # the MTP-FREE variant. Quantizing the wrong model is not an error
+            # anything downstream can detect: the file is valid, the tensor
+            # count is plausible, and the artifact ships.
+            #
+            # Same doctrine as ggml_facts.expected_size: an ambiguous input is
+            # refused, never guessed. Naming both candidates is the point --
+            # the caller knows which they meant, and this module cannot.
+            listing = "\n".join(f"    {f}" for f in gguf_files)
+            raise ValueError(
+                f"{path} contains {len(gguf_files)} .gguf files and there is "
+                f"no basis for choosing between them:\n{listing}\n"
+                f"Pass the specific file rather than the directory. (If these "
+                f"are shards of one multi-part model, merge them first with "
+                f"`llama-gguf-split --merge` -- multi-part sources are not "
+                f"stitched automatically.)"
+            )
         if gguf_files:
             return GGUFSource(os.path.join(path, gguf_files[0]),
                               allow_dequant=allow_dequant)

@@ -1689,6 +1689,16 @@ class MagicQuantOrchestrator:
                 )
 
             predicted_loss = self.predictor.predict_loss(config)
+            # NOTE the units. predicted_loss is in NOISE units (a ranking
+            # score, ~1-3); measured_loss is a RELATIVE FRACTION
+            # ((ppl-baseline)/baseline, ~0.005). Their raw difference is
+            # dimensionally meaningless and must never be fed back as a
+            # correction -- doing so used to make predict_loss return the
+            # measurement itself, handing measured configs a ~+0.20 composite
+            # advantage that collapsed exploration after round 1 (see
+            # PredictiveScorer's "Active learning" section). The predictor now
+            # owns the conversion; we read the real, noise-unit residual back
+            # from it for the record.
             residual = measured_loss - predicted_loss
 
             # Record measurement
@@ -1744,7 +1754,11 @@ class MagicQuantOrchestrator:
             # candidate's predicted_loss in this search, not just
             # this one candidate's own record.
             if not measurement_invalid:
-                self.predictor.record_residual(config, residual)
+                self.predictor.record_measurement(config, measured_loss)
+                # The calibrated, noise-unit residual -- the only one worth
+                # persisting. None until enough pairs exist to fit a scale,
+                # which is honest: "not enough signal yet", never a guess.
+                residual = self.predictor.residual_for(config)
 
             if verbose:
                 log.info(
@@ -1753,7 +1767,11 @@ class MagicQuantOrchestrator:
                     ppl=round(ppl, 4),
                     measured_loss=round(measured_loss, 4),
                     predicted_loss=round(predicted_loss, 4),
-                    residual=round(residual, 4),
+                    # None until the predictor has enough (predicted, measured)
+                    # pairs to fit its measured->noise-unit scale. Logging
+                    # "None" is the honest reading -- there is no calibrated
+                    # residual yet, and mean_abs_residual already filters it.
+                    residual=(round(residual, 4) if residual is not None else None),
                 )
 
             # Persist after EVERY successful measurement -- a kill
@@ -2336,6 +2354,41 @@ class MagicQuantOrchestrator:
                 n_pairs=len(pairs),
             )
 
+    def _band_histogram(self, all_configs) -> Dict[str, int]:
+        """{tier_band: count} over every candidate the search PROPOSED, keyed
+        by predicted size. Counts proposals, not measurements -- see the
+        comment at its call site in _save_results.
+
+        Defensive by design: a candidate without a usable predicted size is
+        counted under "unknown" rather than dropped, so the histogram's total
+        always reconciles against len(all_configs) and a silent shortfall
+        can't hide a bookkeeping bug.
+        """
+        from magicquant.quant.tiers import classify_tier
+
+        hist: Dict[str, int] = {}
+        for cand in all_configs or []:
+            size = None
+            if isinstance(cand, dict):
+                size = cand.get("predicted_size_gb", cand.get("size_gb"))
+            if size is None or not self._baseline_size_gb_for_bands():
+                band = "unknown"
+            else:
+                band = classify_tier(size, self._baseline_size_gb_for_bands())
+            hist[band] = hist.get(band, 0) + 1
+        return hist
+
+    def _baseline_size_gb_for_bands(self) -> float:
+        """Baseline the band histogram classifies against. Separate accessor so
+        a missing/zero baseline degrades to "unknown" bands instead of raising
+        inside a results-writing path."""
+        val = getattr(self, "baseline_size_gb", None)
+        if isinstance(val, (int, float)) and val > 0:
+            return float(val)
+        predictor = getattr(self, "predictor", None)
+        val = getattr(predictor, "baseline_size_gb", 0) if predictor else 0
+        return float(val) if isinstance(val, (int, float)) and val > 0 else 0.0
+
     def _save_results(self, all_configs, tiered):
         """Persist search results and measurements to JSON.
 
@@ -2392,6 +2445,18 @@ class MagicQuantOrchestrator:
             # excluded from the mutable search -- see
             # SensitivityProber._detect_fixed_groups.
             "fixed_groups": getattr(self, "fixed_groups", {}),
+            # PROPOSAL-side band histogram: how many candidates the search
+            # PRODUCED per tier band, by predicted size, regardless of whether
+            # any were ever measured. Without it, "zero configs measured in
+            # the Q5 band" is ambiguous -- it cannot distinguish "the search
+            # never proposed one" from "it proposed several and selection
+            # dropped them all before measurement", and those are different
+            # defects with different fixes. The 2026-08-13 empty-band
+            # investigation stalled on exactly that ambiguity.
+            #
+            # Cheap: all_configs is already in hand and already carries
+            # predicted sizes; this is a count, not a recomputation.
+            "proposed_band_histogram": self._band_histogram(all_configs),
             "seed": self._search_seed,
             "measurement": self._measurement_metadata(),
             # Additive key: the Kendall-tau predicted-vs-measured ranking

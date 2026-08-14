@@ -134,8 +134,22 @@ def run_group_probes(
             stored_conditions = data.get("conditions")
             if stored_conditions == conditions:
                 cached = data.get("probes", {})
+                # "N of M", not "N". This counted entries LOADED, but only
+                # entries with status=="ok" are actually reused -- a failed
+                # probe is re-measured. Observed 2026-08-13: it announced
+                # "reusing 4" while reusing 1 and re-measuring 3 aborts.
+                # Harmless arithmetic, actively misleading in the one
+                # situation someone reads this line for: checking whether a
+                # cache is masking a fix. A status line must not reassure
+                # precisely when it shouldn't.
+                reusable = sum(
+                    1 for v in cached.values()
+                    if isinstance(v, dict) and v.get("status") == "ok"
+                )
                 log.info(
-                    "reusing %d cached v2 probe measurement(s)", len(cached),
+                    "reusing %d of %d cached v2 probe measurement(s) "
+                    "(%d will be re-measured)",
+                    reusable, len(cached), len(cached) - reusable,
                     stage="calibrate",
                 )
             elif isinstance(stored_conditions, dict) and _drop_imatrix(

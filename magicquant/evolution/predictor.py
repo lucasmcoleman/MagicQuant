@@ -103,8 +103,16 @@ class PredictiveScorer:
         # a measured noise number per rewritten pair, not an inferred one.
         self.effective_bpw = effective_bpw or {}
 
-        # Learnable residual cache for active learning
+        # Learnable residual cache for active learning. Values are ALWAYS in
+        # noise units -- see the "Active learning" section below for why that
+        # invariant exists and what broke when it didn't hold.
         self.residual_cache: Dict[str, float] = {}
+        # config_key -> (uncorrected predicted_loss, measured_loss). The raw
+        # material the measured->noise-unit scale is fitted from.
+        self._measurement_pairs: Dict[str, tuple] = {}
+        # Fitted slope mapping a relative-PPL measurement into noise units.
+        # None = not enough signal to fit; no correction is applied.
+        self._loss_scale: Optional[float] = None
 
         # Collapse penalty: when multiple "brain" layers (E, H, O, R) are
         # compressed, quality degrades super-linearly.
@@ -144,6 +152,20 @@ class PredictiveScorer:
             total_loss += self.residual_cache[config_key]
 
         return total_loss
+
+    def _predict_loss_uncorrected(self, group_schemes: Dict[str, str]) -> float:
+        """predict_loss WITHOUT the active-learning correction.
+
+        Calibration must be fitted against the model's own raw output, or the
+        fit is contaminated by the correction derived from it.
+        """
+        key = self._make_config_key(group_schemes)
+        saved = self.residual_cache.pop(key, None)
+        try:
+            return self.predict_loss(group_schemes)
+        finally:
+            if saved is not None:
+                self.residual_cache[key] = saved
 
     def predict_size(self, group_schemes: Dict[str, str]) -> float:
         """Predict file size in GB for a hybrid configuration."""
@@ -440,6 +462,96 @@ class PredictiveScorer:
             'composite_score': composite_score
         }
 
+    # ------------------------------------------------------------------
+    # Active learning
+    # ------------------------------------------------------------------
+    #
+    # THE INVARIANT: predict_loss ALWAYS returns noise units. It must not
+    # silently change what it measures depending on whether a config has
+    # been measured.
+    #
+    # It used to. `residual = measured_loss - predicted_loss` was computed in
+    # the orchestrator and added straight back here, but the two sides are
+    # different quantities:
+    #
+    #   measured_loss = (ppl - baseline_ppl) / baseline_ppl   RELATIVE FRACTION, ~0.005
+    #   predict_loss  = Σ(sens_weight × noise_factor) + ...   NOISE UNITS,      ~2.0
+    #
+    # so `predicted + (measured - predicted)` returned the MEASUREMENT, in
+    # the wrong units. Downstream, `score_hybrid`'s
+    # `loss_score = 1 - predicted_loss / 5.0` mapped ~0.005 to 0.999 and
+    # ~2.0 to 0.60, and `_tournament_selection` sorts every candidate in a
+    # tier on the resulting composite and keeps the top 3. A measured config
+    # therefore carried ~+0.20 composite (on a 0-1 scale, where the whole
+    # precision term spans 0.50) purely from the unit mismatch -- it won its
+    # tier almost regardless of merit, and the next generation was built from
+    # its mutants. Exploration collapsed after round 1. Measured 2026-08-14.
+    #
+    # THE FIX: convert the measurement INTO noise units before differencing,
+    # using a scale fitted from the (predicted, measured) pairs themselves --
+    # a least-squares slope through the origin. Then the residual is a real
+    # calibration correction in the units predict_loss speaks, and measured
+    # and unmeasured configs are once again comparable.
+    #
+    # Deliberately conservative: with fewer than MIN_SCALE_PAIRS usable
+    # pairs the scale is not fitted and NO correction is applied. An
+    # unfitted scale is "no information", never a guess -- the same doctrine
+    # as ggml_facts.expected_size and PredictiveScorer._bpw_for.
+
+    MIN_SCALE_PAIRS = 2
+
+    def record_measurement(
+        self, config: Dict[str, str], measured_loss: float
+    ) -> None:
+        """Record a real measurement and refresh the calibration.
+
+        Stores the (predicted, measured) pair, refits the measured->noise-unit
+        scale over every pair seen, and recomputes every cached residual
+        against the new scale (an updated scale changes older residuals too --
+        leaving them stale would mix calibrations).
+        """
+        key = self._make_config_key(config)
+        # The UNCORRECTED prediction: this pair calibrates the model, so it
+        # must not be contaminated by the correction derived from it.
+        raw_predicted = self._predict_loss_uncorrected(config)
+        self._measurement_pairs[key] = (raw_predicted, measured_loss)
+        self._refit_loss_scale()
+
+    def _refit_loss_scale(self) -> None:
+        """Least-squares slope through the origin over the measured pairs.
+
+        Through the origin because both quantities are zero for a lossless
+        config, so an intercept would be unphysical. Only strictly-positive
+        measurements are fitted: a measurement at or below baseline is inside
+        the noise floor (and may be flagged measurement_invalid upstream), so
+        it carries no calibration signal even though it still RECEIVES a
+        correction once a scale exists.
+        """
+        usable = [(p, m) for p, m in self._measurement_pairs.values() if m > 0]
+        if len(usable) < self.MIN_SCALE_PAIRS:
+            self._loss_scale = None
+            self.residual_cache = {}
+            return
+        num = sum(p * m for p, m in usable)
+        den = sum(m * m for _, m in usable)
+        self._loss_scale = (num / den) if den > 0 else None
+
+        self.residual_cache = {}
+        if self._loss_scale is None:
+            return
+        for key, (raw_predicted, measured) in self._measurement_pairs.items():
+            # measured * scale is the measurement expressed in noise units.
+            self.residual_cache[key] = measured * self._loss_scale - raw_predicted
+
+    def residual_for(self, config: Dict[str, str]) -> Optional[float]:
+        """This config's calibrated residual in NOISE units, or None when no
+        scale has been fitted yet. None is the honest answer -- a residual
+        computed against an unfitted scale would be a guess."""
+        return self.residual_cache.get(self._make_config_key(config))
+
     def record_residual(self, config: Dict[str, str], residual: float):
+        """Legacy direct-residual API, retained for callers that compute the
+        correction themselves and already have it in noise units. Prefer
+        ``record_measurement`` -- it cannot get the units wrong."""
         key = self._make_config_key(config)
         self.residual_cache[key] = residual

@@ -622,15 +622,23 @@ def test_measured_search_overlap_cleans_up_prefetched_build_on_exception(tmp_pat
     monkeypatch.setattr(orch, "_build_candidate", tracking_build)
 
     calls = {"n": 0}
-    original_record_residual = PredictiveScorer.record_residual
+    # Injects at record_measurement, the orchestrator's active-learning entry
+    # point since the tournament-units fix (it was record_residual, which the
+    # orchestrator no longer calls -- it fed a dimensionally invalid residual).
+    # The test is about prefetched-build cleanup on a mid-processing raise, not
+    # about which method raises; it just needs the raise to land on the real
+    # post-measurement path.
+    original_record_measurement = PredictiveScorer.record_measurement
 
-    def flaky_record_residual(self, config, residual):
+    def flaky_record_measurement(self, config, measured_loss):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("simulated mid-processing failure")
-        return original_record_residual(self, config, residual)
+        return original_record_measurement(self, config, measured_loss)
 
-    monkeypatch.setattr(PredictiveScorer, "record_residual", flaky_record_residual)
+    monkeypatch.setattr(
+        PredictiveScorer, "record_measurement", flaky_record_measurement
+    )
 
     with pytest.raises(RuntimeError, match="simulated mid-processing failure"):
         orch.run_measured_search(

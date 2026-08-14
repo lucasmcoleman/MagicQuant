@@ -2,6 +2,61 @@
 
 ## [Unreleased]
 
+### Fixed (2026-08-14 — backlog change-set, S2)
+
+- **Active learning fed a dimensionally invalid residual, collapsing search
+  exploration after round 1.** `residual = measured_loss - predicted_loss`
+  differenced a RELATIVE FRACTION (`(ppl-baseline)/baseline`, ~0.005) against
+  NOISE UNITS (`Σ sensitivity_weight × noise_factor`, ~2.0), then added it
+  back — so `predict_loss` returned the measurement itself, in the wrong
+  units. `score_hybrid`'s `loss_score = 1 - predicted_loss/5.0` mapped that to
+  0.999 against 0.60 for an unmeasured config, and `_tournament_selection`
+  sorts every candidate in a tier on the resulting composite and keeps the top
+  3. **Measured: +0.312 composite from units alone**, on a 0–1 scale whose
+  entire precision term spans 0.50. A measured config won its tier almost
+  regardless of merit and the next generation was built from its mutants.
+  Fixed by converting the measurement into noise units via a scale fitted from
+  the (predicted, measured) pairs — a least-squares slope through the origin —
+  so the residual is a real calibration correction. Under `MIN_SCALE_PAIRS`
+  usable pairs, or with only non-positive measurements, **no correction is
+  applied at all**: "not enough signal" over a guess.
+- **`open_model_source` silently picked one GGUF from a directory holding
+  several**, via `gguf_files[0]` on an UNORDERED `os.listdir` — not even
+  deterministic across machines. Observed: a run directory resolved to the
+  401-tensor MTP-free variant over the 417-tensor full model. Now raises,
+  naming every candidate.
+- **The v2 distortion cache keyed on the absolute model path** (any
+  reorganisation cost a ~90 min recompute for unchanged bytes) **and was blind
+  to resolution-logic changes** (the table's contents are encode→decode error
+  at each tensor's RESOLVED type; the 2026-08-13 weight-suffix gate changed
+  `ssm_a`/`ssm_d` and nothing in the key could see it). Identity is now
+  size + mtime + a 1 MiB content hash, and `RESOLUTION_VERSION` joins the key.
+- **`calibrate.py` logged "reusing N cached probe measurement(s)" counting
+  entries LOADED, not reused** — it announced "reusing 4" while reusing 1 and
+  re-measuring 3 aborts. Now "reusing N of M (K will be re-measured)".
+
+### Added
+
+- **`proposed_band_histogram` in `search_results.json`** — candidates per tier
+  band by PREDICTED size, counting proposals rather than measurements. Without
+  it, "zero configs measured in the Q5 band" cannot distinguish "never
+  proposed" from "proposed and dropped before measurement". Unclassifiable
+  candidates are counted under `unknown` so the total always reconciles.
+
+### Notes
+
+- **The seed-pinned fixture is byte-identical and was NOT regenerated.** The
+  active-learning fix only alters behaviour once residuals are recorded, which
+  requires measurements; the fixture is prediction-only and never reaches that
+  path. Regenerating it would have obscured that.
+- **The cache-key change invalidates every existing distortion table** — both
+  the path removal and `RESOLUTION_VERSION` change the key. This is deliberate
+  and costs a full recompute (~90 min on a 30B) on the next v2 run.
+- Backlog item 5 (v2 "requested vs resolved" scheme labelling) was
+  investigated and **is not a defect**: `Allocation` already serialises both
+  `assignment` and `actual_types`, and `test_v2_search_characterization`
+  already pins both. It was a reader-side confusion.
+
 ### Fixed (2026-08-13, second field report — v2 probe abort)
 
 - **v2 probes aborted llama.cpp on `nemotron_h_moe`; `ssm_a` AND `ssm_d` were
