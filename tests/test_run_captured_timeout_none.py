@@ -24,6 +24,7 @@ Both halves are pinned here: the None default must work, and a programming
 error must not be laundered into a graceful degrade.
 """
 
+import pathlib
 import subprocess
 import sys
 
@@ -96,6 +97,49 @@ def test_ensure_imatrix_does_not_swallow_programming_errors(tmp_path, monkeypatc
 
     with pytest.raises(TypeError):
         im.ensure_imatrix(model, corpus_path=corpus, cache_dir=tmp_path / "_im")
+
+
+def test_ensure_imatrix_does_not_swallow_loader_programming_errors(tmp_path, monkeypatch):
+    """The same bare `except Exception` guarded the LOAD half of the function.
+    A corrupt imatrix file is an expected condition and still degrades (below),
+    but a bug in the loader must surface."""
+    from magicquant import imatrix as im
+
+    model = tmp_path / "model-bf16.gguf"
+    model.write_bytes(b"GGUF" + b"\0" * 64)
+    corpus = tmp_path / "calib.txt"
+    corpus.write_text("hello world\n")
+    cache = tmp_path / "_im"
+    cache.mkdir()
+
+    monkeypatch.setattr(im, "capture_imatrix", lambda *a, **k: None)
+    def _boom(*a, **k):
+        raise AttributeError("'NoneType' object has no attribute 'shape'")
+    monkeypatch.setattr(im, "load_imatrix", _boom)
+
+    with pytest.raises(AttributeError):
+        im.ensure_imatrix(model, corpus_path=corpus, cache_dir=cache)
+
+
+def test_ensure_imatrix_still_degrades_on_a_corrupt_imatrix_file(tmp_path, monkeypatch):
+    """A truncated/corrupt capture is environmental and must stay tolerated --
+    verified against the REAL loader, which raises struct.error on a file that
+    is not a GGUF."""
+    from magicquant import imatrix as im
+
+    model = tmp_path / "model-bf16.gguf"
+    model.write_bytes(b"GGUF" + b"\0" * 64)
+    corpus = tmp_path / "calib.txt"
+    corpus.write_text("hello world\n")
+    cache = tmp_path / "_im"
+    cache.mkdir()
+
+    def _write_garbage(_m, _c, out, **k):
+        pathlib.Path(out).write_bytes(b"not-a-gguf")
+        return pathlib.Path(out)
+
+    monkeypatch.setattr(im, "capture_imatrix", _write_garbage)
+    assert im.ensure_imatrix(model, corpus_path=corpus, cache_dir=cache) is None
 
 
 def test_ensure_imatrix_still_degrades_on_environmental_failure(tmp_path, monkeypatch):

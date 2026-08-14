@@ -396,6 +396,11 @@ def ensure_imatrix(
 
     try:
         return load_imatrix(cache_path)
+    except (TypeError, AttributeError, NameError, ImportError):
+        # Same reasoning as the capture guard above: a corrupt or truncated
+        # imatrix file is an expected condition and still degrades, but a bug
+        # in our own loader must not wear its costume.
+        raise
     except Exception:
         logger.warning(
             "ensure_imatrix: failed to load captured imatrix %s",
