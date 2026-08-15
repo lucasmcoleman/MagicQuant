@@ -21,7 +21,8 @@ baseline) / baseline`` with no validity check), which let a NaN-driven
 project's incident notes for the full root-cause chain.
 """
 
-from typing import Dict, Optional
+import hashlib
+from typing import Any, Dict, Optional
 
 from magicquant.logging import get_logger
 
@@ -332,3 +333,38 @@ def predictor_is_tracking(
     if tau is None:
         return None, None
     return tau > min_tau, tau
+
+
+def imatrix_identity(imatrix: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Cheap content fingerprint of an imatrix, or ``{"active": False}``.
+
+    Shared by the v1 sensitivity prober (``evolution/probing.py``, via the
+    measured-search orchestrator's checkpoint-resume gate) and the v2
+    distortion-table cache (``v2/sensitivity.py``) so "same imatrix" means
+    the same thing in both places -- v2's cache key and v1's checkpoint
+    resume gate must invalidate on identical conditions, not merely similar
+    ones. Full-content hashing would read hundreds of MB per tensor, so this
+    hashes tensor names plus a coarse sample of each vector instead of every
+    value.
+
+    Never raises: this feeds ``_write_measured_checkpoint``, which must be
+    able to persist a checkpoint mid-run regardless of what an imatrix
+    happens to contain (mirrors ``_json_safe``'s same guarantee for
+    measurement values). A tensor value that can't be coerced to a float32
+    array falls back to hashing its ``repr()`` instead of the array bytes --
+    coarser, but still distinguishes "this imatrix" from "a different one"
+    for every real (numpy-array-valued) imatrix this ever actually sees.
+    """
+    if imatrix is None:
+        return {"active": False}
+    import numpy as np
+
+    h = hashlib.sha256()
+    for name in sorted(imatrix):
+        h.update(name.encode())
+        try:
+            v = np.asarray(imatrix[name], dtype=np.float32)
+            h.update(v[:: max(1, v.size // 16)].tobytes())
+        except (TypeError, ValueError):
+            h.update(repr(imatrix[name]).encode())
+    return {"active": True, "n_tensors": len(imatrix), "hash": h.hexdigest()[:16]}

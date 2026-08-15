@@ -80,16 +80,12 @@ def _model_identity(path: Path) -> Dict[str, Any]:
 
 
 def _imatrix_identity(imatrix: Optional[Dict[str, np.ndarray]]) -> Dict[str, Any]:
-    if imatrix is None:
-        return {"active": False}
-    # Cheap content fingerprint: tensor count + a hash over names and a few
-    # sampled values (full-content hashing would read hundreds of MB).
-    h = hashlib.sha256()
-    for name in sorted(imatrix):
-        h.update(name.encode())
-        v = np.asarray(imatrix[name], dtype=np.float32)
-        h.update(v[:: max(1, v.size // 16)].tobytes())
-    return {"active": True, "n_tensors": len(imatrix), "hash": h.hexdigest()[:16]}
+    """Delegates to ``utils.measurement.imatrix_identity`` so this table's
+    cache key and the v1 checkpoint-resume gate (``orchestrator.py``) hash
+    "same imatrix" identically -- see that function's docstring."""
+    from magicquant.utils.measurement import imatrix_identity
+
+    return imatrix_identity(imatrix)
 
 
 def _cache_key(

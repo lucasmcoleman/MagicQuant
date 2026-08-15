@@ -2,6 +2,38 @@
 
 ## [Unreleased]
 
+### Fixed (2026-08-15 — issue #5)
+
+- **v1 sensitivity probes were built without the imatrix, while the
+  candidates and final tiers they steer were built with one.** `SensitivityProber`
+  had no `imatrix` parameter at all (`_real_probe`'s `create_hybrid_gguf` call
+  took the writer default `None`), so every measured search's per-group
+  sensitivity weights were ranked on unweighted probes even when
+  `use_imatrix=True` weighted everything downstream of them. The bias is
+  non-uniform (an imatrix helps K-quants and does nothing for MXFP4/Q8_0 by
+  ggml design), so groups were mis-ranked, not merely mis-scaled. Fixed:
+  `SensitivityProber(imatrix=...)` threads through to every real probe's
+  `create_hybrid_gguf` call, and both `run_measured_search` and
+  `run_full_search` now pass `self._imatrix`. `enable_imatrix()` is now
+  called ahead of the measured-search checkpoint-resume gate (previously
+  after) so the gate's imatrix fingerprint reflects this run's actual state.
+  Decision: a checkpoint's `sensitivity_weights` and `self._measured`
+  candidates are both built against whatever imatrix was active for that
+  run, so `_current_measurement_conditions`/`_measurement_conditions_match`
+  now include an `imatrix_id` (content hash, shared with v2's distortion-
+  table cache via `utils.measurement.imatrix_identity`) and reject a
+  resume whose imatrix identity changed — mirroring v2's cache-invalidation
+  behavior rather than leaving v1 permanently unweighted. Default (no
+  imatrix) behavior is unchanged. Verified: `tests/test_probe_imatrix.py`
+  (new) pins that the imatrix reaches `create_hybrid_gguf` from the prober,
+  that a probe built with one measures differently than one built without,
+  that both orchestrator search paths thread `self._imatrix` into the
+  prober, and that the checkpoint gate invalidates on a changed imatrix
+  identity (including backward compatibility for pre-fix checkpoints with
+  no `imatrix_id` key). Files touched: `magicquant/evolution/probing.py`,
+  `magicquant/orchestrator.py`, `magicquant/utils/measurement.py`,
+  `magicquant/v2/sensitivity.py`.
+
 ### Fixed (2026-08-14 — imatrix capture broken by the deadlock fix)
 
 - **`_run_captured(timeout=None)` raised `TypeError` before spawning, breaking
