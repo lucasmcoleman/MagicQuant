@@ -347,24 +347,69 @@ def imatrix_identity(imatrix: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     hashes tensor names plus a coarse sample of each vector instead of every
     value.
 
-    Never raises: this feeds ``_write_measured_checkpoint``, which must be
-    able to persist a checkpoint mid-run regardless of what an imatrix
-    happens to contain (mirrors ``_json_safe``'s same guarantee for
-    measurement values). A tensor value that can't be coerced to a float32
-    array falls back to hashing its ``repr()`` instead of the array bytes --
+    Never raises (PR6 review F2): this feeds ``_write_measured_checkpoint``,
+    which must be able to persist a checkpoint mid-run regardless of what an
+    imatrix happens to contain (mirrors ``_json_safe``'s same guarantee for
+    measurement values). The WHOLE per-tensor body -- name coercion, array
+    conversion, and the coarse-sample slice -- is guarded, not just the
+    ``np.asarray`` call, since a 0-d array (e.g. from a ``None`` value) makes
+    the slice itself raise ``IndexError``, a non-``str`` key makes naive
+    ``name.encode()`` raise ``AttributeError``, and mutually unorderable
+    keys make a plain ``sorted(imatrix)`` raise ``TypeError`` before any
+    per-tensor code even runs.
+
+    A single malformed ENTRY (a ``None`` value, a ragged list numpy can't
+    coerce, an object whose ``__array__``/``__repr__`` raises) is skipped
+    rather than allowed to abort the whole fingerprint or collapse it onto a
+    shared "something failed" sentinel -- either would make two otherwise-
+    different imatrices compare equal. The entry's raw value is hashed via
+    ``repr()`` instead of its array bytes when array conversion fails --
     coarser, but still distinguishes "this imatrix" from "a different one"
     for every real (numpy-array-valued) imatrix this ever actually sees.
+    Each entry's contribution (name bytes + value bytes) is only fed into
+    the running hash once BOTH halves are known good -- never partially, so
+    a value that fails after its name was already about to be hashed can't
+    leave a half-written entry behind; when even ``repr()`` raises, the
+    whole entry (name included) is dropped from the hash.
     """
     if imatrix is None:
         return {"active": False}
     import numpy as np
 
+    try:
+        names = sorted(imatrix, key=str)
+    except Exception:
+        # str(key) itself failing (a pathological __str__) is exotic enough
+        # that a canonical sort isn't worth chasing -- fall back to
+        # whatever order the dict already iterates in. Still deterministic
+        # for a given imatrix construction (dicts preserve insertion
+        # order); just not a canonical sort. For every real imatrix
+        # (str-keyed, from ensure_imatrix) this is identical to plain
+        # sorted(imatrix) and produces the same hash as before.
+        names = list(imatrix)
+
     h = hashlib.sha256()
-    for name in sorted(imatrix):
-        h.update(name.encode())
+    for name in names:
+        try:
+            name_bytes = str(name).encode()
+        except Exception:
+            # Can't even name this entry (a pathological __str__ on a key
+            # that also broke sorting above) -- nothing safe to hash, skip
+            # it entirely rather than raise.
+            continue
         try:
             v = np.asarray(imatrix[name], dtype=np.float32)
-            h.update(v[:: max(1, v.size // 16)].tobytes())
-        except (TypeError, ValueError):
-            h.update(repr(imatrix[name]).encode())
+            value_bytes = v[:: max(1, v.size // 16)].tobytes()
+        except Exception:
+            try:
+                value_bytes = repr(imatrix[name]).encode()
+            except Exception:
+                # repr() itself raising is rare enough (a pathological
+                # __repr__) that there's nothing safe left to hash for this
+                # one entry -- drop it and keep going. The remaining
+                # entries still differentiate this imatrix from a
+                # different one.
+                continue
+        h.update(name_bytes)
+        h.update(value_bytes)
     return {"active": True, "n_tensors": len(imatrix), "hash": h.hexdigest()[:16]}
