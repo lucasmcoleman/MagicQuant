@@ -266,6 +266,14 @@ def test_run_measured_search_threads_imatrix_into_prober(tmp_path, monkeypatch):
 
 
 def test_run_measured_search_no_imatrix_passes_none_to_prober(tmp_path, monkeypatch):
+    """PR6 review F3: the original assertion (``kw.get("imatrix") is None``)
+    was vacuous -- ``.get()`` returns ``None`` whether the kwarg is threaded
+    explicitly or absent entirely, so deleting ``imatrix=self._imatrix`` at
+    the call site would leave this green. Use the same
+    ``kw.get("imatrix", "MISSING")`` sentinel as
+    ``test_real_probe_default_imatrix_is_none_unchanged_behavior`` to
+    distinguish "explicitly None" from "absent", so this actually goes red
+    if the kwarg stops being threaded."""
     import magicquant.orchestrator as orch_mod
 
     monkeypatch.setattr(orch_mod, "SensitivityProber", _SpyProber)
@@ -276,7 +284,51 @@ def test_run_measured_search_no_imatrix_passes_none_to_prober(tmp_path, monkeypa
             measurement_rounds=1, verbose=False, resume=False, use_imatrix=False,
         )
 
-    assert _SpyProber.last_kwargs.get("imatrix") is None
+    assert _SpyProber.last_kwargs.get("imatrix", "MISSING") is None
+
+
+# ── PR6 review F6: self._imatrix has no per-run reset, unlike its KL
+# ── counterpart -- a second run_measured_search(use_imatrix=False) on the
+# ── SAME orchestrator instance must not inherit a prior run's imatrix.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_second_run_with_use_imatrix_false_does_not_inherit_prior_run_imatrix(
+    tmp_path, monkeypatch
+):
+    """A first run_measured_search(use_imatrix=True) sets self._imatrix; a
+    SECOND run_measured_search(use_imatrix=False) on the same orchestrator
+    instance must reset it back to None before probing -- both the prober's
+    kwarg and the checkpoint-resume cache key (_current_measurement_
+    conditions) are imatrix-aware as of issue #5, so an inherited imatrix
+    would silently widen the blast radius of the pre-existing
+    _build_candidate exposure this bug already had."""
+    import magicquant.orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "SensitivityProber", _SpyProber)
+    orch = _make_orch(tmp_path, monkeypatch)
+
+    fake_imatrix = {"token_embd.weight": np.array([1.0], dtype=np.float32)}
+    monkeypatch.setattr(
+        "magicquant.imatrix.ensure_imatrix", lambda *a, **k: fake_imatrix
+    )
+
+    with pytest.raises(_Sentinel):
+        orch.run_measured_search(
+            measurement_rounds=1, verbose=False, resume=False, use_imatrix=True,
+        )
+    assert orch._imatrix is fake_imatrix  # sanity: first run activated it
+
+    with pytest.raises(_Sentinel):
+        orch.run_measured_search(
+            measurement_rounds=1, verbose=False, resume=False, use_imatrix=False,
+        )
+
+    assert orch._imatrix is None, (
+        "second run's use_imatrix=False must reset self._imatrix, not "
+        "inherit it from the prior run on this same instance"
+    )
+    assert _SpyProber.last_kwargs.get("imatrix", "MISSING") is None
 
 
 def test_run_full_search_threads_imatrix_into_prober(tmp_path, monkeypatch):
@@ -320,6 +372,102 @@ def test_imatrix_identity_different_content_differs():
 def test_imatrix_identity_active_vs_inactive_differs():
     a = {"t": np.array([1.0], dtype=np.float32)}
     assert imatrix_identity(a) != imatrix_identity(None)
+
+
+# ── PR6 review F2: imatrix_identity must actually meet its "Never raises"
+# ── guarantee -- confirmed-raising inputs from the review's table must all
+# ── now return normally, and malformed entries must not collide with each
+# ── other via a shared error sentinel.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_imatrix_identity_none_value_entry_does_not_raise():
+    """A None value produces a 0-d array via np.asarray(None, dtype=f32);
+    slicing that 0-d array with v[::n] raised IndexError, which sat outside
+    the except tuple that only caught TypeError/ValueError."""
+    result = imatrix_identity({"blk.0": None})
+    assert result["active"] is True
+    assert result["n_tensors"] == 1
+    assert isinstance(result["hash"], str)
+
+
+def test_imatrix_identity_non_str_key_does_not_raise():
+    """A non-str key made the naive name.encode() call raise AttributeError
+    (int has no .encode())."""
+    result = imatrix_identity({1: np.array([1.0, 2.0], dtype=np.float32)})
+    assert result["active"] is True
+    assert result["n_tensors"] == 1
+
+
+def test_imatrix_identity_bytes_key_does_not_raise():
+    result = imatrix_identity({b"a": np.array([1.0, 2.0], dtype=np.float32)})
+    assert result["active"] is True
+    assert result["n_tensors"] == 1
+
+
+def test_imatrix_identity_unsortable_keys_does_not_raise():
+    """Mixed int/str keys are not mutually orderable -- plain sorted(imatrix)
+    raised TypeError before any per-tensor code ran at all."""
+    result = imatrix_identity(
+        {1: np.array([1.0], dtype=np.float32), "a": np.array([2.0], dtype=np.float32)}
+    )
+    assert result["active"] is True
+    assert result["n_tensors"] == 2
+
+
+def test_imatrix_identity_array_construction_raising_does_not_raise():
+    """A value whose __array__ raises during np.asarray() must fall back to
+    the repr() path rather than propagate the RuntimeError."""
+
+    class _ExplodingArray:
+        def __array__(self, dtype=None):
+            raise RuntimeError("boom")
+
+        def __repr__(self):
+            return "<exploding>"
+
+    result = imatrix_identity({"blk.0": _ExplodingArray()})
+    assert result["active"] is True
+    assert result["n_tensors"] == 1
+
+
+def test_imatrix_identity_repr_also_raising_skips_entry_not_whole_function():
+    """When even the repr() fallback raises, that one entry is dropped
+    rather than the whole function raising or falling back to a shared
+    sentinel -- the surviving good entry must still be reflected in the
+    hash (proven by differing from an otherwise-identical imatrix missing
+    that good entry)."""
+
+    class _ExplodingEverything:
+        def __array__(self, dtype=None):
+            raise RuntimeError("boom")
+
+        def __repr__(self):
+            raise RuntimeError("repr also boom")
+
+    with_extra = imatrix_identity(
+        {
+            "blk.0": np.array([1.0, 2.0], dtype=np.float32),
+            "blk.1": _ExplodingEverything(),
+        }
+    )
+    without_extra = imatrix_identity({"blk.0": np.array([1.0, 2.0], dtype=np.float32)})
+    assert with_extra["active"] is True
+    # n_tensors reflects the raw imatrix size (includes the dropped entry);
+    # only the HASH must be unaffected by an entry that contributed nothing.
+    assert with_extra["n_tensors"] == 2
+    assert with_extra["hash"] == without_extra["hash"]
+
+
+def test_imatrix_identity_different_malformed_entries_do_not_collide():
+    """Two imatrices whose ONE entry each fails differently must not both
+    collapse onto the same hash via a shared "something failed" sentinel --
+    the review confirmed the repr()-fallback design already avoids this for
+    the entries it could reach; this pins it for entries that previously
+    escaped the guard entirely (None values, non-str keys)."""
+    a = imatrix_identity({"blk.0": None})
+    b = imatrix_identity({1: np.array([9.0], dtype=np.float32)})
+    assert a != b
 
 
 _BASE_CONDITIONS = {
