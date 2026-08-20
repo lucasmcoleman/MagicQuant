@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+### Fixed (2026-08-20 — metadata array signedness lost on every K-quant hybrid render)
+
+- **Every standard MagicQuant K-quant hybrid render wrote
+  `tokenizer.ggml.token_type` as GGUF array element type UINT32 (4) although
+  every real source file has INT32 (5).** Mainline llama.cpp's vocab loader
+  hard-requires `GGUF_TYPE_INT32` for this key and refuses to load the file
+  ("invalid gguf type for tokenizer.ggml.token_type"; real user report, HF
+  discussion `lmcoleman/Qwen3.8-27B-MagicQuant-GGUF#1`, current llama.cpp
+  Windows CUDA release b-series). uint32 was observed in Qwen3.8, Nemotron,
+  ThinkingCap, and Muse-Glimmer renders; int32 in their BF16 sources AND in
+  ROCmFPX renders (a different writer, outside this repo — Foundry's ROCmFPX
+  MQ-hybrid mode never calls `magicquant.gguf.writer._write_metadata_value`,
+  so it was never exposed to this bug).
+- Root cause: `magicquant.gguf.reader.GGUFReader._read_value` discarded the
+  on-disk GGUF element type entirely, returning plain Python ints/lists for
+  every KV. `_write_metadata_value` then re-derived an output type from the
+  Python value's magnitude alone, preferring UINT32 for any non-negative int
+  array — which cannot distinguish a signed array whose values happen to be
+  small and non-negative (`token_type`'s enum values are 0-6) from a
+  genuinely unsigned one. Flagged but deliberately deferred in a comment on
+  the previous `split.*`-KV fix (`e354f79`): "a broader fix would need
+  GGUFReader to retain per-key types; out of scope for this change."
+- Fixed generally, not just for this one key: `GGUFReader` now tags every
+  integer scalar/array KV with the exact on-disk GGUF type it parsed
+  (`GGUFTypedInt`/`GGUFTypedArray`, transparent subclasses of `int`/`list` —
+  every existing consumer of `get_metadata()` keeps working unmodified).
+  `_write_metadata_value` uses that recorded type verbatim when present —
+  covering every signed/unsigned integer width (8/16/32/64-bit) plus
+  float32/float64/bool/string arrays — and only falls back to the historical
+  magnitude-based inference for genuinely untyped values (e.g. a plain list
+  MagicQuant constructs itself rather than one read from a GGUF file).
+- Files: `magicquant/gguf/reader.py`, `magicquant/gguf/writer.py`,
+  `tests/test_writer_metadata_type_roundtrip.py` (new).
+  Verified: 14 new regression tests — byte-level element-type + value
+  round-trip for every signed/unsigned integer width, `token_type`
+  specifically, empty-array and scalar cases, an untyped-list fallback
+  check, and an end-to-end `create_hybrid_gguf` render checked against the
+  *upstream* `gguf` package's own reader (independent of the code under
+  test); full suite 1227 passed / 20 skipped (was 1213/20) in `.venv`;
+  `ruff check --select F` clean. Confirmed the new tests fail against the
+  pre-fix code (`tokenizer.ggml.token_type` comes back UINT32, not INT32).
+
 ### Fixed (2026-08-19 — issue #5 PR review fixes, F1/F2/F3/F5/F6)
 
 - **F1 (MEDIUM): the checkpoint-resume gate's `imatrix_id` backward-compat

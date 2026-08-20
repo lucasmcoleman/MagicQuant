@@ -11,6 +11,52 @@ import struct
 import os
 
 
+class GGUFTypedArray(list):
+    """A metadata array value tagged with its on-disk GGUF element type.
+
+    Behaves exactly like a plain ``list`` (equality, iteration, indexing,
+    JSON-serializes the same way) so every existing consumer of
+    ``GGUFReader.get_metadata()`` keeps working unmodified. The one addition
+    is ``gguf_type``: the GGUF wire-format element type id (see
+    ``gguf.constants.GGUFValueType`` -- values 0-12, matching the
+    ``data_type`` branches in ``_read_value`` below) this array was actually
+    read as.
+
+    Exists because a plain Python list has no memory of whether its ints
+    came from an INT32 or UINT32 array on disk -- both decode to the same
+    Python ``int``. Without this tag, a metadata-copying writer has no way
+    to round-trip an array's element type and has to *guess* one from the
+    values' magnitude alone, which cannot distinguish a signed array whose
+    values happen to be small and non-negative (e.g.
+    ``tokenizer.ggml.token_type``, INT32 on disk, values 0-6) from an
+    unsigned one. See magicquant/gguf/writer.py's ``_write_metadata_value``.
+    """
+
+    def __init__(self, values, gguf_type: int):
+        super().__init__(values)
+        self.gguf_type = gguf_type
+
+
+class GGUFTypedInt(int):
+    """A metadata scalar int value tagged with its on-disk GGUF type.
+
+    Same rationale as ``GGUFTypedArray`` above, for scalar (non-array)
+    integer KV values -- an ``int`` subclass so every existing consumer
+    (arithmetic, comparisons, ``isinstance(..., int)``) keeps working
+    unmodified.
+
+    (No ``__slots__`` here: CPython disallows a nonempty ``__slots__`` on a
+    subtype of ``int`` -- its instances are already variable-length. A plain
+    subclass gets a ``__dict__`` for free, which is fine for a value that's
+    only ever constructed here and read via ``.gguf_type``.)
+    """
+
+    def __new__(cls, value: int, gguf_type: int):
+        obj = super().__new__(cls, value)
+        obj.gguf_type = gguf_type
+        return obj
+
+
 class GGUFReader:
     """
     Read and parse GGUF model files.
@@ -120,19 +166,26 @@ class GGUFReader:
         return f.read(length).decode('utf-8', errors='replace')
     
     def _read_value(self, f, data_type: int) -> Any:
-        """Read a value of the given GGUF type."""
+        """Read a value of the given GGUF type.
+
+        Integer-family scalars (UINT8/INT8/UINT16/INT16/UINT32/INT32/
+        UINT64/INT64) come back tagged with their exact on-disk type via
+        ``GGUFTypedInt``, and ARRAY values via ``GGUFTypedArray`` -- see
+        those classes' docstrings for why. Both subclass the plain Python
+        type they'd otherwise be, so this is purely additive.
+        """
         if data_type == 0:  # UINT8
-            return struct.unpack('<B', f.read(1))[0]
+            return GGUFTypedInt(struct.unpack('<B', f.read(1))[0], data_type)
         elif data_type == 1:  # INT8
-            return struct.unpack('<b', f.read(1))[0]
+            return GGUFTypedInt(struct.unpack('<b', f.read(1))[0], data_type)
         elif data_type == 2:  # UINT16
-            return struct.unpack('<H', f.read(2))[0]
+            return GGUFTypedInt(struct.unpack('<H', f.read(2))[0], data_type)
         elif data_type == 3:  # INT16
-            return struct.unpack('<h', f.read(2))[0]
+            return GGUFTypedInt(struct.unpack('<h', f.read(2))[0], data_type)
         elif data_type == 4:  # UINT32
-            return struct.unpack('<I', f.read(4))[0]
+            return GGUFTypedInt(struct.unpack('<I', f.read(4))[0], data_type)
         elif data_type == 5:  # INT32
-            return struct.unpack('<i', f.read(4))[0]
+            return GGUFTypedInt(struct.unpack('<i', f.read(4))[0], data_type)
         elif data_type == 6:  # FLOAT32
             return struct.unpack('<f', f.read(4))[0]
         elif data_type == 7:  # BOOL
@@ -142,11 +195,12 @@ class GGUFReader:
         elif data_type == 9:  # ARRAY
             elem_type = struct.unpack('<I', f.read(4))[0]
             length = struct.unpack('<Q', f.read(8))[0]
-            return [self._read_value(f, elem_type) for _ in range(length)]
+            items = [self._read_value(f, elem_type) for _ in range(length)]
+            return GGUFTypedArray(items, elem_type)
         elif data_type == 10:  # UINT64
-            return struct.unpack('<Q', f.read(8))[0]
+            return GGUFTypedInt(struct.unpack('<Q', f.read(8))[0], data_type)
         elif data_type == 11:  # INT64
-            return struct.unpack('<q', f.read(8))[0]
+            return GGUFTypedInt(struct.unpack('<q', f.read(8))[0], data_type)
         elif data_type == 12:  # FLOAT64
             return struct.unpack('<d', f.read(8))[0]
         else:
