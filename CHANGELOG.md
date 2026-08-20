@@ -44,6 +44,99 @@
   `ruff check --select F` clean. Confirmed the new tests fail against the
   pre-fix code (`tokenizer.ggml.token_type` comes back UINT32, not INT32).
 
+### Fixed (2026-08-19 — issue #5 PR review fixes, F1/F2/F3/F5/F6)
+
+- **F1 (MEDIUM): the checkpoint-resume gate's `imatrix_id` backward-compat
+  default was asymmetric and discarded on-disk evidence.** A checkpoint
+  missing `imatrix_id` (pre-fix shape) defaulted to `{"active": False}`
+  unconditionally, even though `_write_measured_checkpoint` has recorded a
+  top-level `imatrix.active` block since 2026-07-05 -- five-plus weeks
+  before the 2026-08-13→14 capture-breakage window. An imatrix-active
+  pre-fix checkpoint resuming into a `use_imatrix=False` run therefore
+  spuriously matched (`{"active": False}` == `{"active": False}`) and
+  silently blended imatrix-weighted candidate measurements with freshly-
+  taken unweighted ones. `_load_matching_checkpoint` now derives the
+  fallback from the checkpoint's own `imatrix.active` block: when active,
+  it injects an unconditional-mismatch sentinel (`_UNPROVABLE_IMATRIX`, the
+  checkpoint can't prove WHICH imatrix) rather than a plain default; the
+  `{"active": False}` default now applies only when the checkpoint has no
+  imatrix record at all.
+- **F2 (MEDIUM): `imatrix_identity()` did not meet its "Never raises"
+  guarantee.** `sorted(imatrix)`/`name.encode()` sat outside the guarding
+  `try`, and the coarse-sample slice raised `IndexError` (not in the caught
+  `(TypeError, ValueError)` tuple) on a 0-d array from a `None` entry.
+  Confirmed raising on `{"blk.0": None}`, non-str/bytes keys, and mutually
+  unorderable keys. The whole per-tensor body is now guarded; a single
+  malformed entry (bad value, unnameable key, `__array__`/`__repr__` that
+  raises) is skipped individually rather than aborting the fingerprint or
+  falling back to a shared "something failed" sentinel that could collide
+  two different imatrices onto the same identity. Hash output is
+  byte-for-byte unchanged for every well-formed (str-keyed, array-valued)
+  imatrix.
+- **F3 (LOW): one of the 18 tests was vacuous.**
+  `test_run_measured_search_no_imatrix_passes_none_to_prober` asserted
+  `.get("imatrix") is None`, true whether the kwarg is threaded explicitly
+  or absent entirely -- it stayed green even with `imatrix=self._imatrix`
+  deleted from the call site. Switched to the same `.get("imatrix",
+  "MISSING")` sentinel its sibling test already used; confirmed this now
+  goes red against the un-fixed call site.
+- **F5 (LOW): a relocated comment reasserted a "degrades, never aborts"
+  guarantee this branch's base (`14e9d62`) had already deliberately
+  narrowed.** `ensure_imatrix` re-raises `TypeError`/`AttributeError`/
+  `NameError`/`ImportError` (a bug in our own code is not a capture
+  failure) and `enable_imatrix` does not catch it, so that class of failure
+  DOES abort the search on master -- only an environmental capture failure
+  (missing binary, non-zero exit, timeout) still degrades silently. Both
+  the moved comment and `enable_imatrix`'s own pre-existing, similarly
+  stale docstring are corrected.
+- **F6 (LOW): `self._imatrix` had no per-run reset, unlike the KL state it
+  sits next to.** A second `run_measured_search(use_imatrix=False)` call on
+  the same orchestrator instance inherited the prior run's `self._imatrix`
+  -- pre-existing (already reached `_build_candidate`), but this PR widened
+  the blast radius to the probes and the checkpoint cache key. Added an
+  unconditional `self._imatrix = None` reset ahead of the `use_imatrix`
+  check, mirroring `self._kl_base_logits_path`'s existing per-run reset.
+- Files: `magicquant/orchestrator.py`, `magicquant/utils/measurement.py`,
+  `tests/test_measured_search_checkpoint_resume.py`,
+  `tests/test_probe_imatrix.py`. Verified: 11 new regression tests (3 for
+  F1, 7 for F2, 1 for F6) plus the strengthened F3 test; each of F1/F3/F6's
+  new/changed assertions confirmed to fail against the pre-fix code by
+  temporarily reverting the corresponding source change and re-running;
+  full suite 1242 passed / 20 skipped (up from the rebased branch's 1231 /
+  20 before this fix); `ruff check --select F` clean.
+
+### Fixed (2026-08-15 — issue #5)
+
+- **v1 sensitivity probes were built without the imatrix, while the
+  candidates and final tiers they steer were built with one.** `SensitivityProber`
+  had no `imatrix` parameter at all (`_real_probe`'s `create_hybrid_gguf` call
+  took the writer default `None`), so every measured search's per-group
+  sensitivity weights were ranked on unweighted probes even when
+  `use_imatrix=True` weighted everything downstream of them. The bias is
+  non-uniform (an imatrix helps K-quants and does nothing for MXFP4/Q8_0 by
+  ggml design), so groups were mis-ranked, not merely mis-scaled. Fixed:
+  `SensitivityProber(imatrix=...)` threads through to every real probe's
+  `create_hybrid_gguf` call, and both `run_measured_search` and
+  `run_full_search` now pass `self._imatrix`. `enable_imatrix()` is now
+  called ahead of the measured-search checkpoint-resume gate (previously
+  after) so the gate's imatrix fingerprint reflects this run's actual state.
+  Decision: a checkpoint's `sensitivity_weights` and `self._measured`
+  candidates are both built against whatever imatrix was active for that
+  run, so `_current_measurement_conditions`/`_measurement_conditions_match`
+  now include an `imatrix_id` (content hash, shared with v2's distortion-
+  table cache via `utils.measurement.imatrix_identity`) and reject a
+  resume whose imatrix identity changed — mirroring v2's cache-invalidation
+  behavior rather than leaving v1 permanently unweighted. Default (no
+  imatrix) behavior is unchanged. Verified: `tests/test_probe_imatrix.py`
+  (new) pins that the imatrix reaches `create_hybrid_gguf` from the prober,
+  that a probe built with one measures differently than one built without,
+  that both orchestrator search paths thread `self._imatrix` into the
+  prober, and that the checkpoint gate invalidates on a changed imatrix
+  identity (including backward compatibility for pre-fix checkpoints with
+  no `imatrix_id` key). Files touched: `magicquant/evolution/probing.py`,
+  `magicquant/orchestrator.py`, `magicquant/utils/measurement.py`,
+  `magicquant/v2/sensitivity.py`.
+
 ### Fixed (2026-08-14 — imatrix capture broken by the deadlock fix)
 
 - **`_run_captured(timeout=None)` raised `TypeError` before spawning, breaking

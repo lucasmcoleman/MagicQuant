@@ -29,11 +29,49 @@ from magicquant.utils.llamacpp import (
     binary_supports_arch,
     resolve_source_gguf_arch,
 )
-from magicquant.utils.measurement import measurement_eps, predictor_is_tracking
+from magicquant.utils.measurement import (
+    imatrix_identity,
+    measurement_eps,
+    predictor_is_tracking,
+)
 from magicquant.logging import get_logger
 from magicquant.quant.schemes import get_scheme_by_name
 
 log = get_logger(__name__)
+
+
+class _UnprovableImatrix:
+    """Sentinel injected into a checkpoint's ``imatrix_id`` when the
+    checkpoint predates that key but its top-level ``imatrix.active`` block
+    (written since 2026-07-05) says imatrix WAS active for its candidates
+    (PR6 review F1).
+
+    Such a checkpoint proves its candidates were imatrix-weighted but not
+    WHICH imatrix -- no hash was captured yet -- so it must never compare
+    equal to any current ``imatrix_id``, active or inactive. Without this,
+    ``_measurement_conditions_match``'s missing-key default of
+    ``{"active": False}`` reads a genuinely imatrix-active checkpoint as
+    inactive, and a resume with imatrix OFF would silently match, blending
+    imatrix-weighted candidate measurements into a run of freshly-taken
+    unweighted ones -- exactly the defect issue #5 exists to close,
+    surviving inside its own backward-compat path. ``__eq__`` always
+    returning False (rather than, say, an unhashable/unrepresentable stored
+    value) forces an unconditional mismatch through the ordinary
+    ``!=`` comparison in ``_measurement_conditions_match`` with no special
+    casing needed there.
+    """
+
+    def __eq__(self, other):
+        return False
+
+    def __ne__(self, other):
+        return True
+
+    def __repr__(self):
+        return "<imatrix-active, pre-fix, unprovable>"
+
+
+_UNPROVABLE_IMATRIX = _UnprovableImatrix()
 
 
 class MagicQuantOrchestrator:
@@ -392,8 +430,17 @@ class MagicQuantOrchestrator:
         quantization unweighted, same as never calling this at all.
 
         Returns True if an imatrix is now active, False otherwise (source
-        isn't GGUF, or capture/load failed -- logged as a warning, never
-        raised: this must never block the pipeline).
+        isn't GGUF, or capture/load failed for an ENVIRONMENTAL reason --
+        missing binary, non-zero exit, timeout -- logged as a warning, not
+        raised). PR6 review F5: this docstring predates 14e9d62 (already on
+        this branch's base), which narrowed ``ensure_imatrix``'s own
+        guarantee -- a programming-error exception
+        (``TypeError``/``AttributeError``/``NameError``/``ImportError``)
+        now propagates out of ``ensure_imatrix``, and this method does not
+        catch it (the call below is bare), so that class of failure DOES
+        raise out of ``enable_imatrix`` and abort the pipeline. Only an
+        environmental capture failure degrades silently, never a bug in our
+        own code.
         """
         from magicquant.imatrix import ensure_imatrix, resolve_imatrix_bin
 
@@ -737,7 +784,9 @@ class MagicQuantOrchestrator:
                 .json`` from a prior (possibly killed) run of this exact
                 search -- same seed, same source-model identity (path +
                 size + mtime), same measurement conditions (chunks/ctx_size
-                /corpus). If it matches, restore the baseline PPL,
+                /corpus/KL objective/imatrix identity -- see
+                ``_current_measurement_conditions``). If it matches, restore
+                the baseline PPL,
                 sensitivity weights, and every already-recorded measurement
                 (skipping their rebuild via the existing config_key check)
                 instead of re-running baseline measurement and probing from
@@ -834,6 +883,47 @@ class MagicQuantOrchestrator:
                 ),
             )
 
+        # ── Optional imatrix capture -- deliberately BEFORE the checkpoint
+        # resume gate below, not after: ``_current_measurement_conditions``
+        # (issue #5) fingerprints ``self._imatrix`` to decide whether a
+        # checkpoint's sensitivity weights + measured candidates were built
+        # under the SAME calibration state this run wants. Capturing it
+        # first means that fingerprint reflects this run's real imatrix
+        # state at gate-check time instead of always reading "inactive"
+        # (self._imatrix's __init__ default) regardless of ``use_imatrix``.
+        # Best-effort for an ENVIRONMENTAL capture failure (missing binary,
+        # non-zero exit, timeout) -- degrades to the historical unweighted-
+        # quant behavior rather than aborting a real measured search over a
+        # secondary quality signal. PR6 review F5: this comment moved here
+        # unchanged from the old call site, but 14e9d62 (already on this
+        # branch's base) deliberately NARROWED that guarantee -- a
+        # programming-error exception out of ``ensure_imatrix``
+        # (``TypeError``/``AttributeError``/``NameError``/``ImportError``,
+        # "a bug in our own code is not a capture failure") now re-raises,
+        # and ``enable_imatrix`` below does not catch it, so that class of
+        # failure DOES abort the search on master. Only the environmental
+        # kind still degrades silently.
+        #
+        # PR6 review F6: reset per run, mirroring self._kl_base_logits_path's
+        # own per-run reset below (same rationale). Without this, a second
+        # run_measured_search() call on the same orchestrator instance with
+        # use_imatrix=False would inherit self._imatrix from a PRIOR run on
+        # this instance -- enable_imatrix only ever SETS self._imatrix,
+        # nothing here previously cleared it back to None when use_imatrix
+        # is False. That stale imatrix would then silently reach this run's
+        # probes and its checkpoint-resume cache key
+        # (_current_measurement_conditions), both newly imatrix-aware as of
+        # issue #5 -- widening the blast radius beyond the pre-existing
+        # _build_candidate exposure this already had.
+        self._imatrix = None
+        if use_imatrix:
+            # enable_imatrix -> ensure_imatrix already caches capture to disk
+            # and reuses it on a hit, so calling this ahead of resume is
+            # cheap when the cache survived and correctly recomputes when it
+            # didn't -- no separate resume bookkeeping needed for imatrix
+            # capture itself.
+            self.enable_imatrix(imatrix_corpus)
+
         # ── Resume: look for a checkpoint from a prior (possibly killed) run
         # of this exact search before doing any real measurement work ──
         checkpoint_path = self._measured_checkpoint_path()
@@ -882,19 +972,12 @@ class MagicQuantOrchestrator:
                     measured=len(self._measured),
                 )
 
-        # ── Step 1b: optional imatrix + KL base logits (fuses in the ──
-        # ── baseline measurement on a fresh run, see above) ──
-        # Both are best-effort: a failure here degrades to the historical
-        # behavior (unweighted quant / raw-PPL probe scoring / no KL
-        # objective blend) rather than aborting a real measured search over
-        # a secondary quality signal.
-        if use_imatrix:
-            # enable_imatrix -> ensure_imatrix already caches capture to disk
-            # and reuses it on a hit, so re-calling this on resume is cheap
-            # when the cache survived and correctly recomputes when it didn't
-            # -- no separate resume bookkeeping needed for imatrix itself.
-            self.enable_imatrix(imatrix_corpus)
-
+        # ── Step 1b: optional KL base logits (fuses in the baseline ──
+        # ── measurement on a fresh run, see above). Imatrix capture already
+        # ── happened earlier, ahead of the checkpoint resume gate. ──
+        # Best-effort: a failure here degrades to the historical raw-PPL
+        # probe scoring / no KL objective blend rather than aborting a real
+        # measured search over a secondary quality signal.
         # Base-logits capture is attempted whenever EITHER knob wants it --
         # probe_kl (Step 2's per-group sensitivity probes, on by default) or
         # enable_kl (the candidate objective blend, off by default). They
@@ -1075,6 +1158,11 @@ class MagicQuantOrchestrator:
                 # keeps the heuristic fallback — there it's the documented
                 # design, not a degradation. See probing.ProbeMeasurementError.
                 strict=True,
+                # Probes must be measured under the SAME calibration state
+                # as the candidates and final tiers they steer (issue #5) --
+                # self._imatrix is already active by this point (captured
+                # ahead of the checkpoint-resume gate, above).
+                imatrix=self._imatrix,
             )
             prober.probe_all_groups(groups=groups, aggressive_scheme="Q4_K_M", verbose=verbose)
             self.sensitivity_weights = prober.get_normalized_weights()
@@ -2730,6 +2818,9 @@ class MagicQuantOrchestrator:
             baseline_perplexity=self.baseline_ppl,
             perplexity_calculator=_llama,
             output_dir=str(self.output_dir / "_probes"),
+            # Same calibration state as generate_hybrid_model's final tiers
+            # (issue #5) -- enable_imatrix, above, already set self._imatrix.
+            imatrix=self._imatrix,
         )
         groups = self._detect_search_groups()
 
@@ -3107,13 +3198,11 @@ class MagicQuantOrchestrator:
     def _current_measurement_conditions(self) -> Dict[str, Any]:
         """The subset of measurement conditions that must match between a
         checkpoint and the run attempting to resume it: the chunk cap, ctx
-        size, calibration corpus, and whether/how KL blends into the
-        candidate OBJECTIVE (``enable_kl``/``kl_weight`` -- NOT ``probe_kl``,
-        which only affects Step 2 sensitivity-probe scoring, a RESULT of a
-        run rather than an input the resumed run's candidate ranking depends
-        on). (Fuller run metadata -- imatrix/KL state, probing provenance --
-        is recorded in the checkpoint too, but those are also RESULTS of a
-        run, not inputs to compare for eligibility.)
+        size, calibration corpus, whether/how KL blends into the candidate
+        OBJECTIVE (``enable_kl``/``kl_weight`` -- NOT ``probe_kl``, which only
+        affects Step 2 sensitivity-probe scoring, a RESULT of a run rather
+        than an input the resumed run's candidate ranking depends on), and
+        the active imatrix's identity (``imatrix_id``).
 
         BLOCKER fix (F2): without ``enable_kl``/``kl_weight`` here, a
         checkpoint recorded under a PPL-only objective (``enable_kl=False``)
@@ -3125,6 +3214,20 @@ class MagicQuantOrchestrator:
         KL-blended. See ``_measurement_conditions_match`` for the
         backward-compatible comparison this enables (a checkpoint written
         before this fix simply lacks these two keys).
+
+        ``imatrix_id`` (issue #5): both ``self.sensitivity_weights`` (probes)
+        and every entry in ``self._measured`` (candidates, via
+        ``_build_candidate``'s ``imatrix=self._imatrix``) are built against
+        whatever imatrix was active when the checkpointed run produced them.
+        A resume with a DIFFERENT imatrix identity -- capture off vs on, or a
+        different corpus/model producing a different capture -- must not
+        reuse either: it would silently rank this run's candidates on
+        weights and measurements taken under a calibration state that no
+        longer matches what ``generate_hybrid_model`` will use for the final
+        tiers. This mirrors v2's distortion-table cache, which already keys
+        on imatrix identity (``v2/sensitivity.py``'s ``_imatrix_identity`` /
+        ``_cache_key``) -- v1's checkpoint gate now invalidates the same way,
+        via the same hash (``utils.measurement.imatrix_identity``).
         """
         llama = getattr(self, "_llama_tools", None)
         return {
@@ -3133,6 +3236,7 @@ class MagicQuantOrchestrator:
             "corpus": self._safe_resolve_corpus(),
             "enable_kl": bool(getattr(self, "_enable_kl", False)),
             "kl_weight": getattr(self, "_kl_weight", 0.0),
+            "imatrix_id": imatrix_identity(self._imatrix),
         }
 
     @staticmethod
@@ -3163,6 +3267,30 @@ class MagicQuantOrchestrator:
         ``run_measured_search`` forces ``self._kl_weight = 0.0`` whenever
         ``enable_kl`` is False), so it must not force an unnecessary
         re-measurement.
+
+        ``imatrix_id`` (issue #5) is compared with a MISSING stored key
+        treated as ``{"active": False}`` by default -- a checkpoint written
+        before this key existed, whose own top-level ``imatrix`` block (see
+        ``_write_measured_checkpoint``, recorded since 2026-07-05) also says
+        no imatrix was active, was genuinely produced with unweighted
+        probes, so "key absent" correctly reads as "probes were unweighted"
+        there, exactly like the ``enable_kl`` backward-compat default above.
+
+        PR6 review F1: that default is asymmetric and wrong for a
+        checkpoint whose ``imatrix.active`` block says imatrix WAS active --
+        such a checkpoint predates this fix and cannot prove WHICH imatrix
+        its probes vs. candidates were each built under, so it must not be
+        treated as "inactive" (which would silently MATCH a current
+        imatrix-off run and blend imatrix-weighted measurements with fresh
+        unweighted ones) or partially trusted either way. This method only
+        ever sees a plain ``{"active": False}`` fallback for that case
+        because it cannot see the checkpoint's ``imatrix`` block at all (it
+        is a ``@staticmethod`` receiving only the two condition dicts) --
+        the caller, ``_load_matching_checkpoint``, is responsible for
+        injecting ``_UNPROVABLE_IMATRIX`` (a sentinel that never compares
+        equal to anything) as ``stored["imatrix_id"]`` before calling this
+        method whenever that asymmetric case applies, which forces an
+        unconditional mismatch through the ordinary comparison below.
         """
         for key in ("chunks", "ctx_size", "corpus"):
             if stored.get(key) != current.get(key):
@@ -3176,6 +3304,11 @@ class MagicQuantOrchestrator:
         if current_enable_kl and stored.get("kl_weight", 0.0) != current.get(
             "kl_weight", 0.0
         ):
+            return False
+
+        stored_imatrix_id = stored.get("imatrix_id", {"active": False})
+        current_imatrix_id = current.get("imatrix_id", {"active": False})
+        if stored_imatrix_id != current_imatrix_id:
             return False
 
         return True
@@ -3210,6 +3343,24 @@ class MagicQuantOrchestrator:
             reasons.append("source model identity changed")
         current_conditions = self._current_measurement_conditions()
         stored_conditions = checkpoint.get("measurement_conditions") or {}
+        # PR6 review F1: a checkpoint written before "imatrix_id" existed in
+        # measurement_conditions has no such key here, but
+        # _write_measured_checkpoint has independently recorded a top-level
+        # "imatrix" block (active/n_tensors) since 2026-07-05 -- i.e. before
+        # the "imatrix_id" key existed at all. When that block says imatrix
+        # WAS active, the missing key must NOT fall back to the plain
+        # {"active": False} default inside _measurement_conditions_match --
+        # that default is only correct for a checkpoint with no imatrix
+        # record whatsoever. Inject an unconditional-mismatch sentinel
+        # instead, so an imatrix-active pre-fix checkpoint is rejected
+        # rather than silently resumed into a use_imatrix=False run (the
+        # gap _measurement_conditions_match's own docstring/tests cannot
+        # close, since it never sees this checkpoint's "imatrix" block).
+        if "imatrix_id" not in stored_conditions and (checkpoint.get("imatrix") or {}).get(
+            "active"
+        ):
+            stored_conditions = dict(stored_conditions)
+            stored_conditions["imatrix_id"] = _UNPROVABLE_IMATRIX
         if not self._measurement_conditions_match(stored_conditions, current_conditions):
             reasons.append("measurement conditions changed")
 
