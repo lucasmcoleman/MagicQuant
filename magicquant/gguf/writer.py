@@ -92,6 +92,25 @@ _GGUF_TYPE_FLOAT64 = int(_GGUFValueType.FLOAT64)
 # (gguf.constants.GGUF_DEFAULT_ALIGNMENT) rather than a hand-typed literal.
 ALIGNMENT = _gguf_constants.GGUF_DEFAULT_ALIGNMENT
 
+# struct.pack format code for each GGUF integer scalar/array element type.
+# Used by _write_metadata_value to round-trip a KV value at its EXACT
+# recorded source type (magicquant.gguf.reader.GGUFTypedInt/GGUFTypedArray's
+# ``.gguf_type``) instead of re-deriving a type from the Python value's
+# magnitude alone -- see that function's docstring for the incident this
+# closes (tokenizer.ggml.token_type: source INT32, values 0-6, magnitude
+# inference always prefers UINT32 for non-negative arrays -- HF discussion
+# lmcoleman/Qwen3.8-27B-MagicQuant-GGUF#1).
+_INT_STRUCT_FMT: Dict[int, str] = {
+    _GGUF_TYPE_UINT8:  "B",
+    _GGUF_TYPE_INT8:   "b",
+    _GGUF_TYPE_UINT16: "H",
+    _GGUF_TYPE_INT16:  "h",
+    _GGUF_TYPE_UINT32: "I",
+    _GGUF_TYPE_INT32:  "i",
+    _GGUF_TYPE_UINT64: "Q",
+    _GGUF_TYPE_INT64:  "q",
+}
+
 # Map MagicQuant scheme names to the ggml_type name we write into the file.
 # Built from the canonical scheme registry; F16/F32 added as passthrough
 # entries for source tensors that bypass quantization.
@@ -189,9 +208,24 @@ def _write_metadata_value(f, value: Any):
     elif isinstance(value, np.generic):
         value = value.item()
 
+    # A value read by magicquant.gguf.reader.GGUFReader (GGUFTypedInt /
+    # GGUFTypedArray) carries the EXACT on-disk GGUF type it was parsed
+    # as. When present, that recorded type is authoritative and used
+    # verbatim below -- a copied KV must round-trip at its source element
+    # type, never get re-derived from the Python value's magnitude (which
+    # cannot tell a signed array of small non-negative values apart from an
+    # unsigned one; see _INT_STRUCT_FMT's docstring). Values with no such
+    # tag (freshly constructed by MagicQuant itself, e.g. plain lists in
+    # tests) fall through to the historical magnitude/Python-type
+    # inference unchanged.
+    src_type = getattr(value, "gguf_type", None)
+
     if isinstance(value, bool):
         f.write(struct.pack("<I", _GGUF_TYPE_BOOL))
         f.write(struct.pack("<?", value))
+    elif src_type in _INT_STRUCT_FMT and isinstance(value, int):
+        f.write(struct.pack("<I", src_type))
+        f.write(struct.pack("<" + _INT_STRUCT_FMT[src_type], int(value)))
     elif isinstance(value, int):
         if value < 0:
             f.write(struct.pack("<I", _GGUF_TYPE_INT64))
@@ -211,9 +245,47 @@ def _write_metadata_value(f, value: Any):
     elif isinstance(value, (list, tuple)):
         f.write(struct.pack("<I", _GGUF_TYPE_ARRAY))
         if not value:
-            f.write(struct.pack("<I", _GGUF_TYPE_UINT32))
+            # Preserve the recorded element type for an empty array too
+            # (e.g. an empty FLOAT32 array must not come back tagged
+            # UINT32); only fall back to UINT32 when no type was recorded.
+            f.write(struct.pack(
+                "<I", src_type if src_type is not None else _GGUF_TYPE_UINT32,
+            ))
             f.write(struct.pack("<Q", 0))
+        elif src_type in _INT_STRUCT_FMT:
+            fmt = _INT_STRUCT_FMT[src_type]
+            ints = [
+                int(item.item()) if isinstance(item, np.generic) else int(item)
+                for item in value
+            ]
+            f.write(struct.pack("<I", src_type))
+            f.write(struct.pack("<Q", len(ints)))
+            for item in ints:
+                f.write(struct.pack("<" + fmt, item))
+        elif src_type == _GGUF_TYPE_FLOAT64:
+            f.write(struct.pack("<I", _GGUF_TYPE_FLOAT64))
+            f.write(struct.pack("<Q", len(value)))
+            for item in value:
+                f.write(struct.pack("<d", float(item)))
+        elif src_type == _GGUF_TYPE_FLOAT32:
+            f.write(struct.pack("<I", _GGUF_TYPE_FLOAT32))
+            f.write(struct.pack("<Q", len(value)))
+            for item in value:
+                f.write(struct.pack("<f", float(item)))
+        elif src_type == _GGUF_TYPE_BOOL:
+            f.write(struct.pack("<I", _GGUF_TYPE_BOOL))
+            f.write(struct.pack("<Q", len(value)))
+            for item in value:
+                f.write(struct.pack("<?", bool(item)))
+        elif src_type == _GGUF_TYPE_STRING:
+            f.write(struct.pack("<I", _GGUF_TYPE_STRING))
+            f.write(struct.pack("<Q", len(value)))
+            for item in value:
+                _write_string(f, str(item))
         else:
+            # No recorded source type -- historical magnitude/Python-type
+            # inference (untyped list/tuple, e.g. constructed directly by
+            # MagicQuant or a test fixture).
             # Normalize numpy scalars in the list so type detection works.
             norm = [
                 v.item() if isinstance(v, (np.generic,)) else v
@@ -1487,10 +1559,13 @@ class GGUFWriter:
         """
         self.metadata = {}
         for k, v in source_metadata.items():
-            # split.* excluded: see _SPLIT_KV_KEYS. (Source KVs generally
-            # lose their on-disk GGUF type here, not just these three keys --
-            # a broader fix would need GGUFReader to retain per-key types;
-            # out of scope for this change.)
+            # split.* excluded regardless of type: see _SPLIT_KV_KEYS --
+            # per llama.cpp's gguf-split convention these keys don't belong
+            # in a single-file artifact at all, independent of whether their
+            # type round-trips. (GGUFReader now DOES retain each KV's
+            # on-disk GGUF type -- GGUFTypedInt/GGUFTypedArray -- and
+            # _write_metadata_value uses it, so every other copied key
+            # round-trips at its source element type.)
             if k in _SPLIT_KV_KEYS:
                 continue
             self.metadata[k] = v
