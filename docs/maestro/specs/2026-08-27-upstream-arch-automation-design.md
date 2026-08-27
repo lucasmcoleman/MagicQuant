@@ -107,25 +107,51 @@ the bot PR, before any merge decision:
    confirms the writer doesn't crash and every tensor round-trips to a valid GGUF.
    This catches name-mapping and shape mistakes; it cannot catch value-transform
    correctness (by design — see Non-goal above).
-3. **Inference smoke check** — *only if* llama.cpp already supports the arch
-   (checked the same way `binary_supports_arch` already does, against this box's
-   current `ghcr.io/ggml-org/llama.cpp:server-rocm` image). Loads the fixture GGUF
-   and runs one KL-probe chunk, reusing `probing.py`'s existing broken-probe
-   detection (NaN, or PPL equal to vocab size — the exact signature of the past
-   qwen3_5 uniform-logits incident) as pass/fail.
-4. **Decision**: auto-merge the bot PR only if steps 1–2 pass AND (step 3 passed
-   OR step 3 was skippable-but-not-required — see below). Otherwise leave the PR
-   open, apply a `needs-human` label, and stop.
+3. **Inference smoke check** — *only if* llama.cpp already supports the arch.
+   `binary_supports_arch` (`utils/llamacpp.py`) byte-scans a local binary/library
+   path; it has no notion of a Docker image reference, so this needs a small new
+   adapter, not a direct reuse: extract the binary/`libllama` out of the pulled
+   `ghcr.io/ggml-org/llama.cpp:server-rocm` image (e.g. `docker create` + `docker
+   cp`, or `docker run --entrypoint cat`) into a local file, then run the existing
+   byte-scan against that extracted file.
+
+   If supported, load the fixture GGUF and run one plain-PPL chunk (not KL — see
+   below) against it. Detection logic is **new, not a reuse of
+   `probing.py`'s existing broken-probe check**: that check (NaN, or PPL over
+   `BROKEN_PROBE_RATIO` × baseline) only fires in `probing.py`'s plain-PPL path,
+   gated on `not self.kl_base_logits_path`, and it compares against a
+   `baseline_ppl` from a previously-measured real reference build — there is no
+   such baseline for a freshly-synthesized, random-filled, shape-shrunk fixture
+   that corresponds to no real checkpoint. Instead: within the same gate run,
+   also build a trivial full-precision (F16-passthrough, no quantization) GGUF
+   from the *same* fixture, measure its PPL as a fresh self-baseline, then apply
+   the same NaN / PPL-blowup-ratio logic against that self-baseline rather than
+   a stored historical one.
+4. **Decision**: auto-merge the bot PR only if steps 1–3 all actually ran and
+   passed. There is no branch where step 3 being skipped or unavailable still
+   permits auto-merge — "structurally valid" (steps 1–2) is necessary but not
+   sufficient, since it cannot catch the value-transform errors that caused the
+   qwen3_5 incident, which is exactly what step 3 exists to catch. If llama.cpp
+   doesn't support the arch yet (step 3 can't run) or any step fails, leave the
+   PR open, apply a `needs-human` label, and stop. In this branch — the
+   assignment/mention that notifies Lucas (Component 4) is applied here, at the
+   point the `needs-human` label is set, and also when a merge-by-bot succeeds.
 
 Step 3 needs this box's ROCm hardware and Docker image — GitHub-hosted runners
 have neither. **This requires registering a self-hosted GitHub Actions runner on
 this machine**, scoped to the `MagicQuant` repo and this job only. New operational
 setup, not currently present (confirmed: every existing workflow runs on
-`ubuntu-latest`). Until that runner exists, step 3 is skipped and treated as
-"not required for merge" — meaning early auto-merges will be gated on steps 1–2
-only. Recommend standing up the runner before relying on auto-merge for anything
-where wrong values would be expensive to discover late (i.e., always prefer the
-runner exists before trusting an auto-merge).
+`ubuntu-latest`).
+
+Until that runner exists, step 3 cannot run at all — and auto-merge does **not**
+proceed on steps 1–2 alone. Structural round-trip passing is necessary but not
+sufficient: it catches name/shape mistakes, not the value-transform correctness
+that produced the qwen3_5 incident, so treating "structurally valid" as "safe to
+merge unattended" would reintroduce exactly that failure class. Without the
+runner, every drift lands in the existing human-merge path — auto-merge is
+effectively inert until the runner is registered. This is a prerequisite, not a
+nice-to-have; the implementation plan should stand up the runner before or
+alongside the gate itself, not after.
 
 For qwen4_exp specifically: step 2 will very likely fail or produce a structurally
 valid-but-wrong GGUF, because the hyper-connections/n-gram-embedding/sparse-attention
@@ -160,6 +186,23 @@ Two channels, since neither alone is both durable and truly push:
   the synthetic fixture (Component 3, step 2) is deliberately shape-only.
 - Retiring the existing weekly package-based sweep — it stays as the fallback
   detection path for architectures nobody thought to track ahead of time.
+
+## Suggested implementation phasing
+
+Components differ enough in kind (Python tooling vs. GH Actions vs. local
+systems/infra vs. an out-of-repo scheduled routine) that they should be planned as
+separate phases rather than one flat task list:
+
+1. Tracked-PR registry + `check_tracked_prs.py` + `upstream-pr-watch.yml`
+   (Components 1–2) — self-contained, no dependency on the rest.
+2. Self-hosted runner registration (part of Component 3) — infra prerequisite;
+   do this before or alongside the gate logic, never after.
+3. `gen_arch_fixture.py` + `validate_arch_sync.py` + the gate wiring into
+   `upstream-sync-pr.yml` (Component 3) — depends on the runner existing for its
+   inference-smoke-check path to ever actually run.
+4. GitHub-native assignment/mention wiring + the cloud-scheduled push-notification
+   routine (Component 4) — depends on 1–3 existing to have anything to notify
+   about.
 
 ## Open items for spec review
 
