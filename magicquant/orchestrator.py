@@ -514,7 +514,7 @@ class MagicQuantOrchestrator:
         verdict = binary_supports_arch(perplexity_tool, arch)
         if verdict is False:
             raise LlamaBinaryArchError(
-                f"The resolved llama.cpp binary ({perplexity_tool!r}) does "
+                f"The resolved llama.cpp binary ('{perplexity_tool}') does "
                 f"not contain the GGUF architecture literal {arch!r} -- it "
                 "cannot load this model. This is a PRE-MEASUREMENT check "
                 "(runs before any llama-perplexity subprocess); catching "

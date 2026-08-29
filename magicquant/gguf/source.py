@@ -13,9 +13,17 @@ import logging
 import math
 import os
 import re
+import threading
 import numpy as np
 
 from magicquant.quant import ggml_facts
+
+# Capability detection, not platform sniffing: os.pread exists wherever the C
+# runtime has POSIX pread(2) (Linux, macOS, BSDs) and is absent on Windows.
+# GGUFSource._read_raw_bytes needs a position-independent read that is safe
+# from N threads on one shared handle; where pread is missing it falls back
+# to a lock-serialized lseek+read (see that method's docstring).
+_HAS_PREAD = hasattr(os, "pread")
 
 _log = logging.getLogger(__name__)
 
@@ -153,6 +161,11 @@ class ModelSource(ABC):
 class GGUFSource(ModelSource):
     """Read tensors from a GGUF file."""
 
+    # Class-level default so instances built without __init__ (tests use
+    # __new__) still have a lock on the pread-less fallback path; __init__
+    # replaces it with a per-instance lock.
+    _read_lock = threading.Lock()
+
     # ggml_type id -> name. Derived from magicquant.quant.ggml_facts (stock
     # ids/names come from the installed `gguf` package — see that module's
     # docstring). Deliberately excludes the ROCmFPX fork ids (100-104):
@@ -176,6 +189,9 @@ class GGUFSource(ModelSource):
         # so a per-tensor open/seek/close (thousands of syscalls on a big MoE)
         # is wasteful. Opened lazily, closed in close().
         self._fh = None
+        # Serializes the lseek+read fallback in _read_raw_bytes on platforms
+        # without os.pread. Per-instance so two sources never contend.
+        self._read_lock = threading.Lock()
         # None -> take the environment default. See _ALLOW_DEQUANT_ENV.
         self._allow_dequant = (
             _allow_dequant_default() if allow_dequant is None else bool(allow_dequant)
@@ -258,14 +274,36 @@ class GGUFSource(ModelSource):
         file position. A single pread syscall returns at most ~2 GiB on
         Linux, so gather in a loop -- a 27B model's token_embd (2.4 GiB
         BF16) exceeds the cap and came back short in one call.
+
+        Windows has no os.pread (the CRT lacks POSIX pread(2); the native
+        ReadFile+OVERLAPPED positional read is not wrapped by the stdlib).
+        There the fallback is lseek+read under a per-source lock -- the
+        lock is what makes the two-syscall pair atomic across the pool's
+        threads. The serialization costs nothing in practice: Windows
+        already serializes I/O on a synchronously-opened handle, and the
+        pool's reads overlap with CPU-bound encoding. os.read on Windows
+        clamps a single call to INT_MAX bytes, which the same short-read
+        loop absorbs.
         """
         if self._fh is None:
-            self._fh = open(self._path, "rb")
+            # Double-checked: the pool's first reads arrive concurrently, and
+            # an unguarded lazy open lets N threads each open a handle -- the
+            # losers' handles are garbage-collected (closed) while another
+            # thread is mid-read on that fd -> EBADF. Surfaced by the
+            # fallback's thread-safety test; latent on every platform.
+            with self._read_lock:
+                if self._fh is None:
+                    self._fh = open(self._path, "rb")
         fd = self._fh.fileno()
         remaining = byte_len
         chunks = []
         while remaining > 0:
-            chunk = os.pread(fd, remaining, pos)
+            if _HAS_PREAD:
+                chunk = os.pread(fd, remaining, pos)
+            else:
+                with self._read_lock:
+                    os.lseek(fd, pos, os.SEEK_SET)
+                    chunk = os.read(fd, remaining)
             if not chunk:
                 raise IOError(
                     f"unexpected EOF reading tensor {tensor_name!r}: "

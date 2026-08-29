@@ -76,34 +76,154 @@ _LOAD_CHECK_TIMEOUT = 600           # 10 minutes
 _LOAD_CHECK_BANDWIDTH = 50_000_000  # 50 MB/s -- read throughput, not compute
 
 
-def _kill_process_group(proc: "subprocess.Popen", pgid: Optional[int]) -> None:
-    """SIGKILL the process group *pgid*, then *proc* itself.
+# ---------------------------------------------------------------------------
+# Process-group isolation for measurement subprocesses
+#
+# The stall cleanup below must be able to kill everything the child spawned,
+# including a grandchild that outlived it and inherited its pipe write ends.
+#
+# POSIX: ``start_new_session=True`` makes the child lead its own session, so
+# ``os.killpg`` on that group can never reach MagicQuant's own.
+#
+# Windows has no process groups in that sense, and the obvious substitute --
+# ``taskkill /T`` -- walks the parent->child tree, which fails for the exact
+# case this exists for (child already exited, orphaned grandchild holding the
+# pipe; the tree walk finds nothing). The real equivalent is a Job Object:
+# descendants inherit job membership automatically and TerminateJobObject
+# kills every member regardless of tree state. Done via ctypes on kernel32.
+#
+# Capability-detected (hasattr), not platform-sniffed. A platform with neither
+# degrades to ``proc.kill()`` on the child alone, and says so once.
+# ---------------------------------------------------------------------------
+_HAS_POSIX_PROCESS_GROUPS = hasattr(os, "getpgid") and hasattr(os, "killpg")
+
+if not _HAS_POSIX_PROCESS_GROUPS and os.name == "nt":
+    import ctypes
+    from ctypes import wintypes as _wt
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateJobObjectW.restype = _wt.HANDLE
+    _kernel32.CreateJobObjectW.argtypes = [_wt.LPVOID, _wt.LPCWSTR]
+    _kernel32.OpenProcess.restype = _wt.HANDLE
+    _kernel32.OpenProcess.argtypes = [_wt.DWORD, _wt.BOOL, _wt.DWORD]
+    _kernel32.AssignProcessToJobObject.restype = _wt.BOOL
+    _kernel32.AssignProcessToJobObject.argtypes = [_wt.HANDLE, _wt.HANDLE]
+    _kernel32.TerminateJobObject.restype = _wt.BOOL
+    _kernel32.TerminateJobObject.argtypes = [_wt.HANDLE, _wt.UINT]
+    _kernel32.CloseHandle.restype = _wt.BOOL
+    _kernel32.CloseHandle.argtypes = [_wt.HANDLE]
+    # AssignProcessToJobObject needs PROCESS_SET_QUOTA | PROCESS_TERMINATE.
+    _PROCESS_SET_QUOTA_AND_TERMINATE = 0x0100 | 0x0001
+else:
+    _kernel32 = None
+
+_warned_no_group_isolation = False
+
+
+def _popen_isolation_kwargs() -> dict:
+    """Extra ``Popen`` kwargs that put the child in its own POSIX session.
+
+    Nothing on Windows: isolation there comes from the Job Object attached
+    right after the spawn (``_capture_process_group``), not from a spawn flag.
+    """
+    return {"start_new_session": True} if _HAS_POSIX_PROCESS_GROUPS else {}
+
+
+def _capture_process_group(proc: "subprocess.Popen"):
+    """Return the opaque token ``_kill_process_group`` needs, captured NOW.
+
+    POSIX: the pgid. It MUST be read right after the spawn, while the leader
+    is certainly alive -- by the time a stall is detected the child is
+    typically already reaped and ``os.getpgid(proc.pid)`` raises
+    ``ProcessLookupError``, silently skipping the kill and leaving exactly the
+    grandchild we came to remove. (Caught by
+    tests/test_measurement_pipe_stall.py, which failed only on the NEXT run
+    because the surviving grandchild wrote its marker 30s later.)
+
+    Windows: a Job Object handle with the child assigned. Children the child
+    spawns from here on inherit membership. A grandchild spawned in the
+    microseconds between CreateProcess returning and the assignment would not
+    -- acceptable: llama.cpp's tools do not fork helpers at startup, and the
+    pathology this guards against is a long-lived leaked descriptor, not a
+    startup race.
+
+    ``None`` when the platform offers neither (or the OS call failed):
+    cleanup then falls back to killing the child alone.
+    """
+    global _warned_no_group_isolation
+    if _HAS_POSIX_PROCESS_GROUPS:
+        try:
+            return os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            return None
+    if _kernel32 is not None:
+        job = _kernel32.CreateJobObjectW(None, None)
+        if job:
+            hproc = _kernel32.OpenProcess(
+                _PROCESS_SET_QUOTA_AND_TERMINATE, False, proc.pid
+            )
+            if hproc:
+                try:
+                    if _kernel32.AssignProcessToJobObject(job, hproc):
+                        return job
+                    err = ctypes.get_last_error()
+                finally:
+                    _kernel32.CloseHandle(hproc)
+            else:
+                err = ctypes.get_last_error()
+            _kernel32.CloseHandle(job)
+        else:
+            err = ctypes.get_last_error()
+        _log.warning(
+            "could not attach measurement subprocess %s to a Job Object "
+            "(WinError %s); stall cleanup will kill only the child, not "
+            "anything it spawned", proc.pid, err,
+        )
+        return None
+    if not _warned_no_group_isolation:
+        _warned_no_group_isolation = True
+        _log.warning(
+            "this platform has neither POSIX process groups nor Windows Job "
+            "Objects; measurement stall cleanup will kill only the child"
+        )
+    return None
+
+
+def _kill_process_group(proc: "subprocess.Popen", group) -> None:
+    """Kill the child's whole process group / job, then *proc* itself.
 
     The group matters: the failure this exists for is a grandchild that
     outlived the child and inherited its stdout/stderr write end. Killing
     only the child leaves that grandchild holding the pipe forever.
-    ``_run_captured`` spawns with ``start_new_session=True`` precisely so the
-    group is the child's own and this can never reach back into MagicQuant's
-    own process group.
 
-    *pgid* MUST be the value captured right after the spawn, not looked up
-    here. By the time this runs the child is typically already reaped -- that
-    is the whole premise of the abandoned-pipe path -- and
-    ``os.getpgid(proc.pid)`` then raises ``ProcessLookupError`` for the dead
-    leader, so a lookup here silently skips the kill and leaves exactly the
-    grandchild we came to remove. (Caught by
-    tests/test_measurement_pipe_stall.py, which failed only on the NEXT run
-    because the surviving grandchild wrote its marker 30s later.)
+    *group* is whatever ``_capture_process_group`` returned for this spawn --
+    a pgid on POSIX, a Job Object handle on Windows, or ``None`` (child-only
+    fallback). Never looked up here; see that function for why.
     """
-    if pgid is not None:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+    if group is not None:
+        if _HAS_POSIX_PROCESS_GROUPS:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        elif _kernel32 is not None:
+            _kernel32.TerminateJobObject(group, 1)
     try:
         proc.kill()
     except (ProcessLookupError, OSError):
         pass
+
+
+def _release_process_group(group) -> None:
+    """Drop the token on every exit path. POSIX: nothing to release.
+
+    Windows: closes the Job Object handle WITHOUT terminating its members --
+    the job is created without KILL_ON_JOB_CLOSE on purpose, for parity with
+    POSIX, where a clean child exit never signals its grandchildren. Killing
+    is ``_kill_process_group``'s job, on the stall/timeout paths only.
+    """
+    if group is not None and not _HAS_POSIX_PROCESS_GROUPS and _kernel32 is not None:
+        _kernel32.CloseHandle(group)
 
 
 def _run_captured(
@@ -157,23 +277,27 @@ def _run_captured(
     # The abandoned-pipe bound below still applies when there is no deadline;
     # that guard is about the child being gone, not about elapsed time.
     deadline = None if timeout is None else time.monotonic() + timeout
-    # start_new_session: give the child its own process group so a stall can
-    # be cleaned up wholesale (see _kill_process_group) without signalling
-    # anything of MagicQuant's own.
+    # Own session (POSIX) / own Job Object (Windows) so a stall can be cleaned
+    # up wholesale -- see the process-group seam above _kill_process_group.
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        start_new_session=True,
+        **_popen_isolation_kwargs(),
     )
-    # Captured NOW, while the leader is certainly alive. Looking it up later
-    # fails once the child is reaped -- see _kill_process_group.
+    # Captured NOW, while the leader is certainly alive -- see
+    # _capture_process_group for why a later lookup silently kills nothing.
+    group = _capture_process_group(proc)
     try:
-        pgid: Optional[int] = os.getpgid(proc.pid)
-    except (ProcessLookupError, OSError):
-        pgid = None
+        return _wait_captured(cmd, proc, group, timeout, deadline, check)
+    finally:
+        _release_process_group(group)
 
+
+def _wait_captured(cmd, proc, group, timeout, deadline, check):
+    """The poll loop of ``_run_captured``; split out so the group token is
+    released on every exit path by the caller's ``finally``."""
     child_exited_at: Optional[float] = None
     while True:
         if deadline is None:
@@ -181,7 +305,7 @@ def _run_captured(
         else:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                _kill_process_group(proc, pgid)
+                _kill_process_group(proc, group)
                 out, err = proc.communicate()
                 raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
             poll_for = min(_LIVENESS_POLL_INTERVAL, remaining)
@@ -223,7 +347,7 @@ def _run_captured(
             "unbounded time" if deadline is None else f"{int(deadline - now)}s",
             " ".join(cmd),
         )
-        _kill_process_group(proc, pgid)
+        _kill_process_group(proc, group)
         raise subprocess.TimeoutExpired(
             cmd,
             timeout,

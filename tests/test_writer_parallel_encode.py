@@ -13,6 +13,7 @@ the three invariants the pool must preserve:
   3. The byte budget (_ByteBudget) actually caps in-flight decoded+encoded
      bytes rather than just tensor count.
 """
+import os
 import threading
 import time
 from pathlib import Path
@@ -320,6 +321,7 @@ def test_resolve_encode_budget_bytes_floor_is_largest_single_tensor(monkeypatch)
     assert cap >= 10_000_000 * 4
 
 
+@pytest.mark.skipif(not hasattr(os, "pread"), reason="os.pread is POSIX-only")
 def test_gguf_source_pread_short_reads_are_gathered(tmp_path, monkeypatch):
     """os.pread returns at most ~2GiB per syscall on Linux; a 27B model's
     token_embd (2.4GiB BF16) came back short in one call, truncating the
@@ -352,6 +354,88 @@ def test_gguf_source_pread_short_reads_are_gathered(tmp_path, monkeypatch):
         return real_pread(fd, n, pos)
 
     monkeypatch.setattr(source_mod.os, "pread", capped_pread)
+    out = src.read_tensor_f32("token_embd.weight")
+    assert len(calls) > 1, "cap never engaged -- test is vacuous"
+    np.testing.assert_array_equal(out, data)
+
+
+def _raw_source_over(path, tensors):
+    """GGUFSource over a raw file with a stub reader (no header parsing).
+
+    ``tensors``: {name: (offset, n_f32_elems)}.
+    """
+    src = source_mod.GGUFSource.__new__(source_mod.GGUFSource)
+    src._path = str(path)
+    src._fh = None
+    src._data_offset = 0
+    src._reader = type("R", (), {"get_tensor_info": staticmethod(
+        lambda name: {"data_type": 0, "shape": [tensors[name][1]],
+                      "offset": tensors[name][0]}
+    )})()
+    return src
+
+
+def test_gguf_source_pread_fallback_is_thread_safe(tmp_path, monkeypatch):
+    """Where os.pread is missing (Windows), _read_raw_bytes falls back to
+    lseek+read under a lock. The whole point of pread was that N pool threads
+    share ONE handle -- an unlocked seek+read pair returns the wrong tensor
+    with the right byte count. Force the fallback on every platform and hammer
+    it from many threads; every read must come back byte-exact."""
+    n_tensors, n_elems = 16, 2048
+    blocks = [np.full(n_elems, i, dtype=np.float32).tobytes() for i in range(n_tensors)]
+    raw = tmp_path / "raw.bin"
+    raw.write_bytes(b"".join(blocks))
+    tensors = {f"t{i}": (i * n_elems * 4, n_elems) for i in range(n_tensors)}
+    src = _raw_source_over(raw, tensors)
+
+    monkeypatch.setattr(source_mod, "_HAS_PREAD", False)
+    # Poison os.pread so the fallback path is provably the one exercised.
+    if hasattr(os, "pread"):
+        monkeypatch.setattr(source_mod.os, "pread",
+                            lambda *a: pytest.fail("fallback bypassed"))
+
+    errors, start = [], threading.Barrier(8)
+
+    def worker(wid):
+        # Every failure mode lands in `errors`: a worker exception must fail
+        # the test, not surface as a PytestUnhandledThreadExceptionWarning
+        # while the assertion below passes vacuously. (The lazy-open EBADF
+        # race was found exactly this way.)
+        try:
+            start.wait()
+            for rep in range(50):
+                i = (wid * 7 + rep) % n_tensors
+                got = src.read_tensor_raw(f"t{i}")
+                if got != blocks[i]:
+                    errors.append((wid, i, "misread"))
+        except Exception as exc:  # noqa: BLE001 - re-raised via assert below
+            errors.append((wid, None, repr(exc)))
+
+    threads = [threading.Thread(target=worker, args=(w,)) for w in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert not errors, f"{len(errors)} cross-thread failures: {errors[:5]}"
+
+
+def test_gguf_source_pread_fallback_gathers_short_reads(tmp_path, monkeypatch):
+    """The fallback shares the gather loop: os.read on Windows clamps a single
+    call to INT_MAX, so a capped read must be reassembled exactly."""
+    data = np.arange(4096, dtype=np.float32)
+    raw = tmp_path / "raw.bin"
+    raw.write_bytes(data.tobytes())
+    src = _raw_source_over(raw, {"token_embd.weight": (0, 4096)})
+
+    monkeypatch.setattr(source_mod, "_HAS_PREAD", False)
+    real_read, calls = os.read, []
+
+    def capped_read(fd, n):
+        n = min(n, 1000)
+        calls.append(n)
+        return real_read(fd, n)
+
+    monkeypatch.setattr(source_mod.os, "read", capped_read)
     out = src.read_tensor_f32("token_embd.weight")
     assert len(calls) > 1, "cap never engaged -- test is vacuous"
     np.testing.assert_array_equal(out, data)

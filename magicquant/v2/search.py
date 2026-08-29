@@ -593,7 +593,7 @@ def _check_arch_support(source_model_path: str, perplexity_tool: Optional[str]) 
     verdict = binary_supports_arch(perplexity_tool, arch)
     if verdict is False:
         raise LlamaBinaryArchError(
-            f"The resolved llama.cpp binary ({perplexity_tool!r}) does not "
+            f"The resolved llama.cpp binary ('{perplexity_tool}') does not "
             f"contain the GGUF architecture literal {arch!r} -- it cannot "
             "load this model. This is a PRE-MEASUREMENT check (runs before "
             "any llama-perplexity subprocess); catching it now, at t+0, "

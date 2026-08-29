@@ -18,7 +18,7 @@ EVAL_CORPUS = Path("/server/ai/wikitext/wikitext-2-raw/wiki.test.raw")
 @pytest.fixture(scope="module")
 def corpus() -> str:
     assert DEFAULT_CORPUS_PATH.exists(), f"missing {DEFAULT_CORPUS_PATH}"
-    return DEFAULT_CORPUS_PATH.read_text()
+    return DEFAULT_CORPUS_PATH.read_text(encoding="utf-8")
 
 
 def test_corpus_large_enough_for_the_default_chunk_count(corpus):
@@ -57,7 +57,7 @@ def test_corpus_is_disjoint_from_the_perplexity_eval_corpus(corpus):
     """THE important one. Calibrating on the text a run is scored against
     makes every measured_loss optimistic, and nothing in the output would
     show it."""
-    ev = EVAL_CORPUS.read_text(errors="ignore").split()
+    ev = EVAL_CORPUS.read_text(encoding="utf-8", errors="ignore").split()
     ev_grams = {tuple(ev[i:i + 8]) for i in range(0, len(ev) - 8, 3)}
     cal = corpus.split()
     probes = [tuple(cal[i:i + 8]) for i in range(0, len(cal) - 8, 50)]

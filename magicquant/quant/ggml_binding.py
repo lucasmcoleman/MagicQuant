@@ -137,8 +137,10 @@ def _check_dir(d: Path) -> Optional[Tuple[Path, Path]]:
     if not d.is_dir():
         return None
 
-    base_names = ["libggml-base.so", "libggml-base.so.0", "libggml-base.dylib"]
-    cpu_names = ["libggml-cpu.so", "libggml-cpu.so.0", "libggml-cpu.dylib"]
+    base_names = ["libggml-base.so", "libggml-base.so.0", "libggml-base.dylib",
+                  "ggml-base.dll"]
+    cpu_names = ["libggml-cpu.so", "libggml-cpu.so.0", "libggml-cpu.dylib",
+                 "ggml-cpu.dll"]
 
     base = next((d / n for n in base_names if (d / n).exists()), None)
     cpu = next((d / n for n in cpu_names if (d / n).exists()), None)

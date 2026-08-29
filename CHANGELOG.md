@@ -2,6 +2,47 @@
 
 ## [Unreleased]
 
+### Fixed (2026-08-29 — Windows portability across the measurement and encode paths)
+
+- **Measurement subprocess cleanup could not kill orphaned grandchildren on
+  Windows.** `start_new_session=True` + `os.killpg` has no Windows equivalent
+  that covers the case the stall cleanup exists for — a child that already
+  exited leaving a grandchild holding the pipe write end. The obvious
+  substitute, `taskkill /T`, walks a parent->child tree that in exactly that
+  case is already gone. Replaced with a Job Object via ctypes/kernel32:
+  descendants inherit job membership automatically and `TerminateJobObject`
+  kills every member regardless of tree state. Capability-detected with
+  `hasattr(os, "getpgid")`, never platform-sniffed, so POSIX behaviour is
+  unchanged; a platform with neither degrades to `proc.kill()` on the child
+  alone and says so once.
+- **`GGUFSource._read_raw_bytes` assumed `os.pread`,** which Windows lacks (the
+  CRT has no POSIX `pread(2)`, and the stdlib does not wrap
+  ReadFile+OVERLAPPED). Falls back to `lseek`+`read` under a per-source lock —
+  the lock is what makes the two-syscall pair atomic across the encode pool's
+  threads. Serialization costs nothing in practice: Windows already serializes
+  I/O on a synchronously-opened handle, and the pool's reads overlap with
+  CPU-bound encoding. `os.read` clamping a single call to INT_MAX is absorbed
+  by the existing short-read loop.
+- **Latent on every platform, found while writing the above:** the unguarded
+  lazy `open()` in `_read_raw_bytes` let N pool threads each open a handle;
+  the losers' handles were garbage-collected — closing an fd while another
+  thread was mid-read on it (EBADF). Now double-checked under the same lock.
+- `ggml_binding._discover_libggml` also probes `ggml-base.dll` / `ggml-cpu.dll`.
+  `orchestrator.py` and `v2/search.py` render the resolved binary as
+  `'{path}'` rather than `{path!r}`, which mangles Windows backslashes. Test
+  fakes use `.cmd` shims (a `.sh` is not a valid executable on Windows —
+  WinError 193) and pin utf-8 where the default would be cp1252.
+- (2026-08-29; files: magicquant/utils/llamacpp.py, magicquant/gguf/source.py,
+  magicquant/quant/ggml_binding.py, magicquant/orchestrator.py,
+  magicquant/v2/search.py, tests/test_measurement_pipe_stall.py,
+  tests/test_writer_parallel_encode.py, tests/test_qat_validate.py,
+  tests/test_calib_corpus_quality.py; verified: 1208 passed/39 skipped ->
+  1211 passed/39 skipped in a torch-less venv and 1382/22 -> 1385/22 with
+  torch, i.e. +3 new tests and no regressions in either; `ruff check --select
+  F magicquant/ tools/ tests/` clean; every touched file compiles under
+  Python 3.10, the CI matrix floor. Developed and exercised on Windows;
+  the numbers above are the Linux run.)
+
 ### Fixed (2026-08-20 — metadata array signedness lost on every K-quant hybrid render)
 
 - **Every standard MagicQuant K-quant hybrid render wrote

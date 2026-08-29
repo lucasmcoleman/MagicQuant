@@ -12,9 +12,12 @@ grandchild that outlived the child pins the parent for the entire timeout.
 That timeout is now size-scaled (``_measure_timeout``), so on a 62 GB probe
 it is ~4 hours (~8 for a KL leg) rather than the old flat 2.
 
-The scenario is reproduced here exactly, and cheaply: ``sh -c '(sleep N) &
-echo ...; exit 0'`` backgrounds a grandchild that inherits stdout/stderr and
-outlives the shell -- the same shape as the production failure.
+The scenario is reproduced here exactly, and cheaply: a Python child spawns
+a Python grandchild that inherits its stdout/stderr and outlives it -- the
+same shape as the production failure. It used to be ``sh -c '(sleep N) &
+...'``, which was POSIX-only; the Python form runs everywhere, so the
+Windows Job Object cleanup path is exercised by the same tests as the POSIX
+killpg path.
 
 Note this is NOT a v2-only bug. v1 (``evolution/probing.py``,
 ``orchestrator.py``) and v2 (``v2/search.py``, ``v2/calibrate.py``) all reach
@@ -25,12 +28,74 @@ v1 was lucky rather than safe.
 import os
 import signal
 import subprocess
+import sys
 import time
 
 import pytest
 
 from magicquant.utils import llamacpp
 from magicquant.utils.llamacpp import _run_captured
+
+
+# ── portable child processes ────────────────────────────────────────────────
+#
+# Every child is ``sys.executable -c <script>`` so the tests run identically
+# on POSIX and Windows. The grandchild is handed the child's stdout/stderr
+# EXPLICITLY (stdout=sys.stdout): that is what pins the pipe write ends in the
+# grandchild on both platforms -- relying on implicit handle inheritance is
+# not portable (Windows only inherits std handles in some configurations).
+
+def _py(script: str) -> list:
+    return [sys.executable, "-c", script]
+
+
+def _grandchild_holds_pipe(pidfile=None) -> list:
+    """Child exits at once; its grandchild sleeps 30s holding the pipes.
+    Optionally records the grandchild's PID (not its own -- see the killed
+    test) to *pidfile*."""
+    record = (
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n" if pidfile else ""
+    )
+    return _py(
+        "import subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],"
+        " stdout=sys.stdout, stderr=sys.stderr)\n"
+        + record +
+        "print('working'); sys.stdout.flush(); sys.exit(0)\n"
+    )
+
+
+def _pid_alive(pid: int) -> bool:
+    """Liveness probe that is safe on Windows. NOT ``os.kill(pid, 0)`` there:
+    Windows' os.kill maps any non-CTRL signal to TerminateProcess, so the
+    POSIX "signal 0 = existence check" idiom would kill the process."""
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    SYNCHRONIZE, PROCESS_QUERY_LIMITED_INFORMATION = 0x00100000, 0x1000
+    WAIT_TIMEOUT = 0x102
+    h = k32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return False
+    try:
+        return k32.WaitForSingleObject(h, 0) == WAIT_TIMEOUT
+    finally:
+        k32.CloseHandle(h)
+
+
+def _force_kill(pid: int) -> None:
+    sig = signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, OSError):
+        pass
 
 
 @pytest.fixture
@@ -52,7 +117,7 @@ def test_child_exit_with_pipe_held_open_does_not_wait_out_the_timeout(
     started = time.monotonic()
     with pytest.raises(subprocess.TimeoutExpired):
         _run_captured(
-            ["sh", "-c", "(sleep 30) & echo working; exit 0"],
+            _grandchild_holds_pipe(),
             timeout=30,          # stands in for the multi-hour real timeout
         )
     elapsed = time.monotonic() - started
@@ -76,16 +141,12 @@ def test_the_lingering_grandchild_is_killed(fast_stall_detection, tmp_path):
     """
     pidfile = tmp_path / "grandchild.pid"
 
-    # `$!` (PID of the last background job), NOT `$$`. In POSIX sh `$$`
-    # expands to the PID of the *parent* shell even inside a subshell, so an
-    # earlier version of this test recorded the child's own PID -- already
-    # dead and reaped by the time we look -- and passed no matter what the
-    # cleanup did.
+    # The GRANDCHILD's PID (p.pid in the child script), NOT the child's own.
+    # The sh-era version of this test once recorded `$$` -- the child's PID,
+    # already dead and reaped by the time we look -- and passed no matter
+    # what the cleanup did.
     with pytest.raises(subprocess.TimeoutExpired):
-        _run_captured(
-            ["sh", "-c", f'(sleep 30) & echo $! > "{pidfile}"; echo working; exit 0'],
-            timeout=30,
-        )
+        _run_captured(_grandchild_holds_pipe(pidfile), timeout=30)
 
     assert pidfile.exists(), "grandchild never started -- test is not exercising anything"
     grandchild = int(pidfile.read_text().strip())
@@ -93,17 +154,12 @@ def test_the_lingering_grandchild_is_killed(fast_stall_detection, tmp_path):
 
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
-        try:
-            os.kill(grandchild, 0)
-        except ProcessLookupError:
+        if not _pid_alive(grandchild):
             return  # gone, as required
         time.sleep(0.05)
 
     # Still alive: clean up so the leak does not outlive the test run.
-    try:
-        os.kill(grandchild, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    _force_kill(grandchild)
     pytest.fail(
         f"grandchild {grandchild} survived the stall cleanup -- it still holds "
         "the pipe write end, which is the whole failure being fixed"
@@ -119,7 +175,7 @@ def test_stall_error_explains_itself():
     m._LIVENESS_POLL_INTERVAL, m._ABANDONED_PIPE_GRACE = 0.1, 0.3
     try:
         with pytest.raises(subprocess.TimeoutExpired) as exc:
-            _run_captured(["sh", "-c", "(sleep 30) & exit 0"], timeout=30)
+            _run_captured(_grandchild_holds_pipe(), timeout=30)
     finally:
         m._LIVENESS_POLL_INTERVAL, m._ABANDONED_PIPE_GRACE = old_poll, old_grace
 
@@ -129,7 +185,9 @@ def test_stall_error_explains_itself():
 # ── the contract callers depend on is unchanged ─────────────────────────────
 
 def test_normal_success_returns_completed_process():
-    result = _run_captured(["sh", "-c", "echo out; echo err >&2; exit 0"], timeout=30)
+    result = _run_captured(
+        _py("import sys; print('out'); print('err', file=sys.stderr)"), timeout=30
+    )
     assert isinstance(result, subprocess.CompletedProcess)
     assert result.returncode == 0
     assert "out" in result.stdout
@@ -140,13 +198,16 @@ def test_check_raises_called_process_error_with_output_attached():
     """`_run_subprocess_or_none` prints `<label> failed: <stderr>`, so stderr
     has to survive onto the exception."""
     with pytest.raises(subprocess.CalledProcessError) as exc:
-        _run_captured(["sh", "-c", "echo boom >&2; exit 3"], timeout=30, check=True)
+        _run_captured(
+            _py("import sys; print('boom', file=sys.stderr); sys.exit(3)"),
+            timeout=30, check=True,
+        )
     assert exc.value.returncode == 3
     assert "boom" in exc.value.stderr
 
 
 def test_check_false_returns_nonzero_instead_of_raising():
-    result = _run_captured(["sh", "-c", "exit 7"], timeout=30, check=False)
+    result = _run_captured(_py("import sys; sys.exit(7)"), timeout=30, check=False)
     assert result.returncode == 7
 
 
@@ -155,7 +216,7 @@ def test_genuine_timeout_still_raises_and_kills_the_child():
     timeout -- the liveness check must not shorten a healthy slow run."""
     started = time.monotonic()
     with pytest.raises(subprocess.TimeoutExpired):
-        _run_captured(["sh", "-c", "sleep 30"], timeout=1)
+        _run_captured(_py("import time; time.sleep(30)"), timeout=1)
     assert time.monotonic() - started < 5
 
 
@@ -166,15 +227,17 @@ def test_oserror_from_the_spawn_still_propagates():
         _run_captured(["/nonexistent/mq/binary"], timeout=30)
 
 
+@pytest.mark.skipif(not llamacpp._HAS_POSIX_PROCESS_GROUPS,
+                    reason="POSIX sessions/process groups only")
 def test_child_runs_in_its_own_session():
     """killpg is only safe because the child leads its own group. If this
     regresses, the stall cleanup would signal MagicQuant's own group."""
     proc = subprocess.Popen(
-        ["sh", "-c", "sleep 5"],
+        _py("import time; time.sleep(5)"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        start_new_session=True,
+        **llamacpp._popen_isolation_kwargs(),
     )
     try:
         assert os.getpgid(proc.pid) == proc.pid
@@ -182,6 +245,29 @@ def test_child_runs_in_its_own_session():
     finally:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         proc.wait()
+
+
+def test_process_group_token_is_captured_and_kills_the_child():
+    """Portable counterpart: on every supported platform the spawn must yield
+    a real group token (pgid on POSIX, Job Object on Windows) -- ``None``
+    means the cleanup silently degraded to killing the child alone, which is
+    exactly the grandchild leak this module exists to prevent."""
+    proc = subprocess.Popen(
+        _py("import time; time.sleep(30)"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **llamacpp._popen_isolation_kwargs(),
+    )
+    token = llamacpp._capture_process_group(proc)
+    try:
+        assert token is not None, "no process-group isolation on this platform"
+        llamacpp._kill_process_group(proc, token)
+        proc.wait(timeout=5)
+        assert proc.returncode is not None
+    finally:
+        llamacpp._release_process_group(token)
+        proc.communicate()
 
 
 # ── the bounded load check ──────────────────────────────────────────────────
