@@ -179,11 +179,10 @@ def test_open_model_source_refuses_a_directory_with_several_ggufs(tmp_path):
 
 
 def test_open_model_source_still_accepts_a_single_gguf_directory(tmp_path):
+    import struct
     from magicquant.gguf.source import open_model_source
-    (tmp_path / "only.gguf").write_bytes(b"GGUF" + b"\0" * 32)
-    # Exactly one candidate is unambiguous, so this must resolve. GGUFSource
-    # construction is lazy (it does not parse until opened), so a successful
-    # return here is the correct outcome -- the guard must not fire.
+    (tmp_path / "only.gguf").write_bytes(struct.pack("<4sIQQ", b"GGUF", 3, 0, 0))
+    # Exactly one valid GGUF candidate is unambiguous, so this must resolve.
     src = open_model_source(str(tmp_path))
     assert src is not None
 

@@ -1568,7 +1568,10 @@ class GGUFWriter:
             # round-trips at its source element type.)
             if k in _SPLIT_KV_KEYS:
                 continue
-            self.metadata[k] = v
+            # Our output offsets and padding use ALIGNMENT, independently
+            # of the source layout. Copying a custom input alignment would
+            # tell readers to seek to the wrong output tensor positions.
+            self.metadata[k] = ALIGNMENT if k == "general.alignment" else v
         self.metadata["magicquant.hybrid"] = True
         self.metadata["magicquant.base_quant"] = base_quant
         self.metadata["magicquant.group_schemes"] = json.dumps(group_schemes)

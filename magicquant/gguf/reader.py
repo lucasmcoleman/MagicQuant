@@ -99,73 +99,81 @@ class GGUFReader:
         self.close()
     
     def open(self):
-        """Open and parse the GGUF file. Idempotent — safe to call repeatedly
-        and via both the context manager and lazy accessor paths."""
+        """Parse once; publish reader state only after a complete valid header."""
         if self._opened:
             return
-        self._opened = True
-        with open(self.filepath, 'rb') as f:
-            # Read magic number
-            magic = struct.unpack('<I', f.read(4))[0]
+        metadata = {}
+        tensors = []
+        with open(self.filepath, "rb") as f:
+            self.file_size = os.fstat(f.fileno()).st_size
+            magic = struct.unpack("<I", self._read_exact(f, 4))[0]
             if magic != self.GGUF_MAGIC:
                 raise ValueError(f"Invalid GGUF magic: {hex(magic)}. Expected {hex(self.GGUF_MAGIC)}")
-            
-            # Read version (unused: advances the file cursor past the field;
-            # GGUF version handling is not implemented by this reader).
-            struct.unpack('<I', f.read(4))
-
-            # Read tensor count
-            tensor_count = struct.unpack('<Q', f.read(8))[0]
-            
-            # Read metadata key count
-            metadata_key_count = struct.unpack('<Q', f.read(8))[0]
-            
-            # Parse metadata keys
+            version = struct.unpack("<I", self._read_exact(f, 4))[0]
+            if version not in (2, 3):
+                raise ValueError(f"Unsupported GGUF version: {version}")
+            tensor_count = struct.unpack("<Q", self._read_exact(f, 8))[0]
+            metadata_key_count = struct.unpack("<Q", self._read_exact(f, 8))[0]
+            # Every record consumes at least its length/type fields. Reject
+            # impossible counts without looping over attacker-sized integers.
+            if tensor_count > self.file_size // 24 or metadata_key_count > self.file_size // 12:
+                raise ValueError("GGUF record counts exceed file size")
             for _ in range(metadata_key_count):
                 key = self._read_string(f)
-                data_type = struct.unpack('<I', f.read(4))[0]
-                value = self._read_value(f, data_type)
-                self.metadata[key] = value
-            
-            # Parse tensor information
+                data_type = struct.unpack("<I", self._read_exact(f, 4))[0]
+                metadata[key] = self._read_value(f, data_type)
+
             for _ in range(tensor_count):
-                tensor_name = self._read_string(f)
+                name = self._read_string(f)
+                n_dims = struct.unpack("<I", self._read_exact(f, 4))[0]
+                if not 1 <= n_dims <= 4:
+                    raise ValueError(f"Tensor {name!r} has invalid dimension count: {n_dims}")
+                shape = [struct.unpack("<Q", self._read_exact(f, 8))[0]
+                         for _ in range(n_dims)][::-1]
+                if any(dim == 0 for dim in shape):
+                    raise ValueError(f"Tensor {name!r} has an empty dimension")
+                tensor_type = struct.unpack("<I", self._read_exact(f, 4))[0]
+                offset = struct.unpack("<Q", self._read_exact(f, 8))[0]
+                tensors.append({"name": name, "n_dims": n_dims, "shape": shape,
+                                "data_type": tensor_type, "offset": offset})
 
-                # Read tensor shape (n dimensions, reverse order)
-                n_dims = struct.unpack('<I', f.read(4))[0]
-                shape = []
-                for i in range(n_dims):
-                    dim = struct.unpack('<Q', f.read(8))[0]
-                    shape.insert(0, dim)  # Reverse order
+            alignment = metadata.get("general.alignment", 32)
+            if (not isinstance(alignment, int) or isinstance(alignment, bool)
+                    or alignment <= 0 or alignment > 2**32 - 1
+                    or getattr(alignment, "gguf_type", 4) != 4
+                    or alignment & (alignment - 1)):
+                raise ValueError("GGUF general.alignment must be a positive power-of-two uint32")
+            data_offset = ((f.tell() + alignment - 1) // alignment) * alignment
+            for tensor in tensors:
+                if tensor["offset"] % alignment:
+                    raise ValueError(f"Unaligned GGUF tensor offset: {tensor['name']!r}")
+                if data_offset + tensor["offset"] >= self.file_size:
+                    raise ValueError(f"GGUF tensor starts beyond file data: {tensor['name']!r}")
 
-                # Read tensor type
-                tensor_type = struct.unpack('<I', f.read(4))[0]
+        self.metadata = metadata
+        self.tensors = tensors
+        self.data_offset = data_offset
+        self._opened = True
 
-                # Read offset
-                offset = struct.unpack('<Q', f.read(8))[0]
+    def _read_exact(self, f, size: int) -> bytes:
+        """Bound all reads by the file, including length-prefixed strings."""
+        if size < 0 or size > self.file_size - f.tell():
+            raise ValueError(f"Truncated GGUF: read of {size} bytes exceeds file bounds")
+        data = f.read(size)
+        if len(data) != size:
+            raise ValueError("Truncated GGUF while reading header")
+        return data
 
-                self.tensors.append({
-                    'name': tensor_name,
-                    'n_dims': n_dims,
-                    'shape': shape,
-                    'data_type': tensor_type,
-                    'offset': offset
-                })
-
-            # Data section starts at next 32-byte alignment after ALL header data
-            # (metadata KVs + tensor info entries)
-            self.data_offset = ((f.tell() + 31) // 32) * 32
-    
     def _read_string(self, f) -> str:
         """Read a GGUF string.
 
         Decode non-strictly: one non-UTF-8 byte in a vocab token or metadata
         value shouldn't abort parsing the whole file.
         """
-        length = struct.unpack('<Q', f.read(8))[0]
-        return f.read(length).decode('utf-8', errors='replace')
+        length = struct.unpack('<Q', self._read_exact(f, 8))[0]
+        return self._read_exact(f, length).decode('utf-8', errors='replace')
     
-    def _read_value(self, f, data_type: int) -> Any:
+    def _read_value(self, f, data_type: int, depth: int = 0) -> Any:
         """Read a value of the given GGUF type.
 
         Integer-family scalars (UINT8/INT8/UINT16/INT16/UINT32/INT32/
@@ -174,35 +182,39 @@ class GGUFReader:
         those classes' docstrings for why. Both subclass the plain Python
         type they'd otherwise be, so this is purely additive.
         """
+        if depth > 32:
+            raise ValueError("GGUF metadata arrays are too deeply nested")
         if data_type == 0:  # UINT8
-            return GGUFTypedInt(struct.unpack('<B', f.read(1))[0], data_type)
+            return GGUFTypedInt(struct.unpack('<B', self._read_exact(f, 1))[0], data_type)
         elif data_type == 1:  # INT8
-            return GGUFTypedInt(struct.unpack('<b', f.read(1))[0], data_type)
+            return GGUFTypedInt(struct.unpack('<b', self._read_exact(f, 1))[0], data_type)
         elif data_type == 2:  # UINT16
-            return GGUFTypedInt(struct.unpack('<H', f.read(2))[0], data_type)
+            return GGUFTypedInt(struct.unpack('<H', self._read_exact(f, 2))[0], data_type)
         elif data_type == 3:  # INT16
-            return GGUFTypedInt(struct.unpack('<h', f.read(2))[0], data_type)
+            return GGUFTypedInt(struct.unpack('<h', self._read_exact(f, 2))[0], data_type)
         elif data_type == 4:  # UINT32
-            return GGUFTypedInt(struct.unpack('<I', f.read(4))[0], data_type)
+            return GGUFTypedInt(struct.unpack('<I', self._read_exact(f, 4))[0], data_type)
         elif data_type == 5:  # INT32
-            return GGUFTypedInt(struct.unpack('<i', f.read(4))[0], data_type)
+            return GGUFTypedInt(struct.unpack('<i', self._read_exact(f, 4))[0], data_type)
         elif data_type == 6:  # FLOAT32
-            return struct.unpack('<f', f.read(4))[0]
+            return struct.unpack('<f', self._read_exact(f, 4))[0]
         elif data_type == 7:  # BOOL
-            return struct.unpack('<?', f.read(1))[0]
+            return struct.unpack('<?', self._read_exact(f, 1))[0]
         elif data_type == 8:  # STRING
             return self._read_string(f)
         elif data_type == 9:  # ARRAY
-            elem_type = struct.unpack('<I', f.read(4))[0]
-            length = struct.unpack('<Q', f.read(8))[0]
-            items = [self._read_value(f, elem_type) for _ in range(length)]
+            elem_type = struct.unpack('<I', self._read_exact(f, 4))[0]
+            length = struct.unpack('<Q', self._read_exact(f, 8))[0]
+            if length > self.file_size - f.tell():
+                raise ValueError("GGUF array length exceeds file bounds")
+            items = [self._read_value(f, elem_type, depth + 1) for _ in range(length)]
             return GGUFTypedArray(items, elem_type)
         elif data_type == 10:  # UINT64
-            return GGUFTypedInt(struct.unpack('<Q', f.read(8))[0], data_type)
+            return GGUFTypedInt(struct.unpack('<Q', self._read_exact(f, 8))[0], data_type)
         elif data_type == 11:  # INT64
-            return GGUFTypedInt(struct.unpack('<q', f.read(8))[0], data_type)
+            return GGUFTypedInt(struct.unpack('<q', self._read_exact(f, 8))[0], data_type)
         elif data_type == 12:  # FLOAT64
-            return struct.unpack('<d', f.read(8))[0]
+            return struct.unpack('<d', self._read_exact(f, 8))[0]
         else:
             raise ValueError(f"Unknown GGUF data type: {data_type}")
     

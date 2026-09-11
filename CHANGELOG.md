@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed (2026-09-10 audit)
+
+- GGUF reads now honor validated `general.alignment`, bound header reads, and
+  publish parsed state only after success; hybrid output advertises its actual
+  32-byte alignment. Added upstream-reader round trips and malformed-header
+  regressions; replaced an invalid version-zero fixture. Files:
+  `magicquant/gguf/{reader,writer}.py`, `tests/test_reader_integrity.py`,
+  `tests/test_active_learning_units.py`. Validation: full review suites passed
+  (1,269 main / 1,443 QAT); details in `docs/audits/2026-09-10-review.md`.
+
 ### Fixed (2026-08-20 — metadata array signedness lost on every K-quant hybrid render)
 
 - **Every standard MagicQuant K-quant hybrid render wrote
