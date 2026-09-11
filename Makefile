@@ -1,16 +1,18 @@
 .PHONY: install test lint format docker-build docker-up clean
 
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
+
 install:
-	pip install -e ".[dev]"
+	$(PYTHON) -m pip install -e ".[dev]"
 
 test:
-	python -m pytest tests/ -v
+	$(PYTHON) -m pytest tests/ -v
 
 lint:
-	ruff check magicquant/ tests/
+	$(PYTHON) -m ruff check --select F magicquant/ tools/ tests/
 
 format:
-	ruff format magicquant/ tests/
+	$(PYTHON) -m ruff format magicquant/ tests/
 
 docker-build:
 	docker build -f docker/Dockerfile -t magicquant:latest .

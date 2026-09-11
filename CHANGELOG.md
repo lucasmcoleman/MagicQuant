@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Added (2026-09-10 audit)
+
+- Built-wheel installation smoke checks validate the console entry and bundled
+  calibration corpus outside the checkout. The corpus is now declared as package
+  data, and CI/release jobs check wheels built from source distributions.
+  Makefile commands prefer a local virtualenv and the required Pyflakes gate.
+  Files: `pyproject.toml`, `tools/check_wheel.py`, `.github/workflows/{ci,release}.yml`,
+  `Makefile`. Validation: original wheel failure reproduced; corrected sdist/wheel
+  build, isolated install smoke, and Pyflakes all passed.
+
 ### Fixed (2026-09-10 audit)
 
 - Search uses consistent F16 sampling/expert-imatrix distortion scales,

@@ -114,6 +114,9 @@ jobs:
       - name: Build sdist + wheel
         run: python -m build
 
+      - name: Smoke-test installed release wheel
+        run: python tools/check_wheel.py dist/*.whl
+
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}

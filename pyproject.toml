@@ -82,3 +82,6 @@ where = ["."]
 # only piece the installed package ever needed at runtime), not meant to
 # install as a top-level `tools` package alongside `magicquant`.
 exclude = ["docker*", "tests*", "tools*"]
+
+[tool.setuptools.package-data]
+magicquant = ["data/calib_corpus.txt"]

@@ -48,6 +48,12 @@ jobs:
         # Encoder-parity skips automatically when llama-quantize is unavailable.
         run: python -m pytest tests/ -q
 
+      - name: Build and smoke-test installed wheel
+        run: |
+          pip install build
+          python -m build
+          python tools/check_wheel.py dist/*.whl
+
   qat-tests:
     # QAT-LoRA tests need the [qat] extra (torch/transformers/peft/accelerate)
     # and were never exercised in CI before this job -- the `test` job above
