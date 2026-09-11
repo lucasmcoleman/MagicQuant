@@ -425,8 +425,8 @@ def fit_kappa(
 
     # Cumulative mode: rel-dPPL is recovery from the all-aggressive base.
     ba = outcomes.get("__base_aggressive__")
-    cumulative = ba is not None and ba.ok
-    base_ppl = ba.value if cumulative else None
+    cumulative = ba is not None
+    base_ppl = ba.value if cumulative and ba.ok else None
 
     # Pass 1: raw rel-dPPL per measured group.
     raw_rel: Dict[str, float] = {}
@@ -440,7 +440,11 @@ def fit_kappa(
             continue
         if outcome.ok:
             if cumulative:
-                # Recovery from keeping G high in the all-quantized base.
+                # A failed aggressive baseline does not turn leave-one-high
+                # probes into single-group probes. Their recovery cannot be
+                # measured; leave them for the explicit imputation pass.
+                if base_ppl is None:
+                    continue
                 raw_rel[g] = (base_ppl - outcome.value) / probe_baseline
             else:
                 raw_rel[g] = (outcome.value - probe_baseline) / probe_baseline

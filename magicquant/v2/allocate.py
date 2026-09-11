@@ -4,10 +4,12 @@ Formulation (docs/redesign.md §4): for each unit (tensor) pick one scheme;
 minimize total predicted distortion  Σ κ_g(t) · ε(t, s_t)  subject to
 Σ bytes(t, s_t) ≤ budget.
 
-Solver: per-unit lower convex hull + global slope-greedy (equivalent to a
-Lagrange-multiplier sweep), then a bounded local-search polish over the raw
-(non-hull) choices. The greedy trace IS the predicted quality-size
-frontier: every prefix is the hull-optimal allocation for its size.
+Approximation: per-unit lower convex hull + global slope-greedy, then bounded
+local-search polish over the raw (non-hull) choices. Discrete upgrade costs can
+leave budget unused or require coordinated swaps. The trace is a candidate
+quality-size curve, not a certificate of global optimality. Byte costs cover
+tensor payloads; GGUF metadata and alignment overhead are accounted separately
+by serialization and are not included in this solver's budget.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ class Choice:
 
     scheme: str          # registry scheme name (what the writer config carries)
     actual: str          # resolved on-disk ggml type (prices bytes + distortion)
-    bytes: int           # exact on-disk size
+    bytes: int           # serialized tensor payload size, excluding GGUF overhead
     loss: float          # κ-scaled distortion ε (predicted quality cost)
 
 
@@ -118,7 +120,7 @@ def allocate(
     budget_bytes: int,
     polish_sweeps: int = 2,
 ) -> Allocation:
-    """Solve the MCKP: hull greedy + bounded polish. See module docstring.
+    """Approximate the MCKP with hull greedy + bounded polish. See module docstring.
 
     Raises BudgetInfeasibleError when even the smallest admissible
     configuration exceeds ``budget_bytes``.

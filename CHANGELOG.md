@@ -4,6 +4,17 @@
 
 ### Fixed (2026-09-10 audit)
 
+- Search uses consistent F16 sampling/expert-imatrix distortion scales,
+  invalidates old distortion tables, preserves cumulative-probe failure
+  provenance, and rejects allocations that omit tensors. Both search paths
+  check effective calibration/evaluation corpus identity, including defaults
+  and links. The allocator now documents its approximate optimization and
+  payload-only budget. Files: `magicquant/v2/{allocate,calibrate,search,sensitivity}.py`,
+  `magicquant/orchestrator.py`, `tests/test_v2_audit_regressions.py`,
+  `tests/test_allocation_and_corpus_guards.py`. Validation: 25 new regressions;
+  135 focused tests and full main/QAT review suites passed. v1 retains its
+  logged unweighted fallback; v2 rejects overlapping corpus configuration.
+
 - GGUF reads now honor validated `general.alignment`, bound header reads, and
   publish parsed state only after success; hybrid output advertises its actual
   32-byte alignment. Added upstream-reader round trips and malformed-header

@@ -395,7 +395,9 @@ class MagicQuantOrchestrator:
         isn't GGUF, or capture/load failed -- logged as a warning, never
         raised: this must never block the pipeline).
         """
-        from magicquant.imatrix import ensure_imatrix, resolve_imatrix_bin
+        from magicquant.imatrix import (
+            DEFAULT_CORPUS_PATH, ensure_imatrix, resolve_imatrix_bin,
+        )
 
         # Default llama-imatrix to the sibling of the discovered perplexity
         # binary: ensure_imatrix's own fallback is a PATH lookup, which can
@@ -407,30 +409,34 @@ class MagicQuantOrchestrator:
             if resolved:
                 kwargs["imatrix_bin"] = resolved
 
-        # Never calibrate on the text the run is SCORED against. Doing so
-        # tunes quantization to the eval set and every measured_loss comes
-        # back optimistic with nothing in the output hinting why. The two
-        # default to different corpora, but nothing enforced it until now --
-        # one imatrix_corpus pointed at wikitext would silently invalidate a
-        # whole search's numbers.
-        if corpus_path is not None:
-            try:
-                cal = Path(corpus_path).resolve()
-                tools = self.llama_tools
-                pinned = getattr(tools, "_pinned_corpus", None) if tools else None
-                if pinned and Path(pinned).resolve() == cal:
+        # Both defaults can resolve to the bundled calibration text when
+        # wikitext is absent. Check the effective corpora before capture,
+        # including before the first evaluation has pinned its corpus.
+        try:
+            cal = Path(corpus_path if corpus_path is not None else DEFAULT_CORPUS_PATH)
+            tools = self.llama_tools
+            evaluation = getattr(tools, "_pinned_corpus", None) if tools else None
+            if evaluation is None and tools is not None:
+                resolver = getattr(tools, "_resolve_data_file", None)
+                if resolver is not None:
+                    evaluation = resolver(None)
+            if evaluation is not None:
+                evaluation = Path(evaluation)
+                same_corpus = cal.resolve() == evaluation.resolve()
+                if not same_corpus and cal.exists() and evaluation.exists():
+                    same_corpus = cal.samefile(evaluation)
+                if same_corpus:
                     log.error(
                         "refusing imatrix: the calibration corpus is the same "
                         "file as the perplexity eval corpus, which would make "
                         "every measured loss optimistic. Point imatrix_corpus "
-                        "at different text, or leave it unset for the bundled "
-                        "default.",
+                        "at different text, or disable imatrix.",
                         stage="imatrix", corpus=str(cal),
                     )
                     self._imatrix = None
                     return False
-            except (OSError, ValueError):
-                pass    # unresolvable path: let ensure_imatrix report it
+        except (OSError, ValueError):
+            pass    # unresolvable path: let ensure_imatrix report it
 
         self._imatrix = ensure_imatrix(
             self.source_model_path, corpus_path=corpus_path, **kwargs

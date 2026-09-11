@@ -31,7 +31,8 @@ from magicquant.v2.resolve import resolve_tensor_type, tensor_bytes
 
 log = get_logger(__name__)
 
-TABLE_VERSION = 1
+# Version 2 invalidates tables with undercounted sampled/expert-weighted F16 error.
+TABLE_VERSION = 2
 
 # Groups/type situations whose tensors are not allocatable (fixed by writer
 # compatibility rules regardless of the requested scheme).
@@ -158,6 +159,11 @@ def compute_distortion_table(
     from magicquant.gguf.source import open_model_source
     from magicquant.quant.converters import encode_to_ggml_bytes
     from magicquant.quant.ggml_binding import ggml_decode, supports_decode
+
+    if sample_rows is not None and sample_rows <= 0:
+        raise ValueError("sample_rows must be positive when provided")
+    if not schemes:
+        raise ValueError("schemes must contain at least one quantization scheme")
 
     src_path = Path(source_model_path)
     model_id = _model_identity(src_path)
@@ -290,10 +296,18 @@ def compute_distortion_table(
                 w.ndim == 3 and m_full is not None and m_full.size == w.shape[0] * cols
             )
 
-            sq = np.square(w2d_s.astype(np.float32)).sum(axis=0, dtype=np.float64)
-            entry["wnorm"] = float(
-                (sq * m.astype(np.float64)).sum() if m is not None else sq.sum()
-            ) * row_scale
+            if stacked_moe_imatrix:
+                # Quantized expert choices use the full tensor below. Keep
+                # float choices and the reference norm in that same metric.
+                m3 = m_full.reshape(w.shape[0], 1, cols)
+                entry["wnorm"] = float(
+                    (np.square(w) * m3).sum(dtype=np.float64)
+                )
+            else:
+                sq = np.square(w2d_s).sum(axis=0, dtype=np.float64)
+                entry["wnorm"] = float(
+                    (sq * m.astype(np.float64)).sum() if m is not None else sq.sum()
+                ) * row_scale
 
             # Compute distortion per RESOLVED type once, then map schemes.
             resolved: Dict[str, Any] = {}
@@ -309,8 +323,16 @@ def compute_distortion_table(
                     per_actual_err[actual] = 0.0
                     continue
                 if actual == "F16":
-                    w_hat = w2d_s.astype(np.float16).astype(np.float32)
-                    per_actual_err[actual] = _weighted_sq_err(w2d_s, w_hat, m)
+                    if stacked_moe_imatrix:
+                        w_hat = w.astype(np.float16).astype(np.float32)
+                        per_actual_err[actual] = float(
+                            (np.square(w - w_hat) * m3).sum(dtype=np.float64)
+                        )
+                    else:
+                        w_hat = w2d_s.astype(np.float16).astype(np.float32)
+                        per_actual_err[actual] = (
+                            _weighted_sq_err(w2d_s, w_hat, m) * row_scale
+                        )
                     continue
                 if not supports_decode(actual):
                     per_actual_err[actual] = None

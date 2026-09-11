@@ -184,7 +184,10 @@ def _build_units(
         if entry.get("fixed"):
             (scheme, c), = entry["choices"].items()
             if c.get("bytes") is None:
-                continue  # source-passthrough of unknown size: not allocatable
+                raise ValueError(
+                    f"Cannot allocate tensor {name!r}: its serialized size is "
+                    "unknown. Use a supported BF16/F16/F32 source."
+                )
             choices = [Choice(scheme, c["actual"], int(c["bytes"]), 0.0)]
         else:
             k = kappa.get(group, 1.0)
@@ -202,8 +205,15 @@ def _build_units(
                     Choice(scheme, c["actual"], int(c["bytes"]),
                            k * float(c["werr"]))
                 )
-        if choices:
-            units.append(Unit(name=name, group=group, choices=choices))
+        if not choices:
+            raise ValueError(
+                f"Cannot allocate tensor {name!r} (group {group!r}): no "
+                "admissible choices remain after distortion validation and "
+                f"floor filtering (floor={floors.get(group)!r}). Enable a "
+                "supported scheme or relax the floor; omitting this tensor "
+                "would undercount the model's byte budget."
+            )
+        units.append(Unit(name=name, group=group, choices=choices))
     return units
 
 
@@ -248,7 +258,30 @@ def _resolve_imatrix_and_schemes(
     """── 2. imatrix (optional, loud when absent) ── + scheme selection."""
     imatrix = None
     if cfg.use_imatrix:
-        from magicquant.imatrix import ensure_imatrix, resolve_imatrix_bin
+        from magicquant.imatrix import (
+            DEFAULT_CORPUS_PATH, ensure_imatrix, resolve_imatrix_bin,
+        )
+
+        # Corpus auto-resolution may fall back to the bundled calibration
+        # text, so validate the effective defaults as well as explicit paths.
+        resolve_eval = getattr(tools, "_resolve_data_file", None)
+        eval_corpus = (
+            resolve_eval(None) if resolve_eval is not None else cfg.data_file
+        )
+        calibration = Path(
+            cfg.imatrix_corpus if cfg.imatrix_corpus is not None else DEFAULT_CORPUS_PATH
+        )
+        if eval_corpus is not None:
+            evaluation = Path(eval_corpus)
+            same_corpus = calibration.resolve() == evaluation.resolve()
+            if not same_corpus and calibration.exists() and evaluation.exists():
+                same_corpus = calibration.samefile(evaluation)
+            if same_corpus:
+                raise ValueError(
+                    "The imatrix calibration corpus is the same file as the "
+                    "perplexity evaluation corpus. Choose separate calibration "
+                    "text with imatrix_corpus, or disable imatrix."
+                )
 
         kwargs = {}
         resolved = resolve_imatrix_bin(tools)
@@ -320,7 +353,7 @@ def _calibrate_kappa(
             probe_outcomes, eps_sums, baseline_ppl
         )
         for g, o in probe_outcomes.items():
-            if not o.ok and g not in ("__slice_baseline__", "__base_aggressive__"):
+            if not o.ok and g != "__slice_baseline__":
                 failures.append({"stage": "probe", "group": g, **o.to_json()})
     return kappa, kappa_provenance, probe_outcomes, eps_sums, failures
 
