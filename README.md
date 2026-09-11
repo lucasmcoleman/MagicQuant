@@ -1,8 +1,8 @@
 # MagicQuant
 
-**Evolutionary Tensor Search for Optimal LLM GGUF Hybrid Quantization**
+**Evolutionary Tensor Search for LLM GGUF Hybrid Quantization**
 
-A Python implementation of the MagicQuant framework — an evolutionary search algorithm that discovers optimal per-group quantization configurations for LLM GGUF files. Instead of applying one quantization scheme globally, MagicQuant assigns different schemes to different tensor groups (embeddings, attention, FFN) based on measured sensitivity, producing models that break the standard size/quality/speed Pareto frontier.
+A Python implementation of the MagicQuant framework — an evolutionary search algorithm that explores per-group quantization configurations for LLM GGUF files. MagicQuant assigns different schemes to tensor groups (embeddings, attention, FFN) based on measured sensitivity to improve size, quality, and speed tradeoffs. Search results are empirical candidates, without a guarantee of global optimality.
 
 ## Origin & Credit
 
@@ -22,7 +22,7 @@ BF16 Source Model
 [1. Sensitivity Probing] — Quantize one group at a time, measure KL divergence
      |
      v
-[2. Evolutionary Search] — Discover optimal hybrid configs per compression tier
+[2. Evolutionary Search] — Compare hybrid configs per compression tier
      |                      Protector/Crusher mutations, epsilon-greedy exploration
      v
 [3. Tiered Generation]  — Output best Q4, Q5, Q6 hybrid GGUFs
@@ -109,7 +109,7 @@ cd MagicQuant
 pip install -e .
 ```
 
-Requires Python 3.9+ and NumPy. Optional: [llama.cpp](https://github.com/ggerganov/llama.cpp) for real perplexity measurement during probing.
+Requires Python 3.10+ and NumPy. Optional: [llama.cpp](https://github.com/ggerganov/llama.cpp) for real perplexity measurement during probing.
 
 For **Quantization-Aware Training** (`magicquant qat`) install the optional
 `[qat]` extra, which pulls the heavy training stack (the core install stays
