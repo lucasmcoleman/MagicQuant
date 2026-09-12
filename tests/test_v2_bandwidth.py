@@ -55,16 +55,51 @@ def test_infinite_expert_count_treated_as_missing_no_exception(caplog):
     with caplog.at_level(logging.WARNING):
         w = bw.stream_weights_by_group(md, log=logging.getLogger("t"))
     assert w["X"] == 1.0
-    assert any("expert_count" in r.getMessage() for r in caplog.records)
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "expert_count" in msg and "inf" in msg   # raw hparam value visible
 
 
-def test_nonsense_expert_hparams_logs_warning_naming_both_values(caplog):
+def test_nan_expert_count_treated_as_missing_no_exception(caplog):
+    md = dict(QWEN_MD, **{"qwen35moe.expert_count": float("nan")})
+    with caplog.at_level(logging.WARNING):
+        w = bw.stream_weights_by_group(md, log=logging.getLogger("t"))
+    assert w["X"] == 1.0
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "expert_count" in msg and "nan" in msg   # raw hparam value visible
+
+
+def test_bogus_expert_used_count_shows_raw_value_and_spares_valid_expert_count(caplog):
+    # expert_used_count is unparseable while expert_count parses fine: n and k
+    # must convert independently (the valid one isn't discarded), and the
+    # warning must show the RAW offending value, not a blanked-out None.
+    md = dict(QWEN_MD, **{"qwen35moe.expert_used_count": "bogus"})
+    with caplog.at_level(logging.WARNING):
+        w = bw.stream_weights_by_group(md, log=logging.getLogger("t"))
+    assert w["X"] == 1.0
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "bogus" in msg and "256" in msg
+
+
+def test_nonsense_expert_hparams_fails_hot_not_clamped(caplog):
     md = dict(QWEN_MD, **{"qwen35moe.expert_used_count": 99, "qwen35moe.expert_count": 8})
     with caplog.at_level(logging.WARNING):
-        ratio = bw.expert_ratio(md, log=logging.getLogger("t"))
-    assert ratio == 1.0          # still clamped into [0, 1]
+        w = bw.stream_weights_by_group(md, log=logging.getLogger("t"))
+    assert w["X"] == 1.0         # out-of-range now fails hot -- never clamped to a
+                                 # value derived from the bogus ratio
     msg = " ".join(r.getMessage() for r in caplog.records)
     assert "99" in msg and "8" in msg
+
+
+def test_negative_expert_used_count_fails_hot_not_clamped_to_zero(caplog):
+    # A negative expert_used_count previously clamped to w=0.0 (cold) -- the
+    # one broken-hparam path that priced hot everywhere else. Must now fail
+    # hot like every other broken-hparam case.
+    md = dict(QWEN_MD, **{"qwen35moe.expert_used_count": -4})
+    with caplog.at_level(logging.WARNING):
+        w = bw.stream_weights_by_group(md, log=logging.getLogger("t"))
+    assert w["X"] == 1.0
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "-4" in msg
 
 
 def test_missing_architecture_gives_clear_warning_not_none_dot_expert_count(caplog):
@@ -170,14 +205,14 @@ def test_streamed_bytes_missing_scheme_raises_informative_keyerror():
 def test_streamed_bytes_missing_bytes_key_raises_informative_keyerror():
     t = _table()
     del t["a"]["choices"]["Q4_K_M"]["bytes"]
-    with pytest.raises(KeyError, match=r"'a' / 'Q4_K_M'"):
+    with pytest.raises(KeyError, match=r"'a' / 'Q4_K_M'.*no 'bytes'"):
         bw.streamed_bytes({"a": "Q4_K_M"}, t, {})
 
 
 def test_pure_loss_missing_werr_key_raises_informative_keyerror():
     t = _table()
     del t["a"]["choices"]["Q4_K_M"]["werr"]
-    with pytest.raises(KeyError, match=r"'a' / 'Q4_K_M'"):
+    with pytest.raises(KeyError, match=r"'a' / 'Q4_K_M'.*no 'werr'"):
         bw.pure_loss({"a": "Q4_K_M"}, t, {})
 
 
@@ -192,7 +227,7 @@ def test_pure_loss_werr_none_is_still_silently_excluded():
 def test_bpw_by_group_missing_bytes_key_raises_informative_keyerror():
     t = _table()
     del t["x"]["choices"]["BF16"]["bytes"]
-    with pytest.raises(KeyError, match=r"'x' / 'BF16'"):
+    with pytest.raises(KeyError, match=r"'x' / 'BF16'.*no 'bytes'"):
         bw.bpw_by_group({"x": "BF16"}, t)
 
 
@@ -240,6 +275,37 @@ def test_group_view_ignores_gathered_by_name_disagreement(caplog):
             by_group, exceptions = bw.group_view(w_stream, t, log=logging.getLogger("t"))
         assert by_group["H"] == 1.0 and exceptions == {"blk.0.nextn.embed_tokens.weight": 0.0}
         assert not any("distinct weights" in r.getMessage() for r in caplog.records)
+
+
+def test_group_view_tie_break_is_deterministic_not_insertion_order():
+    # A genuine tie (one tensor each at two different weights, neither
+    # gathered-by-name) must resolve to the higher ("hotter") weight
+    # regardless of dict insertion order, and the loser must be an exception.
+    entries = {"u1": _entry("U", (8,)), "u2": _entry("U", (8,))}
+    w_stream = {"u1": 1.0, "u2": 0.5}
+    for t in (dict(entries), dict(reversed(list(entries.items())))):
+        by_group, exceptions = bw.group_view(w_stream, t)
+        assert by_group["U"] == 1.0
+        assert exceptions == {"u2": 0.5}
+
+
+def test_group_view_all_gathered_group_still_warns_on_disagreement(caplog):
+    # Every tensor in the group is gathered-by-name (rule 2), so the modal
+    # falls back to the full population -- which must still be checked for
+    # disagreement (not the now-empty non-gathered counter), and the pick
+    # must still be order-independent.
+    entries = {
+        "token_embd.weight": _entry("E", (100, 64)),
+        "blk.0.nextn.embed_tokens.weight": _entry("E", (100, 64)),
+    }
+    w_stream = {"token_embd.weight": 0.0, "blk.0.nextn.embed_tokens.weight": 1.0}
+    for t in (dict(entries), dict(reversed(list(entries.items())))):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            by_group, exceptions = bw.group_view(w_stream, t, log=logging.getLogger("t"))
+        assert by_group["E"] == 1.0
+        assert exceptions == {"token_embd.weight": 0.0}
+        assert any("distinct weights" in r.getMessage() for r in caplog.records)
 
 
 def test_float_entry_stub_source_gets_expert_ratio(monkeypatch, tmp_path):

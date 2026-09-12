@@ -34,28 +34,37 @@ def _warn(log, msg: str, *args) -> None:
 
 def expert_ratio(metadata: Mapping[str, Any], *, log=None) -> Optional[float]:
     """expert_used_count / expert_count from the GGUF hparams, or None (with a
-    warning) when either is missing or expert_count is zero. Never divides by
-    zero; never returns a non-finite value."""
+    warning) when either is missing, expert_count is zero, or the values are
+    out of range (used-count negative or greater than the total -- fails hot,
+    never clamped). ``n`` and ``k`` are converted independently, so a parse
+    failure on one never discards a successfully-parsed value for the other;
+    every warning names the RAW hparam value(s), not the (possibly-None)
+    converted ones, so the offending value is visible. Never divides by zero;
+    never returns a non-finite value or one outside [0,1]."""
     arch = metadata.get("general.architecture")
     if not arch:
         _warn(log, "stream weights: general.architecture missing; routed experts priced at w=1.0")
         return None
     key_n = f"{arch}.expert_count"
     key_k = f"{arch}.expert_used_count"
-    n = metadata.get(key_n)
-    k = metadata.get(key_k)
+    n_raw = metadata.get(key_n)
+    k_raw = metadata.get(key_k)
     try:
-        n = int(n) if n is not None else None
-        k = int(k) if k is not None else None
+        n = int(n_raw) if n_raw is not None else None
     except (TypeError, ValueError, OverflowError):
-        n, k = None, None
+        n = None
+    try:
+        k = int(k_raw) if k_raw is not None else None
+    except (TypeError, ValueError, OverflowError):
+        k = None
     if not n or k is None or n <= 0:
         _warn(log, "stream weights: %s / %s missing or zero (%r / %r); "
-                   "routed experts priced at w=1.0 (today's pricing)", key_n, key_k, n, k)
+                   "routed experts priced at w=1.0 (today's pricing)", key_n, key_k, n_raw, k_raw)
         return None
     if k > n or k < 0:
         _warn(log, "stream weights: %s=%r is inconsistent with %s=%r (used-count > "
-                   "total, or negative); clamping to [0,1]", key_k, k, key_n, n)
+                   "total, or negative); routed experts priced at w=1.0 (fails hot, not clamped)", key_k, k_raw, key_n, n_raw)
+        return None
     return min(1.0, max(0.0, k / n))
 
 
@@ -187,16 +196,22 @@ def bpw_by_group(assignment: Mapping[str, str], table_tensors: Mapping[str, Mapp
 def group_view(w_stream: Mapping[str, float], table_tensors: Mapping[str, Mapping[str, Any]],
                *, log=None) -> Tuple[Dict[str, float], Dict[str, float]]:
     """(observed_by_group, exceptions) for reporting: the modal weight over
-    each group's tensors (a group with more than one distinct weight logs a
-    WARNING, ignoring rule-2 gathered-by-name tensors, whose disagreement is
-    intended); exceptions lists every tensor whose weight differs from its
-    group's modal value.
+    each group's tensors; exceptions lists every tensor whose weight differs
+    from its group's modal value.
 
     The modal weight is computed from the NON-gathered population only (a
     group falls back to its full population when every tensor in it is
-    gathered-by-name), so the result is independent of dict insertion order:
-    rule-2 tensors can never tip a tie and always land in `exceptions` when
-    their weight disagrees with the rest of the group."""
+    gathered-by-name, i.e. rule-2). Within that population the modal weight
+    is chosen deterministically: the weight with the HIGHEST COUNT, ties
+    broken by the HIGHER weight (the conservative, "hotter" reading) -- never
+    by dict insertion order, so the result is independent of it. A group
+    with more than one distinct weight IN THE POPULATION ACTUALLY USED for
+    its modal (non-gathered when non-empty, else the full population) logs a
+    WARNING -- so an all-gathered group whose members disagree still warns,
+    even though the non-gathered counter it would otherwise check is empty.
+    Rule-2 tensors excluded from the modal population can never tip a tie
+    and always land in `exceptions` when their weight disagrees with the
+    rest of the group."""
     per_group: Dict[str, Counter] = defaultdict(Counter)      # full population (fallback)
     non_gathered: Dict[str, Counter] = defaultdict(Counter)   # rule-2-excluded population
     for name, entry in table_tensors.items():
@@ -208,9 +223,11 @@ def group_view(w_stream: Mapping[str, float], table_tensors: Mapping[str, Mappin
     by_group: Dict[str, float] = {}
     for g, counts in per_group.items():
         pop = non_gathered[g] if non_gathered[g] else counts
-        if len(non_gathered[g]) > 1:
-            _warn(log, "stream weights: group %s has %d distinct weights %r", g, len(non_gathered[g]), sorted(non_gathered[g]))
-        by_group[g] = pop.most_common(1)[0][0]
+        if len(pop) > 1:
+            _warn(log, "stream weights: group %s has %d distinct weights %r", g, len(pop), sorted(pop))
+        # Deterministic modal pick: highest count, ties broken by the higher
+        # (hotter) weight -- never by Counter/dict insertion order.
+        by_group[g] = max(pop.items(), key=lambda kv: (kv[1], kv[0]))[0]
     exceptions = {name: w_stream.get(name, 1.0) for name, entry in table_tensors.items()
                   if w_stream.get(name, 1.0) != by_group[entry.get("group", "UNKNOWN")]}
     return by_group, exceptions
