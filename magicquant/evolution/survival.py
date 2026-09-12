@@ -173,6 +173,7 @@ class EvolutionarySurvivor:
         stream_aware: bool = False,
         objective_weights: Optional[Tuple[float, float, float]] = None,
         use_bytes_tps: bool = False,
+        use_stream_tps: bool = False,
         block32_only_groups: Optional[Iterable[str]] = None,
     ):
         self.predictor = predictor
@@ -252,6 +253,13 @@ class EvolutionarySurvivor:
         # PredictiveScorer.score_hybrid's use_bytes_tps. Off by default:
         # byte-identical historical scoring.
         self.use_bytes_tps = use_bytes_tps
+        # MoE-correct variant of use_bytes_tps -- see
+        # PredictiveScorer.score_hybrid's use_stream_tps. Off by default:
+        # byte-identical historical scoring. Alone (objective_weights=None,
+        # use_bytes_tps=False) it must still take the tunable path in
+        # _predict_population below, or --stream-tps never reaches
+        # score_hybrid.
+        self.use_stream_tps = use_stream_tps
 
         self.tier_winners: Dict[str, Dict] = {}
 
@@ -732,11 +740,19 @@ class EvolutionarySurvivor:
     # ------------------------------------------------------------------
 
     def _predict_population(self, population: List[Dict]) -> List[Dict]:
-        # objective_weights/use_bytes_tps are opt-in (see __init__): pass
-        # them through to score_hybrid only when at least one is set, else
-        # call exactly as before (no extra args) -- keeps the default path
-        # byte-identical for the seed-pinned regression fixture.
-        tunable = self.objective_weights is not None or self.use_bytes_tps
+        # objective_weights/use_bytes_tps/use_stream_tps are opt-in (see
+        # __init__): pass them through to score_hybrid only when at least
+        # one is set, else call exactly as before (no extra args) -- keeps
+        # the default path byte-identical for the seed-pinned regression
+        # fixture. use_stream_tps MUST be included in this gate on its own:
+        # without it, --stream-tps alone (objective_weights=None,
+        # use_bytes_tps=False) would never take this branch and would never
+        # reach score_hybrid.
+        tunable = (
+            self.objective_weights is not None
+            or self.use_bytes_tps
+            or self.use_stream_tps
+        )
         for candidate in population:
             if tunable:
                 precision_weight, size_weight, speed_weight = (
@@ -750,6 +766,7 @@ class EvolutionarySurvivor:
                     size_weight=size_weight,
                     speed_weight=speed_weight,
                     use_bytes_tps=self.use_bytes_tps,
+                    use_stream_tps=self.use_stream_tps,
                 )
             else:
                 scores = self.predictor.score_hybrid(candidate['config'])

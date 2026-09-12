@@ -18,11 +18,17 @@ with an importance matrix), noise factors for imatrix-consuming schemes
 see `magicquant.quant.schemes.effective_noise_factor`.
 """
 
+import logging
 from typing import Dict, List, Optional
 
 from magicquant.quant import calibration
 from magicquant.quant.schemes import effective_noise_factor, get_scheme_by_name
 from magicquant.utils.naming import config_key as _naming_config_key
+
+# Stdlib logging, deliberately -- NOT magicquant.logging.get_logger (structlog
+# on a PrintLoggerFactory, never reaches pytest's caplog). See score_hybrid's
+# use_stream_tps/use_bytes_tps warning and its test in test_tps_objective.py.
+log = logging.getLogger(__name__)
 
 # Default coefficient for the non-linear "collapse" penalty applied when
 # multiple high-sensitivity ("brain") groups are compressed simultaneously.
@@ -63,6 +69,7 @@ class PredictiveScorer:
         imatrix_active: bool = False,
         calibration_source: str = "",
         effective_bpw: Optional[Dict[str, Dict[str, float]]] = None,
+        stream_weights: Optional[Dict[str, float]] = None,
     ):
         self.sensitivity_weights = sensitivity_weights
         self.parameter_counts = parameter_counts or {}
@@ -102,6 +109,16 @@ class PredictiveScorer:
         # the measured-search active-learning loop. Fixing that properly needs
         # a measured noise number per rewritten pair, not an inferred one.
         self.effective_bpw = effective_bpw or {}
+
+        # {group: weight in [0,1]} -- how often each group is actually read
+        # per decode token (Task 3's magicquant.v2.bandwidth.stream_weights_by_group),
+        # e.g. an MoE experts group X gets n_used/n_expert, not 1.0. Feeds
+        # predict_stream_gb/baseline_stream_gb and use_stream_tps in
+        # score_hybrid. Empty (default) makes both identical to
+        # predict_size/baseline_size_gb -- the historical, byte-size proxy --
+        # required for the seed-pinned regression fixture and every caller
+        # that doesn't pass this.
+        self.stream_weights = dict(stream_weights or {})
 
         # Learnable residual cache for active learning. Values are ALWAYS in
         # noise units -- see the "Active learning" section below for why that
@@ -185,6 +202,33 @@ class PredictiveScorer:
             return self.baseline_size_gb * (avg_bpw / 16.0)
 
         return self._estimate_simple_size(group_schemes)
+
+    @property
+    def baseline_stream_gb(self) -> float:
+        """BF16 baseline size weighted by how often each group is read per
+        decode token (literal 16 bpw; writer-compat rewrites never enter the
+        baseline). Equals baseline_size_gb when no weights are set."""
+        if not self.stream_weights or not self.parameter_counts or not self.baseline_size_gb:
+            return self.baseline_size_gb
+        total = sum(self.parameter_counts.values())
+        if total <= 0:
+            return self.baseline_size_gb
+        weighted = sum(self.stream_weights.get(g, 1.0) * p for g, p in self.parameter_counts.items())
+        return self.baseline_size_gb * weighted / total
+
+    def predict_stream_gb(self, group_schemes: Dict[str, str]) -> float:
+        """predict_size with each group's bytes scaled by its stream weight."""
+        if not self.baseline_size_gb or not self.parameter_counts:
+            return self.predict_size(group_schemes)
+        total_weighted_bits = 0.0
+        total_params = sum(self.parameter_counts.values())
+        for group, scheme in group_schemes.items():
+            params_in_group = self.parameter_counts.get(group, 0)
+            bits = self._bpw_for(group, scheme)
+            total_weighted_bits += self.stream_weights.get(group, 1.0) * params_in_group * bits
+        if total_params > 0:
+            return self.baseline_size_gb * ((total_weighted_bits / total_params) / 16.0)
+        return self.predict_size(group_schemes)
 
     def predict_tps(self, group_schemes: Dict[str, str]) -> float:
         """Predict inference speed (tokens/second) for a configuration."""
@@ -399,6 +443,7 @@ class PredictiveScorer:
         size_weight: float = 0.35,
         speed_weight: float = 0.15,
         use_bytes_tps: bool = False,
+        use_stream_tps: bool = False,
     ) -> Dict:
         """
         Score a hybrid configuration using weighted objectives.
@@ -415,7 +460,22 @@ class PredictiveScorer:
         unlike speed_multiplier. Off by default: byte-identical to the
         historical predict_tps-based scoring, required for the seed-pinned
         refactor-regression fixture.
+
+        use_stream_tps: MoE-correct variant of use_bytes_tps -- prices the
+        same bandwidth-bound proxy off predict_stream_gb/baseline_stream_gb
+        instead of predict_size/baseline_size_gb, so a routed-expert group's
+        bytes are discounted by how often decode actually reads them
+        (self.stream_weights, Task 3's stream_weights_by_group), rather than
+        treating stored file size as the per-token cost. Off by default:
+        stream_weights is empty unless explicitly supplied, so
+        predict_stream_gb/baseline_stream_gb equal predict_size/
+        baseline_size_gb and this is byte-identical to use_bytes_tps -- the
+        seed-pinned regression fixture never passes it. When both
+        use_bytes_tps and use_stream_tps are True, use_stream_tps wins (one
+        WARNING logged) -- it is the more accurate proxy.
         """
+        if use_stream_tps and use_bytes_tps:
+            log.warning("score_hybrid: use_stream_tps overrides use_bytes_tps")
         predicted_loss = self.predict_loss(group_schemes)
         predicted_size = self.predict_size(group_schemes)
         predicted_tps = self.predict_tps(group_schemes)
@@ -431,7 +491,15 @@ class PredictiveScorer:
         else:
             size_score = max(0.0, 1.0 - predicted_size)
 
-        if use_bytes_tps:
+        if use_stream_tps:
+            # Same [0,1] mapping as use_bytes_tps below, but off the stream-
+            # weighted proxy: baseline_stream_gb/predict_stream_gb discount
+            # groups (e.g. MoE experts X) by how often decode actually reads
+            # them, rather than pricing every stored byte as streamed.
+            speedup = self.baseline_stream_gb / max(self.predict_stream_gb(group_schemes), self._BYTES_TPS_EPS)
+            tps_score = (speedup - 1.0) / (self._BYTES_TPS_MAX_SPEEDUP - 1.0)
+            tps_score = min(1.0, max(0.0, tps_score))
+        elif use_bytes_tps:
             # Map the compression ratio to [0, 1] so it DISCRIMINATES across
             # the quantized range: baseline-sized -> 0, >=MAX_SPEEDUP-smaller
             # -> 1. (A bare min(1, baseline/predicted) saturates at 1.0 for

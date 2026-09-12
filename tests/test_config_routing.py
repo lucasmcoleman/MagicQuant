@@ -877,3 +877,27 @@ def test_cmd_imatrix_real_parser_has_llamacpp_path_flag(monkeypatch, tmp_path):
     cli.main()
 
     assert captured["imatrix_bin"] == str(bin_dir / "llama-imatrix")
+
+
+def test_cmd_search_v2_stream_tps_named_in_ignored_v1_flags_warning(monkeypatch, capsys):
+    """--stream-tps (Task 7) is a v1-only scoring knob: _run_v2_search's
+    V2Config construction reads no such attribute, so cmd_search must name
+    it in the ignored-v1-flags warning, mirroring --bytes-tps above."""
+    calls = []
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search", lambda cfg: calls.append(cfg) or {}
+    )
+
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--stream-tps",
+        ],
+    )
+    cli.main()
+
+    assert len(calls) == 1, "the v2 search must still run"
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "--stream-tps" in out

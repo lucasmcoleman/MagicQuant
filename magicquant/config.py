@@ -59,6 +59,11 @@ class MagicQuantSettings(BaseSettings):
     # explicitly opted into.
     speed_weight: Optional[float] = None
     use_bytes_tps: bool = False
+    # MoE-correct variant of use_bytes_tps: scores from predicted STREAMED
+    # bytes per decode token (routed experts discounted by measured
+    # n_used/n_expert) instead of stored size. Off by default; wins over
+    # use_bytes_tps (with a warning) if both are set.
+    use_stream_tps: bool = False
     # Cross-run noise calibration (magicquant/quant/calibration.py): off by
     # default so predictor noise factors/speed multipliers keep reading the
     # fixed tools/calibration_results.json path (or the static registry)

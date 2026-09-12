@@ -238,9 +238,15 @@ def test_predict_population_forwards_objective_weights():
     predictor = _RecordingPredictor()
     survivor = _survivor(predictor, objective_weights=(0.3, 0.2, 0.5))
     survivor._predict_population([{"config": {"E": "BF16"}}])
+    # Task 7: the tunable branch now also always threads use_stream_tps
+    # (default False) alongside use_bytes_tps -- see survival.py's
+    # _predict_population, whose gate must include use_stream_tps so
+    # --stream-tps alone can reach score_hybrid (see the survivor tests
+    # below). Adapting this pre-existing exact-dict assertion for that new
+    # kwarg; use_bytes_tps's own numerics/threading are unchanged.
     assert predictor.calls == [{
         "precision_weight": 0.3, "size_weight": 0.2, "speed_weight": 0.5,
-        "use_bytes_tps": False,
+        "use_bytes_tps": False, "use_stream_tps": False,
     }]
 
 
@@ -253,7 +259,21 @@ def test_predict_population_forwards_use_bytes_tps_alone():
     survivor._predict_population([{"config": {"E": "BF16"}}])
     assert predictor.calls == [{
         "precision_weight": 0.50, "size_weight": 0.35, "speed_weight": 0.15,
-        "use_bytes_tps": True,
+        "use_bytes_tps": True, "use_stream_tps": False,
+    }]
+
+
+def test_predict_population_forwards_use_stream_tps_alone():
+    """use_stream_tps=True with objective_weights/use_bytes_tps left at
+    their defaults still routes through score_hybrid's default
+    0.50/0.35/0.15 weights -- only use_stream_tps changes. Mirrors
+    test_predict_population_forwards_use_bytes_tps_alone above."""
+    predictor = _RecordingPredictor()
+    survivor = _survivor(predictor, use_stream_tps=True)
+    survivor._predict_population([{"config": {"E": "BF16"}}])
+    assert predictor.calls == [{
+        "precision_weight": 0.50, "size_weight": 0.35, "speed_weight": 0.15,
+        "use_bytes_tps": False, "use_stream_tps": True,
     }]
 
 
@@ -261,6 +281,7 @@ def test_objective_weights_and_use_bytes_tps_default_to_none_false():
     survivor = _survivor(_RecordingPredictor())
     assert survivor.objective_weights is None
     assert survivor.use_bytes_tps is False
+    assert survivor.use_stream_tps is False
 
 
 # ── MagicQuantOrchestrator._build_objective_weights ──────────────────────
@@ -445,3 +466,60 @@ def test_build_objective_weights_clamps_out_of_range_speed_weight():
     assert all(w >= 0 for w in hi) and hi[2] == pytest.approx(1.0)
     lo = O._build_objective_weights(-0.5)
     assert lo[2] == pytest.approx(0.0) and sum(lo) == pytest.approx(1.0)
+
+
+# ── Task 7: opt-in stream-weighted speed proxy (--stream-tps) ───────────
+
+
+def _stream_scorer(**kw):
+    return PredictiveScorer({"U": 1.0, "X": 1.0, "H": 1.0},
+                            parameter_counts={"U": 1_000, "X": 30_000, "H": 500},
+                            baseline_size_gb=10.0, **kw)
+
+
+def test_predict_stream_gb_equals_predict_size_without_weights():
+    s = _stream_scorer()
+    cfg = {"U": "Q8_0", "X": "Q4_K_M", "H": "Q6_K"}
+    assert s.predict_stream_gb(cfg) == pytest.approx(s.predict_size(cfg), abs=1e-9)
+    assert s.baseline_stream_gb == pytest.approx(s.baseline_size_gb)
+
+
+def test_predict_stream_gb_discounts_cold_experts():
+    s = _stream_scorer(stream_weights={"X": 0.03})
+    cfg = {"U": "Q8_0", "X": "Q4_K_M", "H": "Q6_K"}
+    assert s.predict_stream_gb(cfg) < 0.2 * s.predict_size(cfg)
+
+
+def test_use_stream_tps_changes_score_only_with_weights():
+    cfg = {"U": "Q8_0", "X": "Q4_K_M", "H": "Q6_K"}
+    a = _stream_scorer().score_hybrid(cfg, use_bytes_tps=True)["tps_score"]
+    b = _stream_scorer().score_hybrid(cfg, use_stream_tps=True)["tps_score"]
+    assert a == pytest.approx(b)
+    c = _stream_scorer(stream_weights={"X": 0.03}).score_hybrid(cfg, use_stream_tps=True)["tps_score"]
+    assert c != pytest.approx(a)
+    assert 0.0 <= c <= 1.0
+
+
+def test_survivor_with_only_use_stream_tps_reaches_score_hybrid():
+    # the survival.py:739 gate: use_stream_tps alone must take the tunable path
+    # NOTE (brief adaptation): EvolutionarySurvivor.__init__ requires
+    # baseline_config (no default) -- the brief's sketch `EvolutionarySurvivor(s)`
+    # doesn't construct. Copying the existing _survivor(predictor, **kw) helper's
+    # construction from this file (~line 225-230): baseline_config={}.
+    s = _stream_scorer(stream_weights={"X": 0.03})
+    pop = [{"config": {"U": "Q8_0", "X": "Q4_K_M", "H": "Q6_K"}}]
+    default = EvolutionarySurvivor(s, baseline_config={})._predict_population([dict(pop[0])])[0]["tps_score"]
+    streamed = EvolutionarySurvivor(
+        s, baseline_config={}, use_stream_tps=True
+    )._predict_population([dict(pop[0])])[0]["tps_score"]
+    assert streamed != pytest.approx(default)
+
+
+def test_use_stream_tps_wins_over_use_bytes_tps_with_warning(caplog):
+    import logging
+    cfg = {"U": "Q8_0", "X": "Q4_K_M", "H": "Q6_K"}
+    s = _stream_scorer(stream_weights={"X": 0.03})
+    with caplog.at_level(logging.WARNING, logger="magicquant.evolution.predictor"):
+        both = s.score_hybrid(cfg, use_bytes_tps=True, use_stream_tps=True)["tps_score"]
+    assert both == pytest.approx(s.score_hybrid(cfg, use_stream_tps=True)["tps_score"])
+    assert any("use_stream_tps" in r.getMessage() for r in caplog.records)

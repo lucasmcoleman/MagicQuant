@@ -131,6 +131,16 @@ class MagicQuantOrchestrator:
         # rewritten Q5_K at 5.5 bpw instead of the 8.5 it really costs, always
         # prefers it to Q5_0, and the block-32 schemes never get chosen.
         self._effective_bpw: Dict[str, Dict[str, float]] = {}
+        # {group: weight in [0,1]} from Task 3's
+        # magicquant.v2.bandwidth.stream_weights_by_group -- how often each
+        # group is actually read per decode token on THIS model (e.g. an MoE
+        # experts group X gets its measured n_used/n_expert ratio, not 1.0).
+        # Handed to PredictiveScorer as stream_weights for use_stream_tps.
+        # None until _estimate_model_size derives it (mirrors _effective_bpw's
+        # "no information yet" default); also None if derivation fails --
+        # never fatal, v1 just prices every byte as streamed (today's
+        # behaviour).
+        self._stream_weights: Optional[Dict[str, float]] = None
 
         # Detected search groups (includes X/R/S when present), populated by
         # the search methods and passed to run_evolution.
@@ -574,6 +584,7 @@ class MagicQuantOrchestrator:
         resume: bool = True,
         speed_weight: Optional[float] = None,
         use_bytes_tps: bool = False,
+        use_stream_tps: bool = False,
         write_calibration: bool = False,
         calibration_source: str = "",
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
@@ -766,6 +777,13 @@ class MagicQuantOrchestrator:
                 from predicted size (``PredictiveScorer.score_hybrid``'s
                 bandwidth-bound proxy) instead of the noisy per-scheme
                 speed_multiplier path. Off by default (unchanged scoring).
+            use_stream_tps: MoE-correct variant of use_bytes_tps -- scores
+                from predicted STREAMED bytes per decode token (routed
+                experts discounted by their measured n_used/n_expert ratio,
+                see ``self._stream_weights``/Task 3's
+                ``stream_weights_by_group``) instead of stored size. Off by
+                default (unchanged scoring); wins over use_bytes_tps with a
+                warning if both are set.
             write_calibration: after a successful measured search, fit
                 per-scheme noise factors from THIS run's measurements +
                 sensitivity weights (mirrors ``tools/fit_noise_factors.py``)
@@ -1170,6 +1188,7 @@ class MagicQuantOrchestrator:
                 stream_aware=stream_aware,
                 objective_weights=objective_weights,
                 use_bytes_tps=use_bytes_tps,
+                use_stream_tps=use_stream_tps,
                 block32_only_groups=self.block32_only_groups,
             )
 
@@ -1570,6 +1589,11 @@ class MagicQuantOrchestrator:
             # costs. Empty for ordinary models, which is exactly the
             # historical behaviour.
             effective_bpw=self._effective_bpw,
+            # How often each group is actually read per decode token on THIS
+            # model (Task 3's stream_weights_by_group). None/empty for
+            # ordinary models or when derivation failed, which is exactly
+            # PredictiveScorer's historical behaviour (stream_weights={}).
+            stream_weights=self._stream_weights,
         )
 
     def _record_candidate_measurement(
@@ -2652,6 +2676,7 @@ class MagicQuantOrchestrator:
         seed_incumbents: bool = True,
         speed_weight: Optional[float] = None,
         use_bytes_tps: bool = False,
+        use_stream_tps: bool = False,
         calibration_source: str = "",
     ) -> Tuple[List[Dict], Dict[str, Dict]]:
         """
@@ -2679,8 +2704,8 @@ class MagicQuantOrchestrator:
         evolutionary search's population so the incumbent mixtures are
         always among the discovered/scored configs. On by default.
 
-        speed_weight/use_bytes_tps: same tunable-objective knobs as
-        run_measured_search (see its docstring and
+        speed_weight/use_bytes_tps/use_stream_tps: same tunable-objective
+        knobs as run_measured_search (see its docstring and
         ``_build_objective_weights``) -- ``None``/``False`` (default) leaves
         the search's scoring unchanged.
 
@@ -2782,6 +2807,7 @@ class MagicQuantOrchestrator:
             stream_aware=stream_aware,
             objective_weights=self._build_objective_weights(speed_weight),
             use_bytes_tps=use_bytes_tps,
+            use_stream_tps=use_stream_tps,
             block32_only_groups=self.block32_only_groups,
         )
 
@@ -3448,6 +3474,12 @@ class MagicQuantOrchestrator:
                     g for g, ok in block32_candidates.items() if ok
                 }
                 self._effective_bpw = self._build_effective_bpw(group_tensors)
+                try:
+                    from magicquant.v2.bandwidth import stream_weights_by_group
+                    self._stream_weights = stream_weights_by_group(src.get_metadata(), log=log)
+                except Exception as exc:  # never fatal: today's pricing
+                    log.warning("stream weights unavailable (%s); v1 prices every byte as streamed", exc)
+                    self._stream_weights = None
                 # Store for the predictor (drop UNKNOWN so it doesn't skew
                 # group-relative shares; its weights still count toward size).
                 self._param_counts = {

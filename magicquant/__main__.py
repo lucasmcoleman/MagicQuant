@@ -158,6 +158,7 @@ def _settings_from_args(args: argparse.Namespace):
     _maybe("measurement_chunks", "measurement_chunks")
     _maybe("speed_weight", "speed_weight")
     _maybe("use_bytes_tps", "use_bytes_tps")
+    _maybe("use_stream_tps", "use_stream_tps")
     _maybe("write_calibration", "write_calibration")
     _maybe("calibration_source", "calibration_source")
     _maybe("algo", "algo")
@@ -193,6 +194,7 @@ _V2_IGNORED_V1_FLAGS = (
     ("--head-aggressive", "head_aggressive"),
     ("--speed-weight", "speed_weight"),
     ("--bytes-tps", "use_bytes_tps"),
+    ("--stream-tps", "use_stream_tps"),
     ("--write-calibration", "write_calibration"),
     ("--calibration-source", "calibration_source"),
     ("--target-quant", "target_quant"),
@@ -361,6 +363,7 @@ def cmd_search(args: argparse.Namespace) -> None:
             measurement_chunks=settings.measurement_chunks,
             speed_weight=settings.speed_weight,
             use_bytes_tps=settings.use_bytes_tps,
+            use_stream_tps=settings.use_stream_tps,
             write_calibration=settings.write_calibration,
             calibration_source=settings.calibration_source,
         )
@@ -382,6 +385,7 @@ def cmd_search(args: argparse.Namespace) -> None:
             measurement_chunks=settings.measurement_chunks,
             speed_weight=settings.speed_weight,
             use_bytes_tps=settings.use_bytes_tps,
+            use_stream_tps=settings.use_stream_tps,
             calibration_source=settings.calibration_source,
         )
 
@@ -959,6 +963,15 @@ def main() -> None:
         help="Score speed deterministically from predicted size (a "
              "memory-bandwidth-bound proxy) instead of the noisy per-scheme "
              "speed_multiplier (default: MAGICQUANT_USE_BYTES_TPS or off)",
+    )
+    search_parser.add_argument(
+        "--stream-tps",
+        dest="use_stream_tps",
+        action="store_true",
+        default=None,
+        help="Score speed from predicted STREAMED bytes per decode token (trunk read every "
+             "token, routed experts n_used/n_expert of the time) instead of stored size; "
+             "MoE-correct variant of --bytes-tps (default: MAGICQUANT_USE_STREAM_TPS or off)",
     )
     search_parser.add_argument(
         "--write-calibration",
