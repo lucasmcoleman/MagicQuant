@@ -53,6 +53,14 @@ def clf():
     # --- SSM / norms ---
     ("blk.0.ssm_in.weight", "S"),
     ("blk.0.attn_norm.weight", "N"),
+    # --- qwen4exp hyper-connection mixers: small per-token residual projections, O ---
+    ("blk.3.hc_attn_up.weight", "O"),
+    ("blk.3.hc_attn_down.weight", "O"),
+    ("blk.3.hc_ffn_inject.weight", "O"),
+    ("output_hc_down.weight", "O"),
+    # --- per-layer embedding table (row-gathered): E. Regression pin — this
+    # already classifies to E by substring; the explicit pattern documents it. ---
+    ("per_layer_token_embd.weight", "E"),
 ])
 def test_classify(clf, name, expected):
     assert clf.classify_tensor(name) == expected, f"{name} -> {clf.classify_tensor(name)}"
@@ -114,6 +122,10 @@ _KNOWN_ARCH_NAMES = [
     "blk.46.nextn.shared_head.head.weight",
     "blk.46.nextn.enorm.weight",
     "model.visual.patch_embed.weight",
+    "per_layer_token_embd.weight",
+    "blk.3.hc_attn_up.weight",
+    "blk.3.hc_ffn_inject.weight",
+    "output_hc_down.weight",
 ]
 
 

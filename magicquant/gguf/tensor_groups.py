@@ -39,7 +39,10 @@ class TensorGroupClassifier:
         'V': [r'model\.visual\.', r'vision_model\.', r'visual\.'],
         'N': [r'_norm\.weight$', r'layernorm', r'_norm\.bias$',
               r'q_norm\.weight$', r'k_norm\.weight$'],
-        'E': [r'token_embd\.weight'],
+        # per_layer_token_embd: the per-layer (PLE / n-gram) embedding table
+        # (gemma-3n, qwen4exp). Row-gathered like token_embd, so group E.
+        # Explicit for documentation: the generic pattern already matches it.
+        'E': [r'per_layer_token_embd\.weight', r'token_embd\.weight'],
         # mtp./nextn.: multi-token-prediction layers (llama.cpp names them
         # blk.N.nextn.{eh_proj,embed_tokens,shared_head...} across GLM/DeepSeek/
         # Qwen3.5 MTP arches). Head-adjacent: they predict tokens, so treat them
@@ -62,7 +65,13 @@ class TensorGroupClassifier:
         'K': [r'attn_k\.weight', r'attn_v\.weight'],
         # attn_gate: Qwen3.5 gated attention -- a per-head gate multiplied into
         # the attention output, so it shares O's sensitivity band.
-        'O': [r'attn_output\.weight', r'attn_gate\.weight'],
+        # hc_*: qwen4exp hyper-connection residual mixers (blk.N.hc_attn_up/
+        # down/inject, blk.N.hc_ffn_inject, output_hc_up/down). Small, on the
+        # per-token path, quantisable; O is the closest band. Must come before
+        # U/D so 'hc_ffn_inject' is not caught by the generic ffn patterns.
+        'O': [r'attn_output\.weight', r'attn_gate\.weight',
+              r'hc_(attn|ffn)_(up|down|inject)\.weight',
+              r'^output_hc_(up|down)\.weight'],
         'S': [r'linear_attn\.', r'mamba\.', r'ssm\.', r'ssm_'],
         'U': [r'ffn_up', r'ffn_gate(?!_inp)', r'ffn_up_shared',
               r'shared_mlp\.input_linear'],
