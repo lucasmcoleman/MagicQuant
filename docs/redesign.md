@@ -546,3 +546,5 @@ untouched. It is the fallback route for the validation campaign in
 Ornith-1.5-35B-A3B at equal payload size under three gates (streamed bytes
 lower; KL vs BF16 not worse, re-measured in-session; measured decode faster)
 before anything is republished.
+
+See also the README section "Streamed bytes and MoE" for the CLI recipe.
