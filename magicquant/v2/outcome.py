@@ -33,6 +33,22 @@ class BudgetInfeasibleError(RuntimeError):
         )
 
 
+class BandwidthInfeasibleError(RuntimeError):
+    """The requested streamed-bytes budget (--budget-bw-gb) is below the
+    smallest streamed-bytes figure any allocation under the storage budget
+    can reach. Carries ``min_bytes`` so callers can report what IS achievable."""
+
+    def __init__(self, budget_bytes: int, min_bytes: int):
+        self.budget_bytes = budget_bytes
+        self.min_bytes = min_bytes
+        super().__init__(
+            f"Streamed-bytes budget {budget_bytes / 1024**3:.2f} GiB/token is "
+            f"infeasible: the least any allocation streams under the storage "
+            f"budget is {min_bytes / 1024**3:.2f} GiB/token. Raise --budget-bw-gb, "
+            "raise --budget-gb, or enable more aggressive schemes."
+        )
+
+
 @dataclass
 class MeasurementOutcome:
     """One build/measure step's result — success OR recorded failure."""

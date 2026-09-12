@@ -16,7 +16,11 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter, defaultdict
-from typing import Any, Dict, Mapping, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+
+from magicquant.v2.allocate import Allocation, Unit, allocate
+from magicquant.v2.outcome import BandwidthInfeasibleError
 
 KNOWN_GROUPS = frozenset({"E", "H", "X", "R", "Q", "K", "O", "S", "U", "D", "N", "V", "UNKNOWN"})
 
@@ -231,3 +235,144 @@ def group_view(w_stream: Mapping[str, float], table_tensors: Mapping[str, Mappin
     exceptions = {name: w_stream.get(name, 1.0) for name, entry in table_tensors.items()
                   if w_stream.get(name, 1.0) != by_group[entry.get("group", "UNKNOWN")]}
     return by_group, exceptions
+
+
+LAM_MAX = 1e9          # feasibility probe only -- never returned as the chosen lambda
+LAM_MIN = 1e-6
+BISECTION_STEPS = 40
+
+
+def _count_inversions(probes: Sequence[Tuple[float, int]]) -> int:
+    """Number of probe pairs (i < j) where lambda rose but streamed bytes rose
+    too -- evidence that S(lambda) is not monotone (allocate.py drops a unit
+    permanently once its next edge exceeds the remaining budget)."""
+    n = 0
+    for i in range(len(probes)):
+        for j in range(i + 1, len(probes)):
+            if probes[i][0] < probes[j][0] and probes[i][1] < probes[j][1]:
+                n += 1
+    return n
+
+
+BuildUnits = Callable[[Dict[str, Any], Mapping[str, float], Mapping[str, str], Mapping[str, float], float], List[Unit]]
+
+
+@dataclass
+class BandwidthSolution:
+    """The chosen lambda, the resulting Allocation, and enough context to
+    report why: bpw/streamed-bytes at both lambda=0 and the chosen lambda,
+    the bisection's non-monotonicity count, and the stream-weight provenance
+    used to compute it. Spec: /server/ai/docs/specs/magicquant-bandwidth.md §2.3."""
+
+    mode: str                                   # "off" | "weight" | "budget"
+    lam: float
+    chosen: Allocation
+    w_stream: Dict[str, float]
+    by_group: Dict[str, float]
+    exceptions: Dict[str, float]
+    weights_source: Dict[str, Any]
+    streamed_bytes: int
+    streamed_bytes_lambda0: int
+    streamed_bytes_min: Optional[int]
+    budget_bw_bytes: Optional[int]
+    nonmonotone_probes: int
+    predicted_loss_pure: float
+    total_loss_with_lambda: float
+    bpw_lambda0: Dict[str, float] = field(default_factory=dict)
+    bpw_chosen: Dict[str, float] = field(default_factory=dict)
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "lambda": self.lam,
+            "stream_weights": {"observed_by_group": self.by_group, "default": 1.0, "exceptions": self.exceptions},
+            "weights_source": self.weights_source,
+            "streamed_bytes": self.streamed_bytes,
+            "streamed_bytes_lambda0": self.streamed_bytes_lambda0,
+            "streamed_bytes_min": self.streamed_bytes_min,
+            "budget_bw_bytes": self.budget_bw_bytes,
+            "nonmonotone_probes": self.nonmonotone_probes,
+            "predicted_loss_pure": self.predicted_loss_pure,
+            "total_loss_with_lambda": self.total_loss_with_lambda,
+            "bpw_by_group": {"lambda0": self.bpw_lambda0, "chosen": self.bpw_chosen},
+        }
+
+
+def solve_bandwidth(build_units: BuildUnits, table: Dict[str, Any], kappa: Mapping[str, float],
+                    floors: Mapping[str, str], w_stream: Mapping[str, float],
+                    budget_bytes: int, budget_bw_bytes: Optional[int], *,
+                    lam_fixed: Optional[float] = None,
+                    weights_source: Optional[Dict[str, Any]] = None, log=None) -> BandwidthSolution:
+    """Choose lambda and the allocation. The storage budget is always hard
+    (enforced inside allocate()); lambda only steers which bytes are spent.
+    Spec section 2.3.
+
+    ``build_units`` is supplied by the caller (search.py's ``_build_units``
+    in production, a local builder in tests) so this module never imports
+    search.py -- that would cycle, since search.py calls solve_bandwidth."""
+    tensors = table["tensors"]
+    kappa = dict(kappa)
+    if lam_fixed is not None and budget_bw_bytes is not None:
+        raise ValueError("bandwidth_weight and budget_bw_gb are mutually exclusive")
+    probes: List[Tuple[float, int]] = []
+
+    def solve(lam: float):
+        alloc = allocate(build_units(table, kappa, floors, w_stream, lam), budget_bytes)
+        s = streamed_bytes(alloc.assignment, tensors, w_stream)
+        probes.append((lam, s))
+        return alloc, s
+
+    def finish(mode, lam, alloc, s, s0, s_min, nonmono, a0):
+        by_group, exceptions = group_view(w_stream, tensors, log=log)
+        return BandwidthSolution(
+            mode=mode, lam=lam, chosen=alloc, w_stream=dict(w_stream),
+            by_group=by_group,
+            exceptions=exceptions,
+            weights_source=dict(weights_source or {}),
+            streamed_bytes=s, streamed_bytes_lambda0=s0, streamed_bytes_min=s_min,
+            budget_bw_bytes=budget_bw_bytes if mode == "budget" else None,
+            nonmonotone_probes=nonmono,
+            predicted_loss_pure=pure_loss(alloc.assignment, tensors, kappa),
+            total_loss_with_lambda=alloc.total_loss,
+            bpw_lambda0=bpw_by_group(a0.assignment, tensors),
+            bpw_chosen=bpw_by_group(alloc.assignment, tensors),
+        )
+
+    a0, s0 = solve(0.0)
+    if lam_fixed is not None:
+        a, s = solve(float(lam_fixed))
+        return finish("weight", float(lam_fixed), a, s, s0, None, 0, a0)
+    if budget_bw_bytes is None:
+        return finish("off", 0.0, a0, s0, s0, None, 0, a0)
+    B = int(budget_bw_bytes)
+    if s0 <= B:
+        return finish("budget", 0.0, a0, s0, s0, None, 0, a0)
+    _, s_min = solve(LAM_MAX)
+    if s_min > B:
+        raise BandwidthInfeasibleError(B, s_min)
+    lo, hi = LAM_MIN, LAM_MAX
+    best_alloc: Optional[Allocation] = None
+    best_lam = 0.0
+    best_s = 0
+    best_pure = math.inf
+    for _ in range(BISECTION_STEPS):
+        mid = math.sqrt(lo * hi)
+        a, s = solve(mid)
+        if s <= B:
+            hi = mid
+            pl = pure_loss(a.assignment, tensors, kappa)
+            if best_alloc is None or pl < best_pure:
+                best_alloc, best_lam, best_s, best_pure = a, mid, s, pl
+        else:
+            lo = mid
+    nonmono = _count_inversions(probes)
+    if best_alloc is None:
+        raise RuntimeError(
+            f"bandwidth: bisection found no feasible lambda although the streamed-bytes "
+            f"floor {s_min / 1024**3:.3f} GiB <= budget {B / 1024**3:.3f} GiB; "
+            f"S(lambda) is non-monotone ({nonmono} inversions over {len(probes)} probes)"
+        )
+    assert best_s <= B and best_alloc.total_bytes <= budget_bytes
+    if nonmono and log is not None:
+        log.warning("bandwidth: S(lambda) non-monotone (%d inversions over %d probes)", nonmono, len(probes))
+    return finish("budget", best_lam, best_alloc, best_s, s0, s_min, nonmono, a0)

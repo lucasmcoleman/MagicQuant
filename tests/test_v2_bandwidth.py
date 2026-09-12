@@ -325,3 +325,121 @@ def test_float_entry_default_metadata_prices_hot(monkeypatch, tmp_path, caplog):
                               {"general.architecture": "llama"}, log=logging.getLogger("t"))
     assert w["blk.0.ffn_down_exps.weight"] == 1.0
     assert any("expert_count" in r.getMessage() for r in caplog.records)
+
+from magicquant.v2.allocate import Choice, Unit, allocate  # noqa: E402
+from magicquant.v2 import BandwidthInfeasibleError  # noqa: E402
+
+
+def _moe_table():
+    """X carries ~95% of bytes at w=0.03; U and H are hot (w=1); N is fixed."""
+    def ch(bf, q6, q6w, q4, q4w):
+        return {"BF16": {"actual": "BF16", "bytes": bf, "werr": 0.0},
+                "Q6_K": {"actual": "Q6_K", "bytes": q6, "werr": q6w},
+                "Q4_K_M": {"actual": "Q4_K_M", "bytes": q4, "werr": q4w}}
+    t = {}
+    for i in range(4):
+        t[f"blk.{i}.ffn_down_exps.weight"] = _entry("X", (8, 64, 64), choices=ch(65536, 26880, 0.02, 18432, 0.08))
+        t[f"blk.{i}.attn_q.weight"] = _entry("U", (64, 64), choices=ch(8192, 3360, 0.05, 2304, 0.20))
+    t["output.weight"] = _entry("H", (128, 64), choices=ch(16384, 6720, 0.05, 4608, 0.25))
+    t["output_norm.weight"] = _entry("N", (64,), fixed=True, choices={"F32": {"actual": "F32", "bytes": 256, "werr": 0.0}})
+    return t
+
+
+def _build_units(table, kappa, floors, w_stream, lam):
+    units = []
+    for name, entry in table["tensors"].items():
+        if entry.get("fixed"):
+            (s, c), = entry["choices"].items()
+            units.append(Unit(name=name, group=entry["group"], choices=[Choice(s, c["actual"], int(c["bytes"]), 0.0)]))
+            continue
+        k = kappa.get(entry["group"], 1.0)
+        chs = []
+        for s, c in entry["choices"].items():
+            loss = k * float(c["werr"])
+            if lam:
+                loss += lam * w_stream.get(name, 1.0) * int(c["bytes"]) / 2**30
+            chs.append(Choice(s, c["actual"], int(c["bytes"]), loss))
+        units.append(Unit(name=name, group=entry["group"], choices=chs))
+    return units
+
+
+def _solve(budget_bytes, budget_bw_bytes=None, lam_fixed=None):
+    table = {"tensors": _moe_table()}
+    w = bw.stream_weights(table["tensors"], {"general.architecture": "m", "m.expert_count": 100, "m.expert_used_count": 3})
+    return bw.solve_bandwidth(_build_units, table, {"X": 1.0, "U": 1.0, "H": 1.0}, {}, w,
+                              budget_bytes, budget_bw_bytes, lam_fixed=lam_fixed), table, w
+
+
+def test_mode_off_is_lambda_zero():
+    sol, table, w = _solve(budget_bytes=200_000)
+    assert sol.mode == "off" and sol.lam == 0.0
+    assert sol.streamed_bytes == sol.streamed_bytes_lambda0 == bw.streamed_bytes(sol.chosen.assignment, table["tensors"], w)
+    assert sol.streamed_bytes_min is None and sol.budget_bw_bytes is None
+    assert sol.predicted_loss_pure == pytest.approx(sol.chosen.total_loss)
+
+
+def _s_min(budget_bytes=200_000):
+    table = {"tensors": _moe_table()}
+    w = bw.stream_weights(table["tensors"], {"general.architecture": "m", "m.expert_count": 100, "m.expert_used_count": 3})
+    a = allocate(_build_units(table, {"X": 1.0, "U": 1.0, "H": 1.0}, {}, w, bw.LAM_MAX), budget_bytes)
+    return bw.streamed_bytes(a.assignment, table["tensors"], w)
+
+
+def test_budget_mode_moves_bits_from_experts_to_trunk():
+    sol0, table, w = _solve(budget_bytes=200_000)
+    target = (sol0.streamed_bytes_lambda0 + _s_min()) // 2          # strictly inside (s_min, s0)
+    sol, _, _ = _solve(budget_bytes=200_000, budget_bw_bytes=target)
+    assert sol.mode == "budget" and sol.lam > 0.0
+    assert sol.streamed_bytes <= sol.budget_bw_bytes
+    assert sol.chosen.total_bytes <= 200_000
+    assert sol.streamed_bytes < sol.streamed_bytes_lambda0
+    # direction: hot groups (U, H) LOSE bpw; cold X GAINS or holds
+    assert sol.bpw_chosen["U"] + sol.bpw_chosen["H"] < sol.bpw_lambda0["U"] + sol.bpw_lambda0["H"]
+    assert sol.bpw_chosen["X"] >= sol.bpw_lambda0["X"]
+    assert sol.predicted_loss_pure < sol.total_loss_with_lambda
+    assert sol.predicted_loss_pure == pytest.approx(bw.pure_loss(sol.chosen.assignment, table["tensors"], {"X": 1.0, "U": 1.0, "H": 1.0}))
+
+
+def test_both_modes_is_an_error():
+    with pytest.raises(ValueError):
+        _solve(budget_bytes=200_000, budget_bw_bytes=60_000, lam_fixed=0.01)
+
+
+def test_count_inversions():
+    assert bw._count_inversions([(1e-3, 100), (1e-2, 90), (1e-1, 80)]) == 0
+    assert bw._count_inversions([(1e-3, 100), (1e-2, 90), (1e-1, 95), (1.0, 80)]) == 1
+    assert bw._count_inversions([]) == 0
+
+
+def test_budget_already_met_returns_lambda_zero():
+    sol0, _, _ = _solve(budget_bytes=200_000)
+    sol, _, _ = _solve(budget_bytes=200_000, budget_bw_bytes=sol0.streamed_bytes_lambda0 * 2)
+    assert sol.mode == "budget" and sol.lam == 0.0
+
+
+def test_infeasible_budget_raises_and_never_returns_lam_max():
+    with pytest.raises(BandwidthInfeasibleError) as ei:
+        _solve(budget_bytes=200_000, budget_bw_bytes=1)
+    assert ei.value.budget_bytes == 1 and ei.value.min_bytes > 1
+
+
+def test_weight_mode_reports_given_lambda():
+    sol, _, _ = _solve(budget_bytes=200_000, lam_fixed=0.05)
+    assert sol.mode == "weight" and sol.lam == 0.05
+
+
+def test_determinism():
+    a, _, _ = _solve(budget_bytes=200_000, budget_bw_bytes=60_000)
+    b, _, _ = _solve(budget_bytes=200_000, budget_bw_bytes=60_000)
+    assert a.chosen.assignment == b.chosen.assignment and a.lam == b.lam
+
+
+def test_to_json_shape():
+    sol, _, _ = _solve(budget_bytes=200_000, budget_bw_bytes=60_000)
+    j = sol.to_json()
+    assert set(j) == {"mode", "lambda", "stream_weights", "weights_source", "streamed_bytes",
+                      "streamed_bytes_lambda0", "streamed_bytes_min", "budget_bw_bytes",
+                      "nonmonotone_probes", "predicted_loss_pure", "total_loss_with_lambda", "bpw_by_group"}
+    assert set(j["stream_weights"]) == {"observed_by_group", "default", "exceptions"}
+    assert j["stream_weights"]["default"] == 1.0
+    assert set(j["bpw_by_group"]) == {"lambda0", "chosen"}
