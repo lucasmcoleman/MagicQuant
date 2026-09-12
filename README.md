@@ -382,15 +382,23 @@ runs; `mode: "off"` when neither flag above is passed) reports: `mode`
 (`observed_by_group`, `default`, `exceptions`), `weights_source`,
 `streamed_bytes` and `streamed_bytes_lambda0` (bytes/token at the chosen λ vs.
 at λ=0 — the delta this feature bought), `streamed_bytes_min` (the bisection
-floor, `budget` mode only), `budget_bw_bytes`, `nonmonotone_probes`,
-`predicted_loss_pure`, `total_loss_with_lambda`, and `bpw_by_group`
-(`lambda0` and `chosen` per-group bits-per-weight).
+floor, `budget` mode only — also `null` in `budget` mode when the budget was
+already met at λ=0, since the bisection never ran), `budget_bw_bytes`,
+`nonmonotone_probes`, `predicted_loss_pure`, `total_loss_with_lambda`,
+`storage_utilisation` (`chosen.total_bytes / budget_bytes` — logged as a
+WARNING when below 0.98, since at λ>0 the greedy can leave budget unspent),
+and `bpw_by_group` (`lambda0` and `chosen` per-group bits-per-weight).
 
-**Caveat:** `frontier.json`'s point losses are λ-inclusive (κ·ε plus the
+**Caveats:** `frontier.json`'s point losses are λ-inclusive (κ·ε plus the
 bandwidth term), while `allocation.predicted_loss` and every anchor's
 `predicted_loss` are pure κ·ε — `report_fit_affine` needs that to keep its
 meaning. `frontier.json["lambda"]` is the signal for whether/how much
-bandwidth pricing shaped a given run's frontier.
+bandwidth pricing shaped a given run's frontier. Because `storage_utilisation`
+can be below 1.0 at λ>0, **compare `allocation.total_bytes` across arms, not
+just the requested `--budget-gb`/`--budget-bw-gb`** — an arm may be
+materially smaller than another at the same nominal storage budget, and
+G1/G3-style speed/size comparisons must not be read as an allocation effect
+when they are partly a size effect.
 
 See [`docs/redesign.md` §11](docs/redesign.md#11-streamed-bytes-addendum-pricing-bytes-by-how-often-they-are-read)
 for the full design record.

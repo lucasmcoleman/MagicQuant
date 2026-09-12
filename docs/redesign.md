@@ -518,7 +518,8 @@ loss_eff(t, s) = κ_g · ε(t, s) + λ · w_t · bytes(t, s) / 2^30      (λ in 
 and `allocate()` is unchanged: `Choice.loss` was already opaque to the hull,
 greedy and polish. With `--budget-bw-gb B`, λ is found by log-space bisection
 so that the realised `Σ w_t · bytes` meets `B` while the storage budget stays a
-hard constraint; the smallest feasible λ wins, ties broken by pure κ·ε loss.
+hard constraint; the feasible probe with the lowest pure κ·ε loss wins (in
+practice the smallest feasible λ, since pure loss rises with λ).
 With `--bandwidth-weight λ` the term is applied at a fixed λ. Every published
 loss (`allocation.predicted_loss`, anchors, the reporting fit) is recomputed as
 pure κ·ε so `report_fit_affine` keeps its meaning; `frontier.json`'s point
@@ -529,8 +530,9 @@ losses are the effective loss and the file records `lambda`.
 The λ term subtracts `λ·w_t/2^30` from every hull-edge slope, so a `w=0` group
 (embeddings) is the one place a bandwidth budget does *not* penalise storage.
 Combined with the single-group-probe κ_E failure in §10, a large λ can pour
-freed storage into embeddings. The bisection returns the smallest feasible λ,
-`--floor E=Q6_K` remains the measured guardrail, and `v2_results.json` reports
+freed storage into embeddings. The bisection returns the feasible probe with
+the lowest pure κ·ε loss (in practice the smallest feasible λ), `--floor
+E=Q6_K` remains the measured guardrail, and `v2_results.json` reports
 per-group bpw at λ=0 and at the chosen λ so the shift is visible.
 
 ### v1
