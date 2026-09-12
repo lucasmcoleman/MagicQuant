@@ -65,9 +65,9 @@ def expert_ratio(metadata: Mapping[str, Any], *, log=None) -> Optional[float]:
         _warn(log, "stream weights: %s / %s missing or zero (%r / %r); "
                    "routed experts priced at w=1.0 (today's pricing)", key_n, key_k, n_raw, k_raw)
         return None
-    if k > n or k < 0:
+    if k > n or k <= 0:
         _warn(log, "stream weights: %s=%r is inconsistent with %s=%r (used-count > "
-                   "total, or negative); routed experts priced at w=1.0 (fails hot, not clamped)", key_k, k_raw, key_n, n_raw)
+                   "total, zero, or negative); routed experts priced at w=1.0 (fails hot, not clamped)", key_k, k_raw, key_n, n_raw)
         return None
     return min(1.0, max(0.0, k / n))
 
@@ -103,6 +103,8 @@ def stream_weights(table_tensors: Mapping[str, Mapping[str, Any]], metadata: Map
     overrides = dict(overrides or {})
     out: Dict[str, float] = {}
     unknown = 0
+    not_3d_in_x: List[str] = []
+    is_3d_not_x: List[str] = []
     for name, entry in table_tensors.items():
         group = entry.get("group", "UNKNOWN")
         shape = list(entry.get("shape") or [])
@@ -120,14 +122,20 @@ def stream_weights(table_tensors: Mapping[str, Mapping[str, Any]], metadata: Map
         else:
             w = 1.0
         if group == "X" and len(shape) != 3:
-            _warn(log, "stream weights: group-X tensor %s is not 3-D (shape %r)", name, shape)
+            not_3d_in_x.append(name)
         if group != "X" and len(shape) == 3:
-            _warn(log, "stream weights: 3-D tensor %s is in group %s, not X", name, group)
+            is_3d_not_x.append(name)
         if not (math.isfinite(w) and 0.0 <= w <= 1.0):
             raise ValueError(f"stream weight for {name!r} is not a finite value in [0,1]: {w!r}")
         out[name] = w
     if unknown:
         _warn(log, "stream weights: %d UNKNOWN-group tensor(s) priced at w=1.0", unknown)
+    if not_3d_in_x:
+        _warn(log, "stream weights: %d group-X tensor(s) not 3-D (first: %s)",
+              len(not_3d_in_x), ", ".join(not_3d_in_x[:3]))
+    if is_3d_not_x:
+        _warn(log, "stream weights: %d tensor(s) are 3-D but not X (first: %s)",
+              len(is_3d_not_x), ", ".join(is_3d_not_x[:3]))
     return out
 
 
@@ -278,6 +286,7 @@ class BandwidthSolution:
     nonmonotone_probes: int
     predicted_loss_pure: float
     total_loss_with_lambda: float
+    storage_utilisation: float
     bpw_lambda0: Dict[str, float] = field(default_factory=dict)
     bpw_chosen: Dict[str, float] = field(default_factory=dict)
 
@@ -294,6 +303,7 @@ class BandwidthSolution:
             "nonmonotone_probes": self.nonmonotone_probes,
             "predicted_loss_pure": self.predicted_loss_pure,
             "total_loss_with_lambda": self.total_loss_with_lambda,
+            "storage_utilisation": self.storage_utilisation,
             "bpw_by_group": {"lambda0": self.bpw_lambda0, "chosen": self.bpw_chosen},
         }
 
@@ -314,6 +324,10 @@ def solve_bandwidth(build_units: BuildUnits, table: Dict[str, Any], kappa: Mappi
     kappa = dict(kappa)
     if lam_fixed is not None and budget_bw_bytes is not None:
         raise ValueError("bandwidth_weight and budget_bw_gb are mutually exclusive")
+    if lam_fixed is not None and not (math.isfinite(lam_fixed) and lam_fixed >= 0.0):
+        raise ValueError(f"lam_fixed must be a finite value >= 0, got {lam_fixed!r}")
+    if budget_bw_bytes is not None and not (math.isfinite(budget_bw_bytes) and budget_bw_bytes > 0):
+        raise ValueError(f"budget_bw_bytes must be a finite value > 0, got {budget_bw_bytes!r}")
     probes: List[Tuple[float, int]] = []
 
     def solve(lam: float):
@@ -324,6 +338,11 @@ def solve_bandwidth(build_units: BuildUnits, table: Dict[str, Any], kappa: Mappi
 
     def finish(mode, lam, alloc, s, s0, s_min, nonmono, a0):
         by_group, exceptions = group_view(w_stream, tensors, log=log)
+        utilisation = alloc.total_bytes / budget_bytes
+        if utilisation < 0.98:
+            _warn(log, "bandwidth: allocation uses only %.1f%% of the storage budget "
+                       "-- at lambda>0 the greedy can leave budget unspent; compare "
+                       "total_bytes across arms", utilisation * 100.0)
         return BandwidthSolution(
             mode=mode, lam=lam, chosen=alloc, w_stream=dict(w_stream),
             by_group=by_group,
@@ -334,6 +353,7 @@ def solve_bandwidth(build_units: BuildUnits, table: Dict[str, Any], kappa: Mappi
             nonmonotone_probes=nonmono,
             predicted_loss_pure=pure_loss(alloc.assignment, tensors, kappa),
             total_loss_with_lambda=alloc.total_loss,
+            storage_utilisation=utilisation,
             bpw_lambda0=bpw_by_group(a0.assignment, tensors),
             bpw_chosen=bpw_by_group(alloc.assignment, tensors),
         )
@@ -341,12 +361,12 @@ def solve_bandwidth(build_units: BuildUnits, table: Dict[str, Any], kappa: Mappi
     a0, s0 = solve(0.0)
     if lam_fixed is not None:
         a, s = solve(float(lam_fixed))
-        return finish("weight", float(lam_fixed), a, s, s0, None, 0, a0)
+        return finish("weight", float(lam_fixed), a, s, s0, None, _count_inversions(probes), a0)
     if budget_bw_bytes is None:
-        return finish("off", 0.0, a0, s0, s0, None, 0, a0)
+        return finish("off", 0.0, a0, s0, s0, None, _count_inversions(probes), a0)
     B = int(budget_bw_bytes)
     if s0 <= B:
-        return finish("budget", 0.0, a0, s0, s0, None, 0, a0)
+        return finish("budget", 0.0, a0, s0, s0, None, _count_inversions(probes), a0)
     _, s_min = solve(LAM_MAX)
     if s_min > B:
         raise BandwidthInfeasibleError(B, s_min)
@@ -356,6 +376,12 @@ def solve_bandwidth(build_units: BuildUnits, table: Dict[str, Any], kappa: Mappi
     best_s = 0
     best_pure = math.inf
     for _ in range(BISECTION_STEPS):
+        if hi / lo < 1.0 + 1e-6:
+            # lo/hi have converged to the same measurement -- every further
+            # probe would be bit-identical (results only change with the
+            # allocation, which is already pinned between lo and hi). Cuts
+            # ~40% of allocate() calls off a typical bisection.
+            break
         mid = math.sqrt(lo * hi)
         a, s = solve(mid)
         if s <= B:
@@ -372,7 +398,12 @@ def solve_bandwidth(build_units: BuildUnits, table: Dict[str, Any], kappa: Mappi
             f"floor {s_min / 1024**3:.3f} GiB <= budget {B / 1024**3:.3f} GiB; "
             f"S(lambda) is non-monotone ({nonmono} inversions over {len(probes)} probes)"
         )
-    assert best_s <= B and best_alloc.total_bytes <= budget_bytes
+    if not (best_s <= B and best_alloc.total_bytes <= budget_bytes):
+        raise RuntimeError(
+            f"bandwidth: internal invariant violated -- the chosen allocation "
+            f"exceeds a budget (streamed {best_s} vs {B}, stored "
+            f"{best_alloc.total_bytes} vs {budget_bytes})"
+        )
     if nonmono and log is not None:
         log.warning("bandwidth: S(lambda) non-monotone (%d inversions over %d probes)", nonmono, len(probes))
     return finish("budget", best_lam, best_alloc, best_s, s0, s_min, nonmono, a0)

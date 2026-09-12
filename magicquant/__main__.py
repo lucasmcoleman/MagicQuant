@@ -258,18 +258,26 @@ def _run_v2_search(args: argparse.Namespace, settings) -> None:
         g, s = spec.split("=", 1)
         floors[g.strip()] = s.strip()
 
+    from magicquant.v2.bandwidth import KNOWN_GROUPS
+
     stream_weights = {}
     for spec in (getattr(args, "stream_weight", None) or []):
         if "=" not in spec:
             raise SystemExit(f"--stream-weight expects GROUP=W, got {spec!r}")
         g, v = spec.split("=", 1)
+        g = g.strip()
+        if g not in KNOWN_GROUPS:
+            raise SystemExit(
+                f"--stream-weight group {g!r} is not a known group; expected "
+                f"one of {sorted(KNOWN_GROUPS)}"
+            )
         try:
             w = float(v)
         except ValueError:
             raise SystemExit(f"--stream-weight expects a float W, got {v!r}")
         if not (0.0 <= w <= 1.0):
             raise SystemExit(f"--stream-weight W must be in [0,1], got {w!r}")
-        stream_weights[g.strip()] = w
+        stream_weights[g] = w
 
     cfg = V2Config(
         source_model_path=settings.source_model_path,

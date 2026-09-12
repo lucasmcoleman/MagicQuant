@@ -68,7 +68,8 @@ class TensorGroupClassifier:
         # hc_*: qwen4exp hyper-connection residual mixers (blk.N.hc_attn_up/
         # down/inject, blk.N.hc_ffn_inject, output_hc_up/down). Small, on the
         # per-token path, quantisable; O is the closest band. Must come before
-        # U/D so 'hc_ffn_inject' is not caught by the generic ffn patterns.
+        # U/D so 'hc_ffn_up'/'hc_ffn_down' are not caught by the generic
+        # ffn_up/ffn_down patterns (those DO match the substring).
         'O': [r'attn_output\.weight', r'attn_gate\.weight',
               r'hc_(attn|ffn)_(up|down|inject)\.weight',
               r'^output_hc_(up|down)\.weight'],

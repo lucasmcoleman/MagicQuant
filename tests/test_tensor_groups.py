@@ -58,6 +58,11 @@ def clf():
     ("blk.3.hc_attn_down.weight", "O"),
     ("blk.3.hc_ffn_inject.weight", "O"),
     ("output_hc_down.weight", "O"),
+    # --- these two ALSO match the U/D ffn_up/ffn_down substrings, so they
+    # pin the O-before-U/D ordering (unlike hc_ffn_inject, which matches
+    # neither U nor D and so proves nothing about ordering) ---
+    ("blk.3.hc_ffn_up.weight", "O"),
+    ("blk.3.hc_ffn_down.weight", "O"),
     # --- per-layer embedding table (row-gathered): E. Regression pin — this
     # already classifies to E by substring; the explicit pattern documents it. ---
     ("per_layer_token_embd.weight", "E"),

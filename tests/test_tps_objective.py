@@ -515,11 +515,33 @@ def test_survivor_with_only_use_stream_tps_reaches_score_hybrid():
     assert streamed != pytest.approx(default)
 
 
-def test_use_stream_tps_wins_over_use_bytes_tps_with_warning(caplog):
+def test_use_stream_tps_wins_over_use_bytes_tps_with_warning(caplog, monkeypatch):
     import logging
+
+    import magicquant.evolution.predictor as predictor_mod
+    # Reset the once-per-process flag so this test is independent of
+    # whatever ran (or didn't) earlier in the same pytest session.
+    monkeypatch.setattr(predictor_mod, "_WARNED_BOTH_TPS", False)
     cfg = {"U": "Q8_0", "X": "Q4_K_M", "H": "Q6_K"}
     s = _stream_scorer(stream_weights={"X": 0.03})
     with caplog.at_level(logging.WARNING, logger="magicquant.evolution.predictor"):
         both = s.score_hybrid(cfg, use_bytes_tps=True, use_stream_tps=True)["tps_score"]
     assert both == pytest.approx(s.score_hybrid(cfg, use_stream_tps=True)["tps_score"])
     assert any("use_stream_tps" in r.getMessage() for r in caplog.records)
+
+
+def test_use_stream_tps_both_flags_warning_fires_once_per_process(caplog, monkeypatch):
+    # An evolutionary campaign scores thousands of candidates a generation --
+    # the both-flags-set warning must fire once for the whole process, not
+    # once per score_hybrid call (5,000+ lines/campaign otherwise).
+    import logging
+
+    import magicquant.evolution.predictor as predictor_mod
+    monkeypatch.setattr(predictor_mod, "_WARNED_BOTH_TPS", False)
+    cfg = {"U": "Q8_0", "X": "Q4_K_M", "H": "Q6_K"}
+    s = _stream_scorer(stream_weights={"X": 0.03})
+    with caplog.at_level(logging.WARNING, logger="magicquant.evolution.predictor"):
+        s.score_hybrid(cfg, use_bytes_tps=True, use_stream_tps=True)
+        s.score_hybrid(cfg, use_bytes_tps=True, use_stream_tps=True)
+    matches = [r for r in caplog.records if "use_stream_tps" in r.getMessage()]
+    assert len(matches) == 1

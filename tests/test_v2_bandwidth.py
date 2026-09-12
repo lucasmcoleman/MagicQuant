@@ -102,6 +102,20 @@ def test_negative_expert_used_count_fails_hot_not_clamped_to_zero(caplog):
     assert "-4" in msg
 
 
+def test_zero_expert_used_count_fails_hot_not_cold(caplog):
+    # expert_used_count == 0 previously fell through to w=0.0 with NO warning
+    # (fails cold -- the one broken-hparam path that priced routed experts as
+    # never-read). Must now join the out-of-range/negative branch: fails hot
+    # to w=1.0 with a WARNING naming expert_used_count.
+    md = {"general.architecture": "qwen35moe", "qwen35moe.expert_count": 256,
+          "qwen35moe.expert_used_count": 0}
+    with caplog.at_level(logging.WARNING):
+        w = bw.stream_weights_by_group(md, log=logging.getLogger("t"))
+    assert w["X"] == 1.0
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "expert_used_count" in msg
+
+
 def test_missing_architecture_gives_clear_warning_not_none_dot_expert_count(caplog):
     with caplog.at_level(logging.WARNING):
         w = bw.stream_weights_by_group({}, log=logging.getLogger("t"))
@@ -157,15 +171,25 @@ def test_per_tensor_override_beats_gathered_rule():
 
 
 def test_shape_sanity_warnings(caplog):
-    tensors = {"blk.0.ffn_up_exps.weight": _entry("X", (64, 32)),   # 2-D X
-               "blk.0.ffn_up.weight": _entry("U", (4, 64, 32))}      # 3-D non-X
+    # Aggregated into ONE warning per kind, with a count and only the first
+    # three names -- like the UNKNOWN-group warning -- rather than one line
+    # per offending tensor.
+    tensors = {
+        "blk.0.ffn_up_exps.weight": _entry("X", (64, 32)),    # 2-D X
+        "blk.1.ffn_up_exps.weight": _entry("X", (64, 32)),    # 2-D X
+        "blk.0.ffn_up.weight": _entry("U", (4, 64, 32)),      # 3-D non-X
+    }
     with caplog.at_level(logging.WARNING):
         bw.stream_weights(tensors, QWEN_MD, log=logging.getLogger("t"))
     msgs = [r.getMessage() for r in caplog.records]
-    x_shape_msgs = [m for m in msgs if "blk.0.ffn_up_exps.weight" in m]
-    other_shape_msgs = [m for m in msgs if "blk.0.ffn_up.weight" in m]
-    assert x_shape_msgs and "not 3-D" in x_shape_msgs[0]
-    assert other_shape_msgs and "not X" in other_shape_msgs[0]
+    x_shape_msgs = [m for m in msgs if "not 3-D" in m]
+    other_shape_msgs = [m for m in msgs if "3-D but not X" in m]
+    assert len(x_shape_msgs) == 1
+    assert "2 group-X" in x_shape_msgs[0]
+    assert "blk.0.ffn_up_exps.weight" in x_shape_msgs[0] and "blk.1.ffn_up_exps.weight" in x_shape_msgs[0]
+    assert len(other_shape_msgs) == 1
+    assert "1 tensor(s)" in other_shape_msgs[0]
+    assert "blk.0.ffn_up.weight" in other_shape_msgs[0]
 
 
 def _table():
@@ -405,6 +429,20 @@ def test_both_modes_is_an_error():
         _solve(budget_bytes=200_000, budget_bw_bytes=60_000, lam_fixed=0.01)
 
 
+@pytest.mark.parametrize("bad_lam", [float("nan"), -0.5, float("inf")])
+def test_solve_bandwidth_rejects_nonfinite_or_negative_lam_fixed(bad_lam):
+    # In-process validation: Foundry constructs V2Config directly, bypassing
+    # __main__.py's --bandwidth-weight CLI guard, so solve_bandwidth itself
+    # must reject a bad lambda before ever calling allocate().
+    with pytest.raises(ValueError):
+        _solve(budget_bytes=200_000, lam_fixed=bad_lam)
+
+
+def test_solve_bandwidth_rejects_nonpositive_budget_bw_bytes():
+    with pytest.raises(ValueError):
+        _solve(budget_bytes=200_000, budget_bw_bytes=0)
+
+
 def test_count_inversions():
     assert bw._count_inversions([(1e-3, 100), (1e-2, 90), (1e-1, 80)]) == 0
     assert bw._count_inversions([(1e-3, 100), (1e-2, 90), (1e-1, 95), (1.0, 80)]) == 1
@@ -429,20 +467,33 @@ def test_weight_mode_reports_given_lambda():
 
 
 def test_determinism():
-    a, _, _ = _solve(budget_bytes=200_000, budget_bw_bytes=60_000)
-    b, _, _ = _solve(budget_bytes=200_000, budget_bw_bytes=60_000)
+    # budget_bw_bytes=60_000 is ABOVE this fixture's s0 (53,793): it never
+    # bisects, so it never actually exercises solve_bandwidth's search loop.
+    # Retarget into the (s_min, s0) band -- the same `target` expression
+    # test_budget_mode_moves_bits_from_experts_to_trunk uses -- so this test
+    # proves determinism of a REAL bisection, not just of the s0<=B shortcut.
+    sol0, _, _ = _solve(budget_bytes=200_000)
+    target = (sol0.streamed_bytes_lambda0 + _s_min()) // 2
+    a, _, _ = _solve(budget_bytes=200_000, budget_bw_bytes=target)
+    b, _, _ = _solve(budget_bytes=200_000, budget_bw_bytes=target)
+    assert a.mode == "budget" and a.lam > 0.0
     assert a.chosen.assignment == b.chosen.assignment and a.lam == b.lam
 
 
 def test_to_json_shape():
-    sol, _, _ = _solve(budget_bytes=200_000, budget_bw_bytes=60_000)
+    sol0, _, _ = _solve(budget_bytes=200_000)
+    target = (sol0.streamed_bytes_lambda0 + _s_min()) // 2
+    sol, _, _ = _solve(budget_bytes=200_000, budget_bw_bytes=target)
+    assert sol.streamed_bytes_min is not None and sol.lam > 0.0
     j = sol.to_json()
     assert set(j) == {"mode", "lambda", "stream_weights", "weights_source", "streamed_bytes",
                       "streamed_bytes_lambda0", "streamed_bytes_min", "budget_bw_bytes",
-                      "nonmonotone_probes", "predicted_loss_pure", "total_loss_with_lambda", "bpw_by_group"}
+                      "nonmonotone_probes", "predicted_loss_pure", "total_loss_with_lambda",
+                      "storage_utilisation", "bpw_by_group"}
     assert set(j["stream_weights"]) == {"observed_by_group", "default", "exceptions"}
     assert j["stream_weights"]["default"] == 1.0
     assert set(j["bpw_by_group"]) == {"lambda0", "chosen"}
+    assert 0 < j["storage_utilisation"] <= 1
 
 
 # ===========================================================================
@@ -567,3 +618,58 @@ def test_unreadable_source_metadata_fails_soft_and_prices_hot(tmp_path, monkeypa
     assert "error" in results["bandwidth"]["weights_source"]
     observed = results["bandwidth"]["stream_weights"]["observed_by_group"]
     assert observed and all(v == 1.0 for v in observed.values())
+
+
+def test_metadata_read_error_scrubs_absolute_source_path(tmp_path, monkeypatch):
+    # weights_source["error"] must be truncated (type name + first 200 chars)
+    # and never leak the absolute source path -- only its basename.
+    def _fake_compute_distortion_table(*a, **kw):
+        return {"tensors": _moe_table(), "meta": {"version": 1, "schemes": ["BF16", "Q6_K", "Q4_K_M"]}}
+
+    long_path = str(tmp_path / "some" / "very" / "long" / "absolute" / "model-bf16.gguf")
+    _install_stubs(monkeypatch, lambda path: 10.0)
+    monkeypatch.setattr(v2search, "compute_distortion_table", _fake_compute_distortion_table)
+
+    def _raise(path, *a, **kw):
+        raise ValueError(f"could not open {long_path}: no such file")
+
+    monkeypatch.setattr(source_mod, "open_model_source", _raise)
+
+    cfg = V2Config(
+        source_model_path=long_path, output_dir=str(tmp_path), budget_gb=5_000_000 / 1024**3,
+        schemes=["BF16", "Q6_K", "Q4_K_M"], use_imatrix=False, group_probes=False, anchors=1,
+    )
+    results = run_budget_search(cfg)
+    err = results["bandwidth"]["weights_source"]["error"]
+    assert err.startswith("ValueError: ")
+    assert long_path not in err
+    assert "model-bf16.gguf" in err
+
+
+def test_run_budget_search_rejects_nonfinite_budget_bw_gb_before_baseline(tmp_path, monkeypatch):
+    # In-process validation must fail BEFORE any measurement -- fail in
+    # seconds, not hours. Prove it by making the baseline measurement blow
+    # up if it is ever reached.
+    def _boom(*a, **kw):
+        raise AssertionError("baseline measurement must not run for an invalid budget_bw_gb")
+
+    monkeypatch.setattr(v2search, "_measure_baseline", _boom)
+    cfg = _make_cfg(tmp_path, budget_bw_gb=float("nan"))
+    with pytest.raises(ValueError, match="budget_bw_gb"):
+        run_budget_search(cfg)
+
+
+def test_run_budget_search_rejects_negative_bandwidth_weight_before_baseline(tmp_path, monkeypatch):
+    def _boom(*a, **kw):
+        raise AssertionError("baseline measurement must not run for an invalid bandwidth_weight")
+
+    monkeypatch.setattr(v2search, "_measure_baseline", _boom)
+    cfg = _make_cfg(tmp_path, bandwidth_weight=-1.0)
+    with pytest.raises(ValueError, match="bandwidth_weight"):
+        run_budget_search(cfg)
+
+
+def test_atomic_write_json_rejects_nonfinite_values(tmp_path):
+    with pytest.raises(ValueError):
+        v2search._atomic_write_json(tmp_path / "f.json", {"x": float("nan")})
+    assert not (tmp_path / "f.json").exists()

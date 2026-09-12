@@ -18,6 +18,7 @@ with an importance matrix), noise factors for imatrix-consuming schemes
 see `magicquant.quant.schemes.effective_noise_factor`.
 """
 
+import functools
 import logging
 from typing import Dict, List, Optional
 
@@ -35,6 +36,13 @@ log = logging.getLogger(__name__)
 # Single home for this value -- tools/fit_noise_factors.py imports it rather
 # than hand-copying the literal.
 DEFAULT_COLLAPSE_PENALTY_BETA = 0.02
+
+# score_hybrid's both-flags-set warning is a config mistake diagnosed once
+# per process, not once per candidate -- an evolutionary campaign scores
+# thousands of candidates a generation, so an un-throttled warning here
+# floods the log (5,000+ lines/campaign) without adding information after
+# the first line.
+_WARNED_BOTH_TPS = False
 
 
 class PredictiveScorer:
@@ -203,7 +211,7 @@ class PredictiveScorer:
 
         return self._estimate_simple_size(group_schemes)
 
-    @property
+    @functools.cached_property
     def baseline_stream_gb(self) -> float:
         """BF16 baseline size weighted by how often each group is read per
         decode token (literal 16 bpw; writer-compat rewrites never enter the
@@ -472,10 +480,13 @@ class PredictiveScorer:
         baseline_size_gb and this is byte-identical to use_bytes_tps -- the
         seed-pinned regression fixture never passes it. When both
         use_bytes_tps and use_stream_tps are True, use_stream_tps wins (one
-        WARNING logged) -- it is the more accurate proxy.
+        WARNING logged FOR THE WHOLE PROCESS, not per call -- see
+        _WARNED_BOTH_TPS) -- it is the more accurate proxy.
         """
-        if use_stream_tps and use_bytes_tps:
+        global _WARNED_BOTH_TPS
+        if use_stream_tps and use_bytes_tps and not _WARNED_BOTH_TPS:
             log.warning("score_hybrid: use_stream_tps overrides use_bytes_tps")
+            _WARNED_BOTH_TPS = True
         predicted_loss = self.predict_loss(group_schemes)
         predicted_size = self.predict_size(group_schemes)
         predicted_tps = self.predict_tps(group_schemes)

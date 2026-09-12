@@ -226,7 +226,7 @@ def _search_args(**kw):
         kl_weight=None, enable_speed_bench=None, enable_rocmfpx=None,
         enable_iq=None, stream_aware=None, head_aggressive=None,
         seed=None, measurement_chunks=None,
-        speed_weight=None, use_bytes_tps=None,
+        speed_weight=None, use_bytes_tps=None, use_stream_tps=None,
         write_calibration=None, calibration_source=None,
     )
     base.update(kw)
@@ -245,7 +245,7 @@ def test_cmd_search_forwards_knobs_to_run_measured_search(monkeypatch):
         enable_rocmfpx=True, enable_iq=True,
         stream_aware=True, head_aggressive=True, seed=42,
         measurement_chunks=8,
-        speed_weight=0.4, use_bytes_tps=True,
+        speed_weight=0.4, use_bytes_tps=True, use_stream_tps=True,
         write_calibration=True, calibration_source="/tmp/calib.json",
     ))
 
@@ -266,6 +266,7 @@ def test_cmd_search_forwards_knobs_to_run_measured_search(monkeypatch):
     assert call["measurement_chunks"] == 8
     assert call["speed_weight"] == 0.4
     assert call["use_bytes_tps"] is True
+    assert call["use_stream_tps"] is True
     assert call["write_calibration"] is True
     assert call["calibration_source"] == "/tmp/calib.json"
 
@@ -282,7 +283,7 @@ def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
         enable_rocmfpx=True, enable_iq=True,
         stream_aware=True, head_aggressive=True, seed=42,
         measurement_chunks=8,
-        speed_weight=0.4, use_bytes_tps=True,
+        speed_weight=0.4, use_bytes_tps=True, use_stream_tps=True,
         write_calibration=True, calibration_source="/tmp/calib.json",
     ))
 
@@ -300,6 +301,7 @@ def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
     assert call["measurement_chunks"] == 8
     assert call["speed_weight"] == 0.4
     assert call["use_bytes_tps"] is True
+    assert call["use_stream_tps"] is True
     assert call["calibration_source"] == "/tmp/calib.json"
     # run_full_search has no KL / speed-bench / write_calibration params --
     # must not be forwarded.
@@ -553,6 +555,26 @@ def test_cmd_search_v2_stream_weight_out_of_range_is_hard_exit(monkeypatch):
         [
             "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
             "--budget-gb", "5", "--stream-weight", "X=2",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        cli.main()
+
+
+@pytest.mark.parametrize("spec", ["default=0.5", "h=0.5", "=0.5"])
+def test_cmd_search_v2_stream_weight_unknown_group_is_hard_exit(monkeypatch, spec):
+    # The group key must be validated against magicquant.v2.bandwidth's
+    # KNOWN_GROUPS -- exact, case-sensitive; "default" is a sibling key in
+    # the reporting JSON, not a group, and must not be accepted here either.
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search",
+        lambda cfg: pytest.fail(f"v2 search must not run with --stream-weight {spec!r}"),
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--stream-weight", spec,
         ],
     )
     with pytest.raises(SystemExit):

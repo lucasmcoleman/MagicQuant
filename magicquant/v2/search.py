@@ -7,6 +7,7 @@ chunk-capped group probes. Everything else is CPU.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -549,10 +550,14 @@ def _assemble_results(
     chosen: Allocation, measured_anchors: List[Dict[str, Any]],
     final_model_path: Optional[str], failures: List[Dict[str, Any]],
     report_fit: Optional[Tuple[float, float]],
-    *, bandwidth: Optional[BandwidthSolution] = None,
+    *, bandwidth: BandwidthSolution,
 ) -> Dict[str, Any]:
     """Second half of ── 7. Report calibration + results ── — results-dict
-    assembly, the three file writes, and completion logging."""
+    assembly, the three file writes, and completion logging.
+
+    ``bandwidth`` is required (keyword-only): run_budget_search always
+    computes a BandwidthSolution via solve_bandwidth (mode "off" when no
+    bandwidth flags are set), so there is no code path where this is None."""
     frontier_json = [p.to_json() for p in chosen.frontier]
     results = {
         "version": 2,
@@ -580,24 +585,21 @@ def _assemble_results(
         "final_model": final_model_path,
         "seconds": round(time.time() - t_start, 1),
     }
-    if bandwidth is not None:
-        results["allocation"]["predicted_loss"] = bandwidth.predicted_loss_pure
-        results["bandwidth"] = bandwidth.to_json()
-        log.info(
-            "bandwidth",
-            mode=bandwidth.mode,
-            lam=bandwidth.lam,
-            streamed_gb=round(bandwidth.streamed_bytes / 1024**3, 3),
-            streamed_gb_lambda0=round(bandwidth.streamed_bytes_lambda0 / 1024**3, 3),
-            streamed_gb_min=(
-                round(bandwidth.streamed_bytes_min / 1024**3, 3)
-                if bandwidth.streamed_bytes_min is not None else None
-            ),
-            storage_gb=round(chosen.total_bytes / 1024**3, 3),
-            budget_gb=cfg.budget_gb,
-        )
-    else:
-        results["bandwidth"] = {"mode": "off", "lambda": 0.0}
+    results["allocation"]["predicted_loss"] = bandwidth.predicted_loss_pure
+    results["bandwidth"] = bandwidth.to_json()
+    log.info(
+        "bandwidth",
+        mode=bandwidth.mode,
+        lam=bandwidth.lam,
+        streamed_gb=round(bandwidth.streamed_bytes / 1024**3, 3),
+        streamed_gb_lambda0=round(bandwidth.streamed_bytes_lambda0 / 1024**3, 3),
+        streamed_gb_min=(
+            round(bandwidth.streamed_bytes_min / 1024**3, 3)
+            if bandwidth.streamed_bytes_min is not None else None
+        ),
+        storage_gb=round(chosen.total_bytes / 1024**3, 3),
+        budget_gb=cfg.budget_gb,
+    )
 
     _atomic_write_json(out_dir / "v2_results.json", results)
 
@@ -607,7 +609,7 @@ def _assemble_results(
     _atomic_write_json(out_dir / "frontier.json", {
         "budget_bytes": budget_bytes,
         "kappa": kappa,
-        "lambda": bandwidth.lam if bandwidth is not None else 0.0,
+        "lambda": bandwidth.lam,
         "points": frontier_json,
         "measured": [
             {"gb": (a["actual_bytes"] or a["predicted_bytes"]) / 1024**3,
@@ -706,6 +708,20 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     budget_bytes = int(cfg.budget_gb * 1024**3)
+
+    # In-process validation: Foundry constructs V2Config directly, bypassing
+    # __main__.py's --budget-bw-gb/--bandwidth-weight CLI guards. Checked
+    # (and budget_bw_bytes computed) right here, before ANY measurement
+    # starts -- baseline PPL below is the first real (potentially
+    # long-running) work -- so a bad config fails in seconds, not hours.
+    if cfg.budget_bw_gb is not None and not (math.isfinite(cfg.budget_bw_gb) and cfg.budget_bw_gb > 0):
+        raise ValueError(f"budget_bw_gb must be a finite value > 0, got {cfg.budget_bw_gb!r}")
+    if not (math.isfinite(cfg.bandwidth_weight) and cfg.bandwidth_weight >= 0):
+        raise ValueError(f"bandwidth_weight must be a finite value >= 0, got {cfg.bandwidth_weight!r}")
+    budget_bw_bytes = (
+        int(cfg.budget_bw_gb * 1024**3) if cfg.budget_bw_gb is not None else None
+    )
+
     failures: List[Dict[str, Any]] = []
 
     # Single LlamaCppTools instance threaded through every phase below —
@@ -743,7 +759,10 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
         finally:
             src.close()
     except Exception as exc:  # noqa: BLE001 -- unreadable/absent source: price every byte as streamed
-        meta_error = f"{type(exc).__name__}: {exc}"
+        meta_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        src_path = cfg.source_model_path
+        if src_path and src_path in meta_error:
+            meta_error = meta_error.replace(src_path, Path(src_path).name)
         log.warning(
             "bandwidth: could not read source metadata; all stream weights = 1.0",
             error=meta_error,
@@ -761,9 +780,12 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
     }
     if meta_error:
         weights_source["error"] = meta_error
-    budget_bw_bytes = (
-        int(cfg.budget_bw_gb * 1024**3) if cfg.budget_bw_gb is not None else None
-    )
+    # Keep only the hparam keys stream_weights()/weights_source actually
+    # need -- the full metadata dict (e.g. a 144 MiB tokenizer array at a
+    # 262k vocab) would otherwise be retained by this local for the rest of
+    # the run just because `metadata` stays in scope.
+    metadata = {k: metadata.get(k) for k in
+                ("general.architecture", f"{arch}.expert_count", f"{arch}.expert_used_count")}
 
     kappa, kappa_provenance, probe_outcomes, eps_sums, probe_failures = (
         _calibrate_kappa(tools, cfg, table, imatrix, baseline_ppl, out_dir)
@@ -796,5 +818,5 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
 
 def _atomic_write_json(path: Path, obj: Any) -> None:
     tmp = str(path) + ".tmp"
-    Path(tmp).write_text(json.dumps(obj, indent=2), encoding="utf-8")
+    Path(tmp).write_text(json.dumps(obj, indent=2, allow_nan=False), encoding="utf-8")
     os.replace(tmp, path)
