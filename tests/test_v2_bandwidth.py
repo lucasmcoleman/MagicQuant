@@ -50,6 +50,32 @@ def test_zero_expert_count_never_divides(caplog):
     assert any("expert_count" in r.getMessage() for r in caplog.records)
 
 
+def test_infinite_expert_count_treated_as_missing_no_exception(caplog):
+    md = dict(QWEN_MD, **{"qwen35moe.expert_count": float("inf")})
+    with caplog.at_level(logging.WARNING):
+        w = bw.stream_weights_by_group(md, log=logging.getLogger("t"))
+    assert w["X"] == 1.0
+    assert any("expert_count" in r.getMessage() for r in caplog.records)
+
+
+def test_nonsense_expert_hparams_logs_warning_naming_both_values(caplog):
+    md = dict(QWEN_MD, **{"qwen35moe.expert_used_count": 99, "qwen35moe.expert_count": 8})
+    with caplog.at_level(logging.WARNING):
+        ratio = bw.expert_ratio(md, log=logging.getLogger("t"))
+    assert ratio == 1.0          # still clamped into [0, 1]
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "99" in msg and "8" in msg
+
+
+def test_missing_architecture_gives_clear_warning_not_none_dot_expert_count(caplog):
+    with caplog.at_level(logging.WARNING):
+        w = bw.stream_weights_by_group({}, log=logging.getLogger("t"))
+    assert w["X"] == 1.0
+    msg = " ".join(r.getMessage() for r in caplog.records)
+    assert "general.architecture missing" in msg
+    assert "None.expert_count" not in msg and "None.expert_used_count" not in msg
+
+
 def test_per_tensor_rules(caplog):
     tensors = {
         "token_embd.weight": _entry("E", (100, 64)),
@@ -73,7 +99,26 @@ def test_per_tensor_rules(caplog):
     assert w["blk.0.attn_q.weight"] == 1.0
     assert w["blk.0.per_layer_proj.weight"] == 1.0
     assert w["blk.0.ffn_gate_inp.weight"] == 1.0
-    assert any("UNKNOWN" in r.getMessage() for r in caplog.records)
+    # exactly one UNKNOWN-group tensor in `tensors` above (per_layer_proj) --
+    # the warning must fire exactly once and name that count.
+    unknown_records = [r for r in caplog.records if "UNKNOWN" in r.getMessage()]
+    assert len(unknown_records) == 1
+    assert "1 UNKNOWN" in unknown_records[0].getMessage()
+
+
+def test_per_tensor_override_beats_gathered_rule():
+    # Rule order is override-by-group first, gathered-by-name second: an
+    # explicit override for H must win even for the rule-2 MTP embedding.
+    tensors = {
+        "token_embd.weight": _entry("E", (100, 64)),
+        "blk.0.nextn.embed_tokens.weight": _entry("H", (100, 64)),
+    }
+    w = bw.stream_weights(tensors, QWEN_MD, overrides={"H": 0.75})
+    assert w["blk.0.nextn.embed_tokens.weight"] == 0.75
+    assert w["token_embd.weight"] == 0.0        # group E, no override -> untouched
+
+    w = bw.stream_weights(tensors, QWEN_MD, overrides={"E": 0.5})
+    assert w["token_embd.weight"] == 0.5
 
 
 def test_shape_sanity_warnings(caplog):
@@ -82,8 +127,10 @@ def test_shape_sanity_warnings(caplog):
     with caplog.at_level(logging.WARNING):
         bw.stream_weights(tensors, QWEN_MD, log=logging.getLogger("t"))
     msgs = [r.getMessage() for r in caplog.records]
-    assert any("blk.0.ffn_up_exps.weight" in m for m in msgs)
-    assert any("blk.0.ffn_up.weight" in m for m in msgs)
+    x_shape_msgs = [m for m in msgs if "blk.0.ffn_up_exps.weight" in m]
+    other_shape_msgs = [m for m in msgs if "blk.0.ffn_up.weight" in m]
+    assert x_shape_msgs and "not 3-D" in x_shape_msgs[0]
+    assert other_shape_msgs and "not X" in other_shape_msgs[0]
 
 
 def _table():
@@ -92,7 +139,9 @@ def _table():
                                           "Q4_K_M": {"actual": "Q4_K_M", "bytes": 36, "werr": 1.0}}),
         "x": _entry("X", (2, 8, 8), choices={"BF16": {"actual": "BF16", "bytes": 256, "werr": 0.0},
                                              "Q4_K_M": {"actual": "Q4_K_M", "bytes": 72, "werr": 0.5}}),
-        "n": _entry("N", (8,), fixed=True, choices={"F32": {"actual": "F32", "bytes": 32, "werr": 0.0}}),
+        # werr=7.0 (not 0.0): if the fixed-tensor exclusion in pure_loss ever
+        # broke, this tensor's contribution would be impossible to miss.
+        "n": _entry("N", (8,), fixed=True, choices={"F32": {"actual": "F32", "bytes": 32, "werr": 7.0}}),
     }
 
 
@@ -101,8 +150,59 @@ def test_streamed_bytes_and_pure_loss_by_hand():
     w = {"a": 1.0, "x": 0.25, "n": 1.0}
     assign = {"a": "Q4_K_M", "x": "BF16", "n": "F32"}
     assert bw.streamed_bytes(assign, t, w) == 36 + int(0.25 * 256) + 32
+    # "n" is fixed: its werr=7.0 must NOT contribute (2.0 not 2.0 + 7.0 == 9.0).
     assert bw.pure_loss(assign, t, {"U": 2.0, "X": 3.0}) == pytest.approx(2.0 * 1.0 + 0.0)
     assert bw.streamed_bytes({"a": "Q4_K_M"}, t, {}) == 36          # missing weight -> 1.0
+
+
+def test_streamed_bytes_missing_tensor_raises_informative_keyerror():
+    t = _table()
+    with pytest.raises(KeyError, match=r"'missing' / 'Q4_K_M'"):
+        bw.streamed_bytes({"missing": "Q4_K_M"}, t, {})
+
+
+def test_streamed_bytes_missing_scheme_raises_informative_keyerror():
+    t = _table()
+    with pytest.raises(KeyError, match=r"'a' / 'NOPE'"):
+        bw.streamed_bytes({"a": "NOPE"}, t, {})
+
+
+def test_streamed_bytes_missing_bytes_key_raises_informative_keyerror():
+    t = _table()
+    del t["a"]["choices"]["Q4_K_M"]["bytes"]
+    with pytest.raises(KeyError, match=r"'a' / 'Q4_K_M'"):
+        bw.streamed_bytes({"a": "Q4_K_M"}, t, {})
+
+
+def test_pure_loss_missing_werr_key_raises_informative_keyerror():
+    t = _table()
+    del t["a"]["choices"]["Q4_K_M"]["werr"]
+    with pytest.raises(KeyError, match=r"'a' / 'Q4_K_M'"):
+        bw.pure_loss({"a": "Q4_K_M"}, t, {})
+
+
+def test_pure_loss_werr_none_is_still_silently_excluded():
+    # werr: null is the documented no-decode sentinel (sensitivity.py) -- it
+    # must stay a silent skip, not be conflated with a missing "werr" key.
+    t = _table()
+    t["a"]["choices"]["Q4_K_M"]["werr"] = None
+    assert bw.pure_loss({"a": "Q4_K_M"}, t, {"U": 2.0}) == 0.0
+
+
+def test_bpw_by_group_missing_bytes_key_raises_informative_keyerror():
+    t = _table()
+    del t["x"]["choices"]["BF16"]["bytes"]
+    with pytest.raises(KeyError, match=r"'x' / 'BF16'"):
+        bw.bpw_by_group({"x": "BF16"}, t)
+
+
+def test_pure_loss_and_bpw_missing_group_key_defaults_to_unknown():
+    t = {"z": {"shape": [2], "n_elems": 2, "fixed": False, "wnorm": None,
+               "choices": {"Q": {"actual": "Q", "bytes": 4, "werr": 0.5}}}}
+    assert "group" not in t["z"]
+    assert bw.pure_loss({"z": "Q"}, t, {}) == pytest.approx(0.5)
+    b = bw.bpw_by_group({"z": "Q"}, t)
+    assert b["UNKNOWN"] == pytest.approx(4 * 8 / 2)
 
 
 def test_bpw_by_group_and_group_view(caplog):
@@ -125,13 +225,21 @@ def test_bpw_by_group_and_group_view(caplog):
 
 
 def test_group_view_ignores_gathered_by_name_disagreement(caplog):
-    # rule-2 tensors (MTP embedding inside H) are an intended exception: no WARNING
-    t = {"output.weight": _entry("H", (100, 64)),
-         "blk.0.nextn.embed_tokens.weight": _entry("H", (100, 64))}
-    with caplog.at_level(logging.WARNING):
-        by_group, exceptions = bw.group_view({"output.weight": 1.0, "blk.0.nextn.embed_tokens.weight": 0.0}, t, log=logging.getLogger("t"))
-    assert by_group["H"] == 1.0 and exceptions == {"blk.0.nextn.embed_tokens.weight": 0.0}
-    assert not any("distinct weights" in r.getMessage() for r in caplog.records)
+    # rule-2 tensors (MTP embedding inside H) are an intended exception: no
+    # WARNING, and the modal weight must come from the non-gathered tensor
+    # ("output.weight") regardless of dict insertion order -- with both
+    # tensors tied 1-1 in the full population, the old implementation's
+    # modal pick flipped depending on which tensor was inserted first.
+    w_stream = {"output.weight": 1.0, "blk.0.nextn.embed_tokens.weight": 0.0}
+    entries = {
+        "output.weight": _entry("H", (100, 64)),
+        "blk.0.nextn.embed_tokens.weight": _entry("H", (100, 64)),
+    }
+    for t in (dict(entries), dict(reversed(list(entries.items())))):
+        with caplog.at_level(logging.WARNING):
+            by_group, exceptions = bw.group_view(w_stream, t, log=logging.getLogger("t"))
+        assert by_group["H"] == 1.0 and exceptions == {"blk.0.nextn.embed_tokens.weight": 0.0}
+        assert not any("distinct weights" in r.getMessage() for r in caplog.records)
 
 
 def test_float_entry_stub_source_gets_expert_ratio(monkeypatch, tmp_path):

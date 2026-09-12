@@ -37,19 +37,25 @@ def expert_ratio(metadata: Mapping[str, Any], *, log=None) -> Optional[float]:
     warning) when either is missing or expert_count is zero. Never divides by
     zero; never returns a non-finite value."""
     arch = metadata.get("general.architecture")
+    if not arch:
+        _warn(log, "stream weights: general.architecture missing; routed experts priced at w=1.0")
+        return None
     key_n = f"{arch}.expert_count"
     key_k = f"{arch}.expert_used_count"
-    n = metadata.get(key_n) if arch else None
-    k = metadata.get(key_k) if arch else None
+    n = metadata.get(key_n)
+    k = metadata.get(key_k)
     try:
         n = int(n) if n is not None else None
         k = int(k) if k is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         n, k = None, None
     if not n or k is None or n <= 0:
         _warn(log, "stream weights: %s / %s missing or zero (%r / %r); "
                    "routed experts priced at w=1.0 (today's pricing)", key_n, key_k, n, k)
         return None
+    if k > n or k < 0:
+        _warn(log, "stream weights: %s=%r is inconsistent with %s=%r (used-count > "
+                   "total, or negative); clamping to [0,1]", key_k, k, key_n, n)
     return min(1.0, max(0.0, k / n))
 
 
@@ -112,13 +118,30 @@ def stream_weights(table_tensors: Mapping[str, Mapping[str, Any]], metadata: Map
     return out
 
 
+def _choice(table_tensors: Mapping[str, Mapping[str, Any]], name: str, scheme: str) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """(entry, choice) = table_tensors[name], table_tensors[name]["choices"][scheme].
+    Raises a KeyError naming both `name` and `scheme` if the tensor, its
+    "choices", or that particular scheme is missing -- instead of a bare,
+    uninformative KeyError pointing at one dict level."""
+    try:
+        entry = table_tensors[name]
+        choice = entry["choices"][scheme]
+    except KeyError:
+        raise KeyError(f"{name!r} / {scheme!r}: tensor or scheme not found in distortion table") from None
+    return entry, choice
+
+
 def streamed_bytes(assignment: Mapping[str, str], table_tensors: Mapping[str, Mapping[str, Any]],
                    w_stream: Mapping[str, float]) -> int:
     """Sum over ALL assigned tensors (fixed included) of w_t * bytes(t, chosen).
     A tensor missing from w_stream is priced at 1.0."""
     total = 0.0
     for name, scheme in assignment.items():
-        b = int(table_tensors[name]["choices"][scheme]["bytes"])
+        _, choice = _choice(table_tensors, name, scheme)
+        try:
+            b = int(choice["bytes"])
+        except KeyError:
+            raise KeyError(f"{name!r} / {scheme!r}: choice has no 'bytes' entry") from None
         total += w_stream.get(name, 1.0) * b
     return int(round(total))
 
@@ -126,16 +149,22 @@ def streamed_bytes(assignment: Mapping[str, str], table_tensors: Mapping[str, Ma
 def pure_loss(assignment: Mapping[str, str], table_tensors: Mapping[str, Mapping[str, Any]],
               kappa: Mapping[str, float]) -> float:
     """Sum of kappa_g * werr(t, chosen) over non-fixed tensors -- the quality
-    objective with no lambda term (fixed tensors contribute 0.0, as today)."""
+    objective with no lambda term (fixed tensors contribute 0.0, as today).
+    A choice with ``werr: null`` (the documented no-decode sentinel, see
+    sensitivity.py) is silently excluded, same as before; a choice with the
+    "werr" key entirely absent is a malformed table entry and raises."""
     total = 0.0
     for name, scheme in assignment.items():
-        entry = table_tensors[name]
+        entry, choice = _choice(table_tensors, name, scheme)
         if entry.get("fixed"):
             continue
-        werr = entry["choices"][scheme].get("werr")
+        try:
+            werr = choice["werr"]
+        except KeyError:
+            raise KeyError(f"{name!r} / {scheme!r}: choice has no 'werr' entry") from None
         if werr is None:
             continue
-        total += float(kappa.get(entry["group"], 1.0)) * float(werr)
+        total += float(kappa.get(entry.get("group", "UNKNOWN"), 1.0)) * float(werr)
     return total
 
 
@@ -144,9 +173,14 @@ def bpw_by_group(assignment: Mapping[str, str], table_tensors: Mapping[str, Mapp
     bytes_g: Dict[str, int] = defaultdict(int)
     elems_g: Dict[str, int] = defaultdict(int)
     for name, scheme in assignment.items():
-        entry = table_tensors[name]
-        bytes_g[entry["group"]] += int(entry["choices"][scheme]["bytes"])
-        elems_g[entry["group"]] += int(entry.get("n_elems") or 0)
+        entry, choice = _choice(table_tensors, name, scheme)
+        try:
+            b = int(choice["bytes"])
+        except KeyError:
+            raise KeyError(f"{name!r} / {scheme!r}: choice has no 'bytes' entry") from None
+        group = entry.get("group", "UNKNOWN")
+        bytes_g[group] += b
+        elems_g[group] += int(entry.get("n_elems") or 0)
     return {g: (bytes_g[g] * 8.0 / elems_g[g]) for g in bytes_g if elems_g[g] > 0}
 
 
@@ -156,20 +190,27 @@ def group_view(w_stream: Mapping[str, float], table_tensors: Mapping[str, Mappin
     each group's tensors (a group with more than one distinct weight logs a
     WARNING, ignoring rule-2 gathered-by-name tensors, whose disagreement is
     intended); exceptions lists every tensor whose weight differs from its
-    group's modal value."""
-    per_group: Dict[str, Counter] = defaultdict(Counter)
-    disagree_check: Dict[str, set] = defaultdict(set)
+    group's modal value.
+
+    The modal weight is computed from the NON-gathered population only (a
+    group falls back to its full population when every tensor in it is
+    gathered-by-name), so the result is independent of dict insertion order:
+    rule-2 tensors can never tip a tie and always land in `exceptions` when
+    their weight disagrees with the rest of the group."""
+    per_group: Dict[str, Counter] = defaultdict(Counter)      # full population (fallback)
+    non_gathered: Dict[str, Counter] = defaultdict(Counter)   # rule-2-excluded population
     for name, entry in table_tensors.items():
         g = entry.get("group", "UNKNOWN")
         w = w_stream.get(name, 1.0)
         per_group[g][w] += 1
         if not _GATHERED_NAME.search(name):        # rule-2 tensors are an intended, silent exception
-            disagree_check[g].add(w)
+            non_gathered[g][w] += 1
     by_group: Dict[str, float] = {}
     for g, counts in per_group.items():
-        if len(disagree_check[g]) > 1:
-            _warn(log, "stream weights: group %s has %d distinct weights %r", g, len(disagree_check[g]), sorted(disagree_check[g]))
-        by_group[g] = counts.most_common(1)[0][0]
+        pop = non_gathered[g] if non_gathered[g] else counts
+        if len(non_gathered[g]) > 1:
+            _warn(log, "stream weights: group %s has %d distinct weights %r", g, len(non_gathered[g]), sorted(non_gathered[g]))
+        by_group[g] = pop.most_common(1)[0][0]
     exceptions = {name: w_stream.get(name, 1.0) for name, entry in table_tensors.items()
                   if w_stream.get(name, 1.0) != by_group[entry.get("group", "UNKNOWN")]}
     return by_group, exceptions
