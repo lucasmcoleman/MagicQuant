@@ -15,6 +15,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from magicquant.logging import get_logger
 from magicquant.v2.allocate import Allocation, Choice, Unit, allocate
+from magicquant.v2.bandwidth import (
+    BandwidthSolution,
+    pure_loss,
+    solve_bandwidth,
+    stream_weights,
+    streamed_bytes,
+)
 from magicquant.v2.calibrate import (
     affine_report_fit,
     fit_kappa,
@@ -81,6 +88,12 @@ class V2Config:
     # _select_schemes (explicit cfg.schemes and target_profile="q4nx" are
     # unaffected either way).
     enable_iq: bool = False
+    # Streamed-bytes term (docs/redesign.md section 11). Both off = byte-
+    # identical to today. bandwidth_weight is a fixed lambda (loss per
+    # streamed GiB); budget_bw_gb bisects lambda to a streamed-bytes budget.
+    bandwidth_weight: float = 0.0
+    budget_bw_gb: Optional[float] = None
+    stream_weights: Dict[str, float] = field(default_factory=dict)  # group -> w override
 
 
 def _model_has_block32_only_tensors(source_model_path: str) -> bool:
@@ -168,6 +181,8 @@ def _build_units(
     table: Dict[str, Any],
     kappa: Dict[str, float],
     floors: Dict[str, str],
+    w_stream: Optional[Dict[str, float]] = None,
+    lam: float = 0.0,
 ) -> List[Unit]:
     from magicquant.quant.schemes import get_scheme_by_name
 
@@ -201,10 +216,10 @@ def _build_units(
                             continue
                     except ValueError:
                         pass
-                choices.append(
-                    Choice(scheme, c["actual"], int(c["bytes"]),
-                           k * float(c["werr"]))
-                )
+                loss = k * float(c["werr"])
+                if lam:
+                    loss += lam * (w_stream or {}).get(name, 1.0) * int(c["bytes"]) / 2**30
+                choices.append(Choice(scheme, c["actual"], int(c["bytes"]), loss))
         if not choices:
             raise ValueError(
                 f"Cannot allocate tensor {name!r} (group {group!r}): no "
@@ -360,22 +375,30 @@ def _calibrate_kappa(
 
 def _allocate_frontier_and_anchors(
     table: Dict[str, Any], kappa: Dict[str, float], cfg: V2Config,
-    budget_bytes: int,
-) -> Tuple[Allocation, List[Allocation], List[Dict[str, Any]]]:
+    budget_bytes: int, w_stream: Dict[str, float],
+    budget_bw_bytes: Optional[int], weights_source: Dict[str, Any],
+) -> Tuple[Allocation, List[Allocation], List[Dict[str, Any]], BandwidthSolution, List[Dict[str, Any]]]:
     """── 5. Allocation + frontier ──
 
     ``chosen`` (the primary budget allocation) is allowed to raise
-    BudgetInfeasibleError uncaught — only the NEIGHBOR anchors are wrapped
-    in a try/except and recorded as failures.
+    BudgetInfeasibleError/BandwidthInfeasibleError uncaught — only the
+    NEIGHBOR anchors are wrapped in a try/except and recorded as failures.
     """
-    units = _build_units(table, kappa, cfg.floors)
-    chosen = allocate(units, budget_bytes)
+    solution = solve_bandwidth(
+        _build_units, table, kappa, cfg.floors, w_stream, budget_bytes, budget_bw_bytes,
+        lam_fixed=(cfg.bandwidth_weight or None), weights_source=weights_source, log=log,
+    )
+    chosen = solution.chosen
+    units = _build_units(table, kappa, cfg.floors, w_stream, solution.lam)
     log.info(
         "v2 allocation solved",
         stage="allocate",
         size_gb=round(chosen.total_bytes / 1024**3, 3),
-        predicted_loss=chosen.total_loss,
+        predicted_loss=solution.predicted_loss_pure,
         frontier_points=len(chosen.frontier),
+        bandwidth_mode=solution.mode,
+        lam=solution.lam,
+        streamed_gb=round(solution.streamed_bytes / 1024**3, 3),
     )
 
     # Anchor allocations: the budget point plus neighbors on the frontier.
@@ -392,12 +415,20 @@ def _allocate_frontier_and_anchors(
                 "stage": "anchor-allocate", "factor": factor,
                 "status": "failed", "error": str(exc),
             })
-    return chosen, anchor_allocs, failures
+    anchor_stats = [
+        {
+            "predicted_loss_pure": pure_loss(a.assignment, table["tensors"], kappa),
+            "streamed_bytes": streamed_bytes(a.assignment, table["tensors"], w_stream),
+        }
+        for a in anchor_allocs
+    ]
+    return chosen, anchor_allocs, failures, solution, anchor_stats
 
 
 def _build_and_verify_anchors(
     cfg: V2Config, tools, imatrix: Optional[Dict[str, Any]],
     baseline_ppl: float, anchor_allocs: List[Allocation], out_dir: Path,
+    anchor_stats: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[str], List[Dict[str, Any]]]:
     """── 6. Build + verify anchors (full corpus; per-candidate failures
     recorded, run continues) ──
@@ -446,7 +477,10 @@ def _build_and_verify_anchors(
             "path": str(out_path),
             "predicted_bytes": alloc.total_bytes,
             "actual_bytes": actual_bytes,
-            "predicted_loss": alloc.total_loss,
+            "predicted_loss": (
+                anchor_stats[idx]["predicted_loss_pure"] if anchor_stats else alloc.total_loss
+            ),
+            "streamed_bytes": anchor_stats[idx]["streamed_bytes"] if anchor_stats else None,
             "measurement": outcome.to_json(),
         }
         if outcome.ok:
@@ -515,6 +549,7 @@ def _assemble_results(
     chosen: Allocation, measured_anchors: List[Dict[str, Any]],
     final_model_path: Optional[str], failures: List[Dict[str, Any]],
     report_fit: Optional[Tuple[float, float]],
+    *, bandwidth: Optional[BandwidthSolution] = None,
 ) -> Dict[str, Any]:
     """Second half of ── 7. Report calibration + results ── — results-dict
     assembly, the three file writes, and completion logging."""
@@ -545,6 +580,24 @@ def _assemble_results(
         "final_model": final_model_path,
         "seconds": round(time.time() - t_start, 1),
     }
+    if bandwidth is not None:
+        results["allocation"]["predicted_loss"] = bandwidth.predicted_loss_pure
+        results["bandwidth"] = bandwidth.to_json()
+        log.info(
+            "bandwidth",
+            mode=bandwidth.mode,
+            lam=bandwidth.lam,
+            streamed_gb=round(bandwidth.streamed_bytes / 1024**3, 3),
+            streamed_gb_lambda0=round(bandwidth.streamed_bytes_lambda0 / 1024**3, 3),
+            streamed_gb_min=(
+                round(bandwidth.streamed_bytes_min / 1024**3, 3)
+                if bandwidth.streamed_bytes_min is not None else None
+            ),
+            storage_gb=round(chosen.total_bytes / 1024**3, 3),
+            budget_gb=cfg.budget_gb,
+        )
+    else:
+        results["bandwidth"] = {"mode": "off", "lambda": 0.0}
 
     _atomic_write_json(out_dir / "v2_results.json", results)
 
@@ -554,6 +607,7 @@ def _assemble_results(
     _atomic_write_json(out_dir / "frontier.json", {
         "budget_bytes": budget_bytes,
         "kappa": kappa,
+        "lambda": bandwidth.lam if bandwidth is not None else 0.0,
         "points": frontier_json,
         "measured": [
             {"gb": (a["actual_bytes"] or a["predicted_bytes"]) / 1024**3,
@@ -670,17 +724,61 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
     baseline_ppl = _measure_baseline(tools, cfg)
     imatrix, schemes = _resolve_imatrix_and_schemes(tools, cfg)
     table = _build_distortion_table(cfg, schemes, imatrix, out_dir)
+
+    # Streamed-bytes weights: derived from the source model's own GGUF
+    # metadata (architecture + MoE hparams), never from the (cached)
+    # distortion table. The import is function-local so tests can
+    # monkeypatch magicquant.gguf.source.open_model_source; the read is
+    # fail-soft -- an unreadable/absent source (e.g. the characterization
+    # suite's fabricated "src.gguf") must never abort a budget search, it
+    # just prices every byte as fully streamed (w=1.0).
+    from magicquant.gguf.source import open_model_source
+
+    metadata: Dict[str, Any] = {}
+    meta_error: Optional[str] = None
+    try:
+        src = open_model_source(cfg.source_model_path)
+        try:
+            metadata = dict(src.get_metadata())
+        finally:
+            src.close()
+    except Exception as exc:  # noqa: BLE001 -- unreadable/absent source: price every byte as streamed
+        meta_error = f"{type(exc).__name__}: {exc}"
+        log.warning(
+            "bandwidth: could not read source metadata; all stream weights = 1.0",
+            error=meta_error,
+        )
+    w_stream = stream_weights(table["tensors"], metadata, cfg.stream_weights, log=log)
+    arch = metadata.get("general.architecture")
+    weights_source: Dict[str, Any] = {
+        "arch": arch,
+        "expert_count": metadata.get(f"{arch}.expert_count"),
+        "expert_used_count": metadata.get(f"{arch}.expert_used_count"),
+        "overrides": dict(cfg.stream_weights),
+        "unknown_tensors": sum(
+            1 for e in table["tensors"].values() if e.get("group") == "UNKNOWN"
+        ),
+    }
+    if meta_error:
+        weights_source["error"] = meta_error
+    budget_bw_bytes = (
+        int(cfg.budget_bw_gb * 1024**3) if cfg.budget_bw_gb is not None else None
+    )
+
     kappa, kappa_provenance, probe_outcomes, eps_sums, probe_failures = (
         _calibrate_kappa(tools, cfg, table, imatrix, baseline_ppl, out_dir)
     )
     failures.extend(probe_failures)
-    chosen, anchor_allocs, anchor_allocate_failures = (
-        _allocate_frontier_and_anchors(table, kappa, cfg, budget_bytes)
+    chosen, anchor_allocs, anchor_allocate_failures, bandwidth_solution, anchor_stats = (
+        _allocate_frontier_and_anchors(
+            table, kappa, cfg, budget_bytes, w_stream, budget_bw_bytes, weights_source,
+        )
     )
     failures.extend(anchor_allocate_failures)
     measured_anchors, final_model_path, anchor_failures = (
         _build_and_verify_anchors(
-            cfg, tools, imatrix, baseline_ppl, anchor_allocs, out_dir
+            cfg, tools, imatrix, baseline_ppl, anchor_allocs, out_dir,
+            anchor_stats=anchor_stats,
         )
     )
     failures.extend(anchor_failures)
@@ -692,6 +790,7 @@ def run_budget_search(cfg: V2Config) -> Dict[str, Any]:
         cfg, tools, out_dir, budget_bytes, t_start, baseline_ppl, imatrix,
         schemes, table, kappa, kappa_provenance, eps_sums, chosen,
         measured_anchors, final_model_path, failures, report_fit,
+        bandwidth=bandwidth_solution,
     )
 
 

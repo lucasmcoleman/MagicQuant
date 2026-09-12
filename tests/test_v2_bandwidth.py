@@ -443,3 +443,127 @@ def test_to_json_shape():
     assert set(j["stream_weights"]) == {"observed_by_group", "default", "exceptions"}
     assert j["stream_weights"]["default"] == 1.0
     assert set(j["bpw_by_group"]) == {"lambda0", "chosen"}
+
+
+# ===========================================================================
+# Integration: Task 5 wires solve_bandwidth into
+# magicquant.v2.search.run_budget_search. Driven through the SAME
+# characterization harness as tests/test_v2_search_characterization.py
+# (its fixtures/helpers are reused directly, not re-derived) so the pipeline
+# runs GPU-free and fully deterministic.
+# ===========================================================================
+
+import json  # noqa: E402
+
+import magicquant.gguf.source as source_mod  # noqa: E402
+import magicquant.v2.search as v2search  # noqa: E402
+from magicquant.v2.search import V2Config, run_budget_search  # noqa: E402
+from tests.test_v2_search_characterization import (  # noqa: E402
+    SOURCE, _fake_table, _happy_ppl, _install_stubs, _make_cfg,
+)
+from tests.test_writer import StubSource  # noqa: E402
+
+
+def test_run_budget_search_off_mode_is_byte_identical_shape(tmp_path, monkeypatch):
+    """No bandwidth flags -> mode "off" and the pre-existing 0.07 loss pin
+    survives untouched (results["allocation"]["predicted_loss"] is now
+    routed through bandwidth.predicted_loss_pure, but at lambda=0 that is
+    numerically the same quantity as the old chosen.total_loss)."""
+    cfg = _make_cfg(tmp_path)
+    _install_stubs(monkeypatch, _happy_ppl)
+
+    results = run_budget_search(cfg)
+
+    assert results["bandwidth"]["mode"] == "off"
+    assert results["bandwidth"]["lambda"] == 0.0
+    assert results["allocation"]["predicted_loss"] == pytest.approx(0.07)
+
+
+def test_run_budget_search_wires_budget_mode_and_pure_loss(tmp_path, monkeypatch):
+    # First, an unconstrained (bandwidth-off) run to learn this fixture's
+    # lambda=0 streamed-bytes figure -- never hand-derived/hard-coded.
+    cfg0 = _make_cfg(tmp_path / "off", anchors=1)
+    _install_stubs(monkeypatch, _happy_ppl)
+    results0 = run_budget_search(cfg0)
+    assert results0["bandwidth"]["mode"] == "off"
+    s0 = results0["bandwidth"]["streamed_bytes"]
+
+    # Now a real streamed-bytes budget, strictly below s0, wired through a
+    # genuine (non-fabricated) metadata source -- StubSource with real MoE
+    # hparams -- so w_stream is derived from actual expert_count/
+    # expert_used_count rather than the default _FakeSource's bare
+    # "general.architecture": "llama".
+    monkeypatch.setattr(
+        source_mod, "open_model_source",
+        lambda path, *a, **kw: StubSource([], metadata=QWEN_MD),
+    )
+    cfg = _make_cfg(tmp_path / "budget", anchors=1, budget_bw_gb=(s0 - 1) / 1024**3)
+    results = run_budget_search(cfg)
+
+    assert results["bandwidth"]["mode"] == "budget"
+    assert results["bandwidth"]["weights_source"]["arch"] == "qwen35moe"
+    assert results["allocation"]["predicted_loss"] == results["bandwidth"]["predicted_loss_pure"]
+    for a in results["anchors"]:
+        assert "streamed_bytes" in a
+
+    frontier = json.loads((tmp_path / "budget" / "frontier.json").read_text())
+    assert frontier["lambda"] == results["bandwidth"]["lambda"]
+
+    table = _fake_table(cfg.schemes)
+    recomputed = bw.pure_loss(
+        results["allocation"]["assignment"], table["tensors"], results["kappa"]
+    )
+    assert results["allocation"]["predicted_loss"] == pytest.approx(recomputed)
+    assert recomputed < results["bandwidth"]["total_loss_with_lambda"]
+
+
+def test_tiny_bandwidth_weight_leaves_assignment_and_report_fit_unchanged(tmp_path, monkeypatch):
+    """A lambda small enough to never flip a single allocation decision
+    (invariant (h)): the assignment and the reporting-fit calibration must
+    come out identical to the lambda=0 run."""
+    _install_stubs(monkeypatch, _happy_ppl)
+
+    cfg0 = _make_cfg(tmp_path / "lam0")
+    results0 = run_budget_search(cfg0)
+
+    cfg_tiny = _make_cfg(tmp_path / "tiny", bandwidth_weight=1e-9)
+    results_tiny = run_budget_search(cfg_tiny)
+
+    assert results_tiny["bandwidth"]["mode"] == "weight"
+    assert results_tiny["allocation"]["assignment"] == results0["allocation"]["assignment"]
+    assert results_tiny["report_fit_affine"] == results0["report_fit_affine"]
+
+
+def test_unreadable_source_metadata_fails_soft_and_prices_hot(tmp_path, monkeypatch):
+    # _moe_table (defined above) is X/U/H/N only -- no E or V groups, whose
+    # stream weight is hard-pinned to 0.0 regardless of metadata (see
+    # stream_weights_by_group). With this shape, EVERY group's
+    # fallback-on-metadata-failure weight is genuinely 1.0, so "the run
+    # prices everything hot when the source is unreadable" is actually
+    # exercised end to end, not accidentally true for an unrelated reason
+    # (the characterization suite's own fixture has a gathered-by-name
+    # group-E tensor that is 0.0 independent of metadata, which would make
+    # this assertion true for the wrong reason).
+    ppl = lambda path: 10.0 if path == SOURCE else 10.1  # noqa: E731
+
+    def _fake_compute_distortion_table(*a, **kw):
+        return {"tensors": _moe_table(), "meta": {"version": 1, "schemes": ["BF16", "Q6_K", "Q4_K_M"]}}
+
+    _install_stubs(monkeypatch, ppl)
+    monkeypatch.setattr(v2search, "compute_distortion_table", _fake_compute_distortion_table)
+
+    def _raise(path, *a, **kw):
+        raise ValueError("unreadable source")
+
+    monkeypatch.setattr(source_mod, "open_model_source", _raise)
+
+    cfg = V2Config(
+        source_model_path=SOURCE, output_dir=str(tmp_path), budget_gb=5_000_000 / 1024**3,
+        schemes=["BF16", "Q6_K", "Q4_K_M"], use_imatrix=False, group_probes=False, anchors=1,
+    )
+
+    results = run_budget_search(cfg)
+
+    assert "error" in results["bandwidth"]["weights_source"]
+    observed = results["bandwidth"]["stream_weights"]["observed_by_group"]
+    assert observed and all(v == 1.0 for v in observed.values())

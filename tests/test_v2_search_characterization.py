@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import pytest
 
+import magicquant.gguf.source as source_mod
 import magicquant.gguf.writer as wmod
 import magicquant.imatrix as imatrix_mod
 import magicquant.utils.llamacpp as llamacpp_mod
@@ -132,6 +133,19 @@ class _FakeTools:
         return self._ppl_lookup(p)
 
 
+class _FakeSource:
+    """Stand-in for a ``ModelSource`` returned by ``open_model_source`` --
+    lets the happy path exercise the REAL bandwidth-metadata-read code in
+    run_budget_search (a function-local import, so patching the module
+    attribute below is enough) without touching a real GGUF."""
+
+    def get_metadata(self) -> Dict[str, Any]:
+        return {"general.architecture": "llama"}
+
+    def close(self) -> None:
+        pass
+
+
 def _install_stubs(
     monkeypatch,
     ppl_lookup: Callable[[str], Optional[float]],
@@ -190,6 +204,8 @@ def _install_stubs(
     monkeypatch.setattr(v2search, "compute_distortion_table",
                          _fake_compute_distortion_table)
     monkeypatch.setattr(imatrix_mod, "ensure_imatrix", _fake_ensure_imatrix)
+    monkeypatch.setattr(source_mod, "open_model_source",
+                         lambda path, *a, **kw: _FakeSource())
 
     return tools_registry, build_log, ensure_imatrix_calls
 
@@ -240,7 +256,7 @@ def test_happy_path_results_json_shape_and_values(happy_run):
         "baseline_provenance", "measurement", "schemes", "kappa",
         "kappa_provenance", "group_epsilon_sums", "allocation",
         "group_summary", "anchors", "report_fit_affine", "failures",
-        "final_model", "seconds",
+        "final_model", "bandwidth", "seconds",
     }
     assert results["version"] == 2
     assert results["algo"] == "v2-budget"
@@ -285,7 +301,8 @@ def test_happy_path_results_json_shape_and_values(happy_run):
     for a in anchors:
         assert set(a.keys()) == {
             "tag", "path", "predicted_bytes", "actual_bytes",
-            "predicted_loss", "measurement", "ppl", "measured_rel_loss",
+            "predicted_loss", "streamed_bytes", "measurement", "ppl",
+            "measured_rel_loss",
         }
         assert a["measurement"]["status"] == "ok"
         assert a["predicted_bytes"] == 6160
@@ -327,7 +344,7 @@ def test_happy_path_frontier_json_shape_and_values(happy_run):
     results = happy_run["results"]
 
     frontier = json.loads((tmp_path / "frontier.json").read_text())
-    assert set(frontier.keys()) == {"budget_bytes", "kappa", "points", "measured"}
+    assert set(frontier.keys()) == {"budget_bytes", "kappa", "points", "measured", "lambda"}
     assert frontier["budget_bytes"] == int(happy_run["cfg"].budget_gb * 1024**3)
     assert frontier["kappa"] == results["kappa"]
 
@@ -589,7 +606,7 @@ def test_anchor_stage_failure_recorded_without_raising_and_frontier_fallback(
     # A failed anchor's dict has no ppl/measured_rel_loss keys at all.
     assert set(failed_anchor.keys()) == {
         "tag", "path", "predicted_bytes", "actual_bytes",
-        "predicted_loss", "measurement",
+        "predicted_loss", "streamed_bytes", "measurement",
     }
     assert failed_anchor["actual_bytes"] is None  # build raised before writing
     # The failed anchor's intended path is preserved (never nulled: the
