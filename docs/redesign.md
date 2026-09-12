@@ -470,3 +470,83 @@ The validation in docs/validation.md reports whether `cumulative` closes
 the v1–v2 gap **without** the manual `--floor E=Q6_K` guardrail — if it
 does, `cumulative` becomes the recommended default in a follow-up once it
 has mileage across more models.
+
+---
+
+## 11. Streamed-bytes addendum: pricing bytes by how often they are read
+
+**Status (2026-09-11):** opt-in (`--budget-bw-gb` / `--bandwidth-weight`),
+default off and byte-identical. Revises one item of §9: "speed-aware objectives
+beyond byte-pricing" is no longer a non-goal for the single term below.
+
+### The failure
+
+§4.3 says "the byte cost is priced directly by the budget constraint." That is
+true when every stored byte is read once per decode token — a dense model. It
+is false for a routed MoE: a trunk byte is read every token, a routed-expert
+byte `n_used/n_expert` of the time (8/256 on Qwen3.6-35B-A3B and Ornith), an
+embedding row almost never. MagicQuant's own shipped MoE quants show the
+consequence — per-group accounting from the GGUF headers, `w` = fraction of a
+group's bytes touched per token:
+
+| model | quant | trunk bpw | experts bpw | trunk share of traffic | weights GiB/token |
+|---|---|---|---|---|---|
+| Ornith-1.5-35B-A3B | MagicQuant Q4_K_M (shipped) | 11.86 (head BF16) | 4.25 | 84% | 3.24 |
+| Qwen3.6-35B-A3B | MagicQuant ROCmFPX MQ-Q4 (shipped) | 12.69 (head BF16, DeltaNet 16) | 4.50 | 84% | 3.47 |
+| Qwen3.6-35B-A3B | unsloth MXFP4_MOE (stock) | 8.81 | 4.71 | 78% | 2.60 |
+| Qwen3.8-Flash-Next | unsloth UD-IQ4_XS | 9.08 | 3.94 | 80% | 5.44 |
+| gemma-4-26B-A4B | unsloth UD-Q4_K_XL | 4.68 | 4.50 | 55% | 1.65 |
+| Qwen3.8-27B (dense) | MagicQuant Q4_K_M | 4.61 | — | 100% | 13.97 |
+
+Same architecture, MagicQuant vs stock: +33% bytes per token. Decode at batch 1
+is memory-bandwidth-bound, so that is roughly a 25% decode-speed penalty for a
+file that is no smaller. v1's `stream_aware` cannot fix it (a sampling bias
+with no cost term — the shipped Ornith run had it on and still chose BF16 for
+H/K/O); v2's MCKP cannot either (bytes are priced by storage only).
+
+### The fix: a stream weight and one Lagrangian term
+
+Each tensor gets an architectural weight `w_t ∈ [0,1]` — 1.0 for anything read
+in full every token, `expert_used_count / expert_count` for routed experts,
+0.0 for row-gathered embeddings (vocab, per-layer, MTP embedding tables) —
+read off the GGUF hparams, never measured. The allocator's per-choice loss becomes
+
+```
+loss_eff(t, s) = κ_g · ε(t, s) + λ · w_t · bytes(t, s) / 2^30      (λ in loss per streamed GiB)
+```
+
+and `allocate()` is unchanged: `Choice.loss` was already opaque to the hull,
+greedy and polish. With `--budget-bw-gb B`, λ is found by log-space bisection
+so that the realised `Σ w_t · bytes` meets `B` while the storage budget stays a
+hard constraint; the feasible probe with the lowest pure κ·ε loss wins (in
+practice the smallest feasible λ, since pure loss rises with λ).
+With `--bandwidth-weight λ` the term is applied at a fixed λ. Every published
+loss (`allocation.predicted_loss`, anchors, the reporting fit) is recomputed as
+pure κ·ε so `report_fit_affine` keeps its meaning; `frontier.json`'s point
+losses are the effective loss and the file records `lambda`.
+
+### Where this bites: w = 0 groups
+
+The λ term subtracts `λ·w_t/2^30` from every hull-edge slope, so a `w=0` group
+(embeddings) is the one place a bandwidth budget does *not* penalise storage.
+Combined with the single-group-probe κ_E failure in §10, a large λ can pour
+freed storage into embeddings. The bisection returns the feasible probe with
+the lowest pure κ·ε loss (in practice the smallest feasible λ), `--floor
+E=Q6_K` remains the measured guardrail, and `v2_results.json` reports
+per-group bpw at λ=0 and at the chosen λ so the shift is visible.
+
+### v1
+
+`--stream-tps` swaps the `use_bytes_tps` proxy's stored-size ratio for a
+stream-weighted one (`predict_stream_gb`), leaving the remap and clamp
+untouched. It is the fallback route for the validation campaign in
+`docs/validation.md`.
+
+### Validation
+
+`docs/validation.md` — "Streamed-bytes campaign" — re-quantizes the shipped
+Ornith-1.5-35B-A3B at equal payload size under three gates (streamed bytes
+lower; KL vs BF16 not worse, re-measured in-session; measured decode faster)
+before anything is republished.
+
+See also the README section "Streamed bytes and MoE" for the CLI recipe.

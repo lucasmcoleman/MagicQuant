@@ -59,6 +59,11 @@ class MagicQuantSettings(BaseSettings):
     # explicitly opted into.
     speed_weight: Optional[float] = None
     use_bytes_tps: bool = False
+    # MoE-correct variant of use_bytes_tps: scores from predicted STREAMED
+    # bytes per decode token (routed experts discounted by measured
+    # n_used/n_expert) instead of stored size. Off by default; wins over
+    # use_bytes_tps (with a warning) if both are set.
+    use_stream_tps: bool = False
     # Cross-run noise calibration (magicquant/quant/calibration.py): off by
     # default so predictor noise factors/speed multipliers keep reading the
     # fixed tools/calibration_results.json path (or the static registry)
@@ -72,6 +77,9 @@ class MagicQuantSettings(BaseSettings):
     # Target model size in GiB for --algo v2 (weights only; leave headroom
     # for ctx/KV inside the GTT envelope).
     budget_gb: Optional[float] = None
+    # Streamed-bytes budget in GiB/token for --algo v2 (docs/redesign.md
+    # section 11). None = off.
+    budget_bw_gb: Optional[float] = None
     # v2 κ-probe mode: "single" (default) or "cumulative" (leave-one-group-
     # high marginal-importance probes; docs/redesign.md §10).
     probe_mode: str = "single"

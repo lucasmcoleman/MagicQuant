@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import math
 import sys
 import json
 from pathlib import Path
@@ -157,10 +158,12 @@ def _settings_from_args(args: argparse.Namespace):
     _maybe("measurement_chunks", "measurement_chunks")
     _maybe("speed_weight", "speed_weight")
     _maybe("use_bytes_tps", "use_bytes_tps")
+    _maybe("use_stream_tps", "use_stream_tps")
     _maybe("write_calibration", "write_calibration")
     _maybe("calibration_source", "calibration_source")
     _maybe("algo", "algo")
     _maybe("budget_gb", "budget_gb")
+    _maybe("budget_bw_gb", "budget_bw_gb")
     _maybe("probe_mode", "probe_mode")
 
     # MagicQuantSettings() reads env/.env first; explicit kwargs (CLI) win.
@@ -191,6 +194,7 @@ _V2_IGNORED_V1_FLAGS = (
     ("--head-aggressive", "head_aggressive"),
     ("--speed-weight", "speed_weight"),
     ("--bytes-tps", "use_bytes_tps"),
+    ("--stream-tps", "use_stream_tps"),
     ("--write-calibration", "write_calibration"),
     ("--calibration-source", "calibration_source"),
     ("--target-quant", "target_quant"),
@@ -222,12 +226,58 @@ def _run_v2_search(args: argparse.Namespace, settings) -> None:
             "the v2 search allocates per-tensor precision to a byte budget."
         )
 
+    # --budget-bw-gb is settings-routed (MAGICQUANT_BUDGET_BW_GB works, parity
+    # with --budget-gb); --bandwidth-weight has no env support -- read
+    # straight off args, like --floor below -- since a fixed lambda is a
+    # per-invocation tuning knob, not a standing preference.
+    bandwidth_weight = getattr(args, "bandwidth_weight", None)
+    if settings.budget_bw_gb is not None and bandwidth_weight is not None:
+        raise SystemExit(
+            "--budget-bw-gb and --bandwidth-weight are mutually exclusive"
+        )
+
+    if bandwidth_weight is not None and not (
+        math.isfinite(bandwidth_weight) and bandwidth_weight >= 0.0
+    ):
+        raise SystemExit(
+            f"--bandwidth-weight must be a finite value >= 0, got {bandwidth_weight!r} "
+            "(a negative lambda would reward streaming more bytes)"
+        )
+
+    if settings.budget_bw_gb is not None and not (
+        math.isfinite(settings.budget_bw_gb) and settings.budget_bw_gb > 0.0
+    ):
+        raise SystemExit(
+            f"--budget-bw-gb must be a finite value > 0, got {settings.budget_bw_gb!r}"
+        )
+
     floors = {}
     for spec in (getattr(args, "floor", None) or []):
         if "=" not in spec:
             raise SystemExit(f"--floor expects GROUP=SCHEME, got {spec!r}")
         g, s = spec.split("=", 1)
         floors[g.strip()] = s.strip()
+
+    from magicquant.v2.bandwidth import KNOWN_GROUPS
+
+    stream_weights = {}
+    for spec in (getattr(args, "stream_weight", None) or []):
+        if "=" not in spec:
+            raise SystemExit(f"--stream-weight expects GROUP=W, got {spec!r}")
+        g, v = spec.split("=", 1)
+        g = g.strip()
+        if g not in KNOWN_GROUPS:
+            raise SystemExit(
+                f"--stream-weight group {g!r} is not a known group; expected "
+                f"one of {sorted(KNOWN_GROUPS)}"
+            )
+        try:
+            w = float(v)
+        except ValueError:
+            raise SystemExit(f"--stream-weight expects a float W, got {v!r}")
+        if not (0.0 <= w <= 1.0):
+            raise SystemExit(f"--stream-weight W must be in [0,1], got {w!r}")
+        stream_weights[g] = w
 
     cfg = V2Config(
         source_model_path=settings.source_model_path,
@@ -249,6 +299,9 @@ def _run_v2_search(args: argparse.Namespace, settings) -> None:
         sample_rows=getattr(args, "sensitivity_sample_rows", None),
         floors=floors,
         keep_anchors=getattr(args, "keep_anchors", False),
+        bandwidth_weight=float(bandwidth_weight or 0.0),
+        budget_bw_gb=settings.budget_bw_gb,
+        stream_weights=stream_weights,
     )
     results = run_budget_search(cfg)
     out = Path(settings.output_dir)
@@ -318,6 +371,7 @@ def cmd_search(args: argparse.Namespace) -> None:
             measurement_chunks=settings.measurement_chunks,
             speed_weight=settings.speed_weight,
             use_bytes_tps=settings.use_bytes_tps,
+            use_stream_tps=settings.use_stream_tps,
             write_calibration=settings.write_calibration,
             calibration_source=settings.calibration_source,
         )
@@ -339,6 +393,7 @@ def cmd_search(args: argparse.Namespace) -> None:
             measurement_chunks=settings.measurement_chunks,
             speed_weight=settings.speed_weight,
             use_bytes_tps=settings.use_bytes_tps,
+            use_stream_tps=settings.use_stream_tps,
             calibration_source=settings.calibration_source,
         )
 
@@ -918,6 +973,15 @@ def main() -> None:
              "speed_multiplier (default: MAGICQUANT_USE_BYTES_TPS or off)",
     )
     search_parser.add_argument(
+        "--stream-tps",
+        dest="use_stream_tps",
+        action="store_true",
+        default=None,
+        help="Score speed from predicted STREAMED bytes per decode token (trunk read every "
+             "token, routed experts n_used/n_expert of the time) instead of stored size; "
+             "MoE-correct variant of --bytes-tps (default: MAGICQUANT_USE_STREAM_TPS or off)",
+    )
+    search_parser.add_argument(
         "--write-calibration",
         action="store_true",
         default=None,
@@ -1017,6 +1081,34 @@ def main() -> None:
         help="[v2] minimum scheme for a group, repeatable (e.g. --floor "
              "E=Q6_K --floor H=Q6_K); default: no floors, measured "
              "sensitivity decides",
+    )
+    search_parser.add_argument(
+        "--budget-bw-gb",
+        dest="budget_bw_gb",
+        type=float,
+        default=None,
+        help="[v2] streamed-bytes budget in GiB per decode token: bisect the "
+             "bandwidth term so the trunk+active-expert bytes read per token fit "
+             "(default: MAGICQUANT_BUDGET_BW_GB or off). Mutually exclusive with "
+             "--bandwidth-weight",
+    )
+    search_parser.add_argument(
+        "--bandwidth-weight",
+        dest="bandwidth_weight",
+        type=float,
+        default=None,
+        help="[v2] fixed lambda for the streamed-bytes term, in loss per "
+             "streamed GiB (useful range ~0.003-0.1); must be >= 0. No "
+             "MAGICQUANT_ env var -- CLI only. Mutually exclusive with "
+             "--budget-bw-gb",
+    )
+    search_parser.add_argument(
+        "--stream-weight",
+        action="append",
+        default=None,
+        metavar="GROUP=W",
+        help="[v2] override a group's stream weight in [0,1], repeatable "
+             "(e.g. --stream-weight H=0.5). No MAGICQUANT_ env var -- CLI only",
     )
     search_parser.set_defaults(func=cmd_search)
 

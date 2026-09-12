@@ -12,9 +12,9 @@ from magicquant.v2.sensitivity import compute_distortion_table
 from tests.test_writer import StubSource
 
 
-def _float_entry(monkeypatch, tmp_path, weights, *, sample_rows=None, imatrix=None):
+def _float_entry(monkeypatch, tmp_path, weights, *, sample_rows=None, imatrix=None, metadata=None):
     name = "blk.0.ffn_down_exps.weight" if weights.ndim == 3 else "blk.0.ffn_down.weight"
-    source = StubSource([(name, weights, weights.shape)])
+    source = StubSource([(name, weights, weights.shape)], metadata=metadata)
     monkeypatch.setattr("magicquant.gguf.source.open_model_source", lambda _: source)
     path = tmp_path / "source.gguf"
     path.write_bytes(b"synthetic source")

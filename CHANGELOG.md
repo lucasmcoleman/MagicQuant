@@ -2,6 +2,198 @@
 
 ## [Unreleased]
 
+### Added (2026-09-11 streamed-bytes allocation)
+
+- `magicquant/gguf/tensor_groups.py`'s classifier gains rules for
+  hyper-connection mixer projections (`blk.N.hc_attn_up/down.weight`,
+  `hc_ffn_inject.weight`, `output_hc_down.weight` -> group `O`) and pins the
+  existing substring classification of per-layer embedding tables
+  (`per_layer_token_embd.weight` -> group `E`) with an explicit regression
+  case — groundwork for pricing bytes by architectural role in the tasks
+  below. Files: `magicquant/gguf/tensor_groups.py`, `tests/test_tensor_groups.py`.
+  Validation: 5 new parametrized `test_classify` cases plus 4 new
+  known-architecture-name entries.
+
+- Records the streamed-bytes design addendum as `docs/redesign.md` §11: the
+  failure (storage-only byte pricing is wrong for routed MoE — a routed-expert
+  byte is read `n_used/n_expert` of the time, not every token), the fix (a
+  per-tensor architectural stream weight `w_t` and one Lagrangian term,
+  `loss_eff = κ·ε + λ·w_t·bytes/2^30`), and the validation gate. Docs-only;
+  no code or tests. Files: `CLAUDE.md`, `docs/redesign.md`. Validation:
+  Docs-only; full suite unchanged at 1330 passed / 20 skipped.
+
+- `magicquant/v2/bandwidth.py` gains `stream_weights()` (per-tensor `w_t` from
+  GGUF hparams — 1.0 full-read, `expert_used_count/expert_count` for routed
+  experts, 0.0 for row-gathered embeddings — with per-tensor/per-group
+  overrides), `group_view()`, `streamed_bytes()`, and a `pure_loss()` /
+  `bpw_by_group()` pair that keep κ·ε accounting separate from any bandwidth
+  term. Files: `magicquant/v2/bandwidth.py`, `tests/test_v2_audit_regressions.py`,
+  `tests/test_v2_bandwidth.py`. Validation: 11 new focused tests (hparam-derived
+  weights and overrides, missing/zero/negative expert-count handling,
+  per-tensor rules, shape-sanity warnings, hand-computed `streamed_bytes`/
+  `pure_loss`, `bpw_by_group`/`group_view`, and metadata-stub source paths).
+
+- Review-hardens the tensor/scheme error paths in `magicquant/v2/bandwidth.py`:
+  `group_view`'s modal weight is computed from the non-gathered population
+  (falling back to the full population when a group is entirely
+  gathered-by-name) instead of dict/`Counter` insertion order; `expert_ratio`
+  catches `OverflowError` on an infinite `expert_count` and warns with both
+  raw values on nonsense hparams; a missing `general.architecture` gets its
+  own clear warning; `pure_loss`/`bpw_by_group` default a missing `group` key
+  to `"UNKNOWN"`; and `streamed_bytes`/`pure_loss`/`bpw_by_group` raise
+  `KeyError`s naming both the tensor and scheme for a missing tensor, scheme,
+  `bytes`, or `werr` key (`werr: null`, the documented no-decode sentinel, is
+  still silently excluded, not conflated with a missing key). Files:
+  `magicquant/v2/bandwidth.py`, `tests/test_v2_bandwidth.py`. Validation: 11
+  new focused tests (informative-`KeyError` coverage, `OverflowError`/nonsense-
+  hparam handling, per-tensor-override-beats-gathered-rule, `UNKNOWN`-group
+  default) plus 2 tightened existing assertions.
+
+- Further hardens the same module per a second review pass: `group_view`'s
+  modal pick is now fully deterministic (highest count, ties broken by the
+  higher/"hotter" weight, never insertion order), with the disagreement
+  warning running against whichever population was actually used for the
+  modal; `expert_ratio` fails hot (`None` -> `w=1.0`) instead of clamping to
+  0.0 when `expert_used_count` is negative or exceeds `expert_count`, and
+  converts `expert_count`/`expert_used_count` independently so a parse
+  failure on one no longer discards a successfully-parsed value for the
+  other, with warnings reporting the raw (pre-conversion) hparam values.
+  Files: `magicquant/v2/bandwidth.py`, `tests/test_v2_bandwidth.py`.
+  Validation: +5 net (one test replaced) focused tests (deterministic
+  tie-break under both insertion orders, all-gathered-group disagreement
+  warning, NaN/negative/bogus expert-count values fail hot rather than
+  clamp) plus 3 tightened `KeyError`-message assertions — the
+  `expert_used_count == 0` case this pass claimed as "fails hot" was not
+  actually covered by a test until the final-review pass below caught it
+  still returning `w=0.0` uncovered.
+
+- Adds `solve_bandwidth()`: log-space bisection over λ so the realised
+  `Σ w_t · bytes` meets a `--budget-bw-gb` target while the storage budget
+  stays hard (`budget` mode), a fixed-λ `weight` mode, and a new
+  `BandwidthInfeasibleError` raised when even `LAM_MAX` can't reach the
+  budget rather than silently returning it. `BandwidthSolution.to_json()`
+  reports mode, λ, streamed bytes at the chosen λ vs. λ=0, per-group bpw at
+  both, and bisection provenance (`nonmonotone_probes`). Files:
+  `magicquant/v2/__init__.py`, `magicquant/v2/bandwidth.py`,
+  `magicquant/v2/outcome.py`, `tests/test_v2_bandwidth.py`. Validation: 9 new
+  focused tests (mode-off is λ=0, budget mode moves bits trunk<->experts,
+  budget/weight mutual exclusivity, inversion counting, budget-already-met
+  short-circuit, infeasible budget raises rather than returning `LAM_MAX`,
+  weight mode reports the given λ, determinism, `to_json` shape).
+
+- Wires `solve_bandwidth()` into `magicquant/v2/search.py`'s orchestration:
+  `run_budget_search` threads `w_stream`/`budget_bw_bytes` through to
+  allocation, stamps `results["bandwidth"]` from `BandwidthSolution.to_json()`
+  (`run_budget_search` always builds a `BandwidthSolution` -- mode `"off"`
+  when no bandwidth flags are set -- so `bandwidth` is never `None` here;
+  a later review removed the dead `else` branch this line originally
+  described),
+  overwrites `results["allocation"]["predicted_loss"]` with the pure κ·ε loss
+  so `report_fit_affine` keeps its meaning even when λ>0, and adds
+  `frontier.json["lambda"]`. Files: `magicquant/v2/search.py`,
+  `tests/test_v2_bandwidth.py`, `tests/test_v2_search_characterization.py`.
+  Validation: 4 new focused tests (off-mode is byte-identical in shape,
+  budget mode wires through and reports the pure loss, a tiny bandwidth
+  weight leaves assignment/`report_fit` unchanged, unreadable source
+  metadata fails soft and prices hot) plus the four characterization pins
+  below.
+
+- Adds `--budget-bw-gb` (settings-routed, `MAGICQUANT_BUDGET_BW_GB` env
+  support, parity with `--budget-gb`), `--bandwidth-weight` (CLI-only fixed
+  λ — a per-invocation tuning knob, no env var), and repeatable
+  `--stream-weight GROUP=W` (CLI-only) to `magicquant search --algo v2`, with
+  validation: `--budget-bw-gb`/`--bandwidth-weight` are mutually exclusive,
+  `--bandwidth-weight` must be finite and >= 0, `--budget-bw-gb` must be
+  finite and > 0, and `--stream-weight` must parse as a float in [0,1].
+  Files: `magicquant/__main__.py`, `magicquant/config.py`,
+  `tests/test_config_routing.py`. Validation: 9 new focused tests (flags
+  reach `V2Config`, env-var routing for `--budget-bw-gb`, mutual exclusivity,
+  hard-exit validation for bad/negative/NaN/zero/out-of-range values).
+
+- Adds `--stream-tps` to the v1 evolutionary path: `predict_stream_gb`
+  discounts routed-expert bytes by `n_used/n_expert` (a stream-weighted
+  counterpart to the existing `--bytes-tps` stored-size proxy) and
+  `use_stream_tps` reaches `survival._predict_population` ->
+  `PredictiveScorer.score_hybrid` scoring; `--stream-tps` is v1-only and is
+  now named in the `--algo v2`
+  ignored-v1-flags warning. Files: `magicquant/__main__.py`,
+  `magicquant/config.py`, `magicquant/evolution/predictor.py`,
+  `magicquant/evolution/survival.py`, `magicquant/orchestrator.py`,
+  `tests/test_config_routing.py`, `tests/test_tps_objective.py`. Validation:
+  7 new focused tests (`predict_stream_gb` equals `predict_size` without
+  weights / discounts cold experts, `use_stream_tps` changes score only with
+  weights, a survivor with only `use_stream_tps` reaches `score_hybrid`,
+  `use_stream_tps` wins over `use_bytes_tps` with a warning, `--stream-tps`
+  named in the v2-ignored-flags warning); full suite 1330 passed, 20 skipped;
+  `ruff check --select F magicquant/ tools/ tests/` clean.
+
+- **Behavioural notes.** (a) Four characterization pins in
+  `tests/test_v2_search_characterization.py` changed deliberately: the
+  top-level `v2_results.json` key set gains `bandwidth` (always present under
+  `--algo v2`, `mode: "off"` by default); both per-anchor key sets (ok and
+  failed) gain `streamed_bytes`; and `frontier.json`'s key set gains
+  `lambda`. (b) A default run (no `--budget-bw-gb`/`--bandwidth-weight`) is
+  byte-identical in allocation, but the published `allocation.predicted_loss`
+  scalar is now always a direct sum of κ·ε rather than an incrementally
+  accumulated total, so it may differ from the pre-feature value by ULPs.
+  (c) `frontier.json`'s point losses are λ-inclusive (κ·ε plus the bandwidth
+  term) — read `frontier.json["lambda"]` to see whether/how much bandwidth
+  pricing shaped a given run's frontier; `allocation.predicted_loss` and
+  every anchor's `predicted_loss` stay pure κ·ε. (d) `magicquant search`'s
+  argparse prefix abbreviations `--budget` and `--stream` are now ambiguous
+  (new `--budget-bw-gb` collides with `--budget-gb`; new `--stream-weight`/
+  `--stream-tps` collide with `--stream-aware`) — verified directly
+  (`magicquant search --budget ...` and `--stream ...` both now error
+  `ambiguous option`) — scripts must use full flag names. (e) `--stream-tps`
+  is v1-only; passing it under `--algo v2` triggers the existing
+  ignored-v1-flags warning rather than doing anything.
+
+- Final-review fixes across the whole feature: `expert_ratio` now fails hot
+  (`w=1.0` + WARNING) for `expert_used_count == 0`, not just negative/
+  out-of-range (it previously fell through to `w=0.0` with no warning);
+  `solve_bandwidth`/`run_budget_search` reject a non-finite/negative
+  `lam_fixed`/`bandwidth_weight` and a non-finite/non-positive
+  `budget_bw_gb`/`budget_bw_bytes` in-process (Foundry constructs `V2Config`
+  directly, bypassing the CLI guards), checked before any measurement runs;
+  `_atomic_write_json` passes `allow_nan=False`; `BandwidthSolution` gains
+  `storage_utilisation` (`chosen.total_bytes / budget_bytes`, warned below
+  0.98); the bisection exits early once `hi/lo` converges (~40% fewer
+  `allocate()` calls) and computes `nonmonotone_probes` in every mode, not
+  just `budget`; the feasibility assertion is a `RuntimeError` (survives
+  `python -O`); the two per-tensor shape-sanity warnings in `stream_weights`
+  are aggregated into one line each with a count and the first three names;
+  `--stream-weight`'s group key is validated against `KNOWN_GROUPS`
+  (`SystemExit` otherwise -- `default` is a reporting key, not a group);
+  `_assemble_results`'s `bandwidth` parameter is now required keyword-only
+  (the `mode: "off"` fallback branch was dead code -- `run_budget_search`
+  always builds a `BandwidthSolution`); the metadata-read failure path
+  truncates `weights_source["error"]` to 200 chars and scrubs the absolute
+  source path down to its basename; `run_budget_search` retains only the
+  three hparam keys `stream_weights()` needs after computing them, instead
+  of keeping the full source metadata (a 144 MiB tokenizer array at a 262k
+  vocab) alive for the rest of the run; `PredictiveScorer.baseline_stream_gb`
+  is a `functools.cached_property`; and the both-`*_tps`-flags-set warning in
+  `score_hybrid` fires once per process instead of once per candidate (a
+  campaign scores thousands a generation). Files: `magicquant/v2/bandwidth.py`,
+  `magicquant/v2/search.py`, `magicquant/__main__.py`,
+  `magicquant/evolution/predictor.py`, `magicquant/gguf/tensor_groups.py`,
+  `tests/test_v2_bandwidth.py`, `tests/test_config_routing.py`,
+  `tests/test_tps_objective.py`, `tests/test_tensor_groups.py`. Also
+  retargets `test_v2_bandwidth.py`'s `test_determinism`/`test_to_json_shape`
+  onto a `budget_bw_bytes` inside `(s_min, s0)` (the old `60_000` sat above
+  this fixture's `s0` of `53,793`, so neither test ever actually bisected).
+  Validation: +15 net focused tests (zero-expert-used-count fails hot,
+  in-process validation for `lam_fixed`/`budget_bw_bytes`/`budget_bw_gb`/
+  `bandwidth_weight` raising before baseline measurement, `_atomic_write_json`
+  rejects non-finite values, metadata-error path scrubbing, aggregated
+  shape-warning counts, `--stream-weight` unknown-group rejection ×3,
+  hyper-connection `hc_ffn_up`/`hc_ffn_down` ordering pins, once-per-process
+  both-flags warning, `use_stream_tps` forwarding in the CLI routing tests);
+  full suite 1345 passed / 20 skipped; `ruff check --select F magicquant/
+  tools/ tests/` clean; `test_v2_search_characterization.py` and
+  `test_refactor_regression.py` pass unchanged -- no VALUE pin moved, no
+  fixture regenerated.
+
 ### Added (2026-09-10 audit)
 
 - Built-wheel installation smoke checks validate the console entry and bundled

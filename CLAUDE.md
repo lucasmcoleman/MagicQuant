@@ -25,7 +25,7 @@ Two virtualenvs on the dev box; NEVER use bare `python`/`pytest` (PATH resolves 
 an unrelated shim without pytest — it exits 0 having run nothing):
 
 ```bash
-.venv/bin/python -m pytest tests/ -q            # main suite (~1090 tests, ~15s)
+.venv/bin/python -m pytest tests/ -q            # main suite (~1270 tests, ~15s)
 .venv/bin/python -m pytest tests/test_writer.py::test_name -q   # single test
 .venv-qat/bin/python -m pytest tests/ -q        # torch env: runs the ~210 QAT tests too
 .venv/bin/ruff check --select F magicquant/ tools/ tests/   # BLOCKING in CI — keep at zero

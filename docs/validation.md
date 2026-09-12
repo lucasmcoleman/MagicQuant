@@ -1,6 +1,6 @@
 # v2 validation — old vs new pipeline at matched size budget
 
-**Status: COMPLETE.** Headline verdict below; one supplementary cell
+**Status: COMPLETE for the 2026-07 v1/v2 matched-size study; a streamed-bytes campaign (docs/redesign.md section 11) is open and will be appended below.** Headline verdict below; one supplementary cell
 (v2-with-embedding-floor PPL, and v2 HellaSwag) is marked *pending
 post-cutoff GPU* and does not gate the conclusion.
 

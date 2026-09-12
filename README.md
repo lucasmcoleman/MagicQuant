@@ -345,6 +345,64 @@ magicquant/
 evolutionary path above remains the default. `qat/_ggml_ref.py` (a private
 reference helper, not part of the public API) is omitted from this tree.
 
+## Streamed bytes and MoE
+
+Storage-only byte pricing is correct for a dense model but not for a routed
+MoE: a trunk byte is read every decode token while a routed-expert byte is
+only read `n_used/n_expert` of the time, so two renders of equal file size can
+still stream very different bytes per token. MagicQuant's own shipped MoE
+quants show the consequence — same architecture, MagicQuant vs stock quants
+below, +33% bytes per token, which at batch-1 (memory-bandwidth-bound) decode
+is roughly a 25% speed penalty for a file that is no smaller:
+
+| model | quant | trunk bpw | experts bpw | trunk share of traffic | weights GiB/token |
+|---|---|---|---|---|---|
+| Ornith-1.5-35B-A3B | MagicQuant Q4_K_M (shipped) | 11.86 (head BF16) | 4.25 | 84% | 3.24 |
+| Qwen3.6-35B-A3B | MagicQuant ROCmFPX MQ-Q4 (shipped) | 12.69 (head BF16, DeltaNet 16) | 4.50 | 84% | 3.47 |
+| Qwen3.6-35B-A3B | unsloth MXFP4_MOE (stock) | 8.81 | 4.71 | 78% | 2.60 |
+| Qwen3.8-Flash-Next | unsloth UD-IQ4_XS | 9.08 | 3.94 | 80% | 5.44 |
+| gemma-4-26B-A4B | unsloth UD-Q4_K_XL | 4.68 | 4.50 | 55% | 1.65 |
+| Qwen3.8-27B (dense) | MagicQuant Q4_K_M | 4.61 | — | 100% | 13.97 |
+
+```
+magicquant search <model-bf16.gguf> --algo v2 --budget-gb 19.57 --budget-bw-gb 2.1 --probe-mode cumulative --floor E=Q6_K --use-imatrix
+magicquant search <model-bf16.gguf> --stream-tps --speed-weight 0.3        # v1 route: stream-weighted speed proxy
+```
+
+| flag | what it does | env support |
+|---|---|---|
+| `--budget-bw-gb` | `[v2]` streamed-bytes budget in GiB per decode token: bisects λ so trunk+active-expert bytes read per token fit the budget. Mutually exclusive with `--bandwidth-weight`. | `MAGICQUANT_BUDGET_BW_GB` |
+| `--bandwidth-weight` | `[v2]` fixed λ (loss per streamed GiB) for the streamed-bytes term, instead of bisecting to a budget. Mutually exclusive with `--budget-bw-gb`. | none — CLI only |
+| `--stream-weight GROUP=W` | `[v2]` override a group's stream weight in [0,1], repeatable. | none — CLI only |
+| `--stream-tps` | `[v1]` score speed from predicted streamed bytes per decode token instead of stored size — the MoE-correct variant of `--bytes-tps`. | `MAGICQUANT_USE_STREAM_TPS` |
+
+`v2_results.json`'s top-level `bandwidth` block (present whenever `--algo v2`
+runs; `mode: "off"` when neither flag above is passed) reports: `mode`
+(`off`/`weight`/`budget`), `lambda` (the chosen λ), `stream_weights`
+(`observed_by_group`, `default`, `exceptions`), `weights_source`,
+`streamed_bytes` and `streamed_bytes_lambda0` (bytes/token at the chosen λ vs.
+at λ=0 — the delta this feature bought), `streamed_bytes_min` (the bisection
+floor, `budget` mode only — also `null` in `budget` mode when the budget was
+already met at λ=0, since the bisection never ran), `budget_bw_bytes`,
+`nonmonotone_probes`, `predicted_loss_pure`, `total_loss_with_lambda`,
+`storage_utilisation` (`chosen.total_bytes / budget_bytes` — logged as a
+WARNING when below 0.98, since at λ>0 the greedy can leave budget unspent),
+and `bpw_by_group` (`lambda0` and `chosen` per-group bits-per-weight).
+
+**Caveats:** `frontier.json`'s point losses are λ-inclusive (κ·ε plus the
+bandwidth term), while `allocation.predicted_loss` and every anchor's
+`predicted_loss` are pure κ·ε — `report_fit_affine` needs that to keep its
+meaning. `frontier.json["lambda"]` is the signal for whether/how much
+bandwidth pricing shaped a given run's frontier. Because `storage_utilisation`
+can be below 1.0 at λ>0, **compare `allocation.total_bytes` across arms, not
+just the requested `--budget-gb`/`--budget-bw-gb`** — an arm may be
+materially smaller than another at the same nominal storage budget, and
+G1/G3-style speed/size comparisons must not be read as an allocation effect
+when they are partly a size effect.
+
+See [`docs/redesign.md` §11](docs/redesign.md#11-streamed-bytes-addendum-pricing-bytes-by-how-often-they-are-read)
+for the full design record.
+
 ## Configuration via Environment
 
 The `search` command (and `search --dry-run`) reads settings from environment

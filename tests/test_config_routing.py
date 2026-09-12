@@ -226,7 +226,7 @@ def _search_args(**kw):
         kl_weight=None, enable_speed_bench=None, enable_rocmfpx=None,
         enable_iq=None, stream_aware=None, head_aggressive=None,
         seed=None, measurement_chunks=None,
-        speed_weight=None, use_bytes_tps=None,
+        speed_weight=None, use_bytes_tps=None, use_stream_tps=None,
         write_calibration=None, calibration_source=None,
     )
     base.update(kw)
@@ -245,7 +245,7 @@ def test_cmd_search_forwards_knobs_to_run_measured_search(monkeypatch):
         enable_rocmfpx=True, enable_iq=True,
         stream_aware=True, head_aggressive=True, seed=42,
         measurement_chunks=8,
-        speed_weight=0.4, use_bytes_tps=True,
+        speed_weight=0.4, use_bytes_tps=True, use_stream_tps=True,
         write_calibration=True, calibration_source="/tmp/calib.json",
     ))
 
@@ -266,6 +266,7 @@ def test_cmd_search_forwards_knobs_to_run_measured_search(monkeypatch):
     assert call["measurement_chunks"] == 8
     assert call["speed_weight"] == 0.4
     assert call["use_bytes_tps"] is True
+    assert call["use_stream_tps"] is True
     assert call["write_calibration"] is True
     assert call["calibration_source"] == "/tmp/calib.json"
 
@@ -282,7 +283,7 @@ def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
         enable_rocmfpx=True, enable_iq=True,
         stream_aware=True, head_aggressive=True, seed=42,
         measurement_chunks=8,
-        speed_weight=0.4, use_bytes_tps=True,
+        speed_weight=0.4, use_bytes_tps=True, use_stream_tps=True,
         write_calibration=True, calibration_source="/tmp/calib.json",
     ))
 
@@ -300,6 +301,7 @@ def test_cmd_search_forwards_knobs_to_run_full_search(monkeypatch):
     assert call["measurement_chunks"] == 8
     assert call["speed_weight"] == 0.4
     assert call["use_bytes_tps"] is True
+    assert call["use_stream_tps"] is True
     assert call["calibration_source"] == "/tmp/calib.json"
     # run_full_search has no KL / speed-bench / write_calibration params --
     # must not be forwarded.
@@ -463,6 +465,187 @@ def test_cmd_search_v2_env_adapter_also_hard_exits(monkeypatch):
     )
     with pytest.raises(SystemExit, match="MAGICQUANT_ADAPTER_PATH"):
         cli.cmd_search(_search_args(algo="v2", budget_gb=5.0))
+
+
+# ── cmd_search --algo v2 streamed-bytes flags (Task 6) ───────────────────────
+# --budget-bw-gb (settings-routed, env-capable), --bandwidth-weight and
+# --stream-weight (args-only, no env support -- mirrors --floor) feed
+# V2Config's bandwidth_weight/budget_bw_gb/stream_weights fields (Task 5).
+
+
+def test_cmd_search_v2_budget_bw_gb_and_stream_weight_reach_v2config(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search", lambda cfg: calls.append(cfg) or {}
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--budget-bw-gb", "2",
+            "--stream-weight", "H=0.5", "--stream-weight", "X=0.1",
+        ],
+    )
+    cli.main()
+
+    assert len(calls) == 1
+    cfg = calls[0]
+    assert cfg.budget_bw_gb == 2.0
+    assert cfg.stream_weights == {"H": 0.5, "X": 0.1}
+    assert cfg.bandwidth_weight == 0.0
+
+
+def test_cmd_search_v2_bandwidth_weight_reaches_v2config(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search", lambda cfg: calls.append(cfg) or {}
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--bandwidth-weight", "0.05",
+        ],
+    )
+    cli.main()
+
+    assert len(calls) == 1
+    assert calls[0].bandwidth_weight == 0.05
+
+
+def test_cmd_search_v2_budget_bw_gb_and_bandwidth_weight_mutually_exclusive(monkeypatch):
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search",
+        lambda cfg: pytest.fail("v2 search must not run with both flags set"),
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--budget-bw-gb", "2", "--bandwidth-weight", "0.05",
+        ],
+    )
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        cli.main()
+
+
+def test_cmd_search_v2_stream_weight_bad_float_is_hard_exit(monkeypatch):
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search",
+        lambda cfg: pytest.fail("v2 search must not run with a malformed --stream-weight"),
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--stream-weight", "X=abc",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        cli.main()
+
+
+def test_cmd_search_v2_stream_weight_out_of_range_is_hard_exit(monkeypatch):
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search",
+        lambda cfg: pytest.fail("v2 search must not run with an out-of-range --stream-weight"),
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--stream-weight", "X=2",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        cli.main()
+
+
+@pytest.mark.parametrize("spec", ["default=0.5", "h=0.5", "=0.5"])
+def test_cmd_search_v2_stream_weight_unknown_group_is_hard_exit(monkeypatch, spec):
+    # The group key must be validated against magicquant.v2.bandwidth's
+    # KNOWN_GROUPS -- exact, case-sensitive; "default" is a sibling key in
+    # the reporting JSON, not a group, and must not be accepted here either.
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search",
+        lambda cfg: pytest.fail(f"v2 search must not run with --stream-weight {spec!r}"),
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--stream-weight", spec,
+        ],
+    )
+    with pytest.raises(SystemExit):
+        cli.main()
+
+
+def test_cmd_search_v2_budget_bw_gb_from_env(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search", lambda cfg: calls.append(cfg) or {}
+    )
+    monkeypatch.setenv("MAGICQUANT_BUDGET_BW_GB", "1.5")
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5",
+        ],
+    )
+    cli.main()
+
+    assert len(calls) == 1
+    assert calls[0].budget_bw_gb == 1.5
+
+
+def test_cmd_search_v2_bandwidth_weight_negative_is_hard_exit(monkeypatch):
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search",
+        lambda cfg: pytest.fail("v2 search must not run with a negative --bandwidth-weight"),
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--bandwidth-weight", "-1",
+        ],
+    )
+    with pytest.raises(SystemExit, match=">= 0"):
+        cli.main()
+
+
+def test_cmd_search_v2_bandwidth_weight_nan_is_hard_exit(monkeypatch):
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search",
+        lambda cfg: pytest.fail("v2 search must not run with a NaN --bandwidth-weight"),
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--bandwidth-weight", "nan",
+        ],
+    )
+    with pytest.raises(SystemExit, match="finite"):
+        cli.main()
+
+
+def test_cmd_search_v2_budget_bw_gb_zero_is_hard_exit(monkeypatch):
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search",
+        lambda cfg: pytest.fail("v2 search must not run with --budget-bw-gb 0"),
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--budget-bw-gb", "0",
+        ],
+    )
+    with pytest.raises(SystemExit, match="> 0"):
+        cli.main()
 
 
 # ── cmd_generate routing (M5 finish) ────────────────────────────────────────
@@ -716,3 +899,27 @@ def test_cmd_imatrix_real_parser_has_llamacpp_path_flag(monkeypatch, tmp_path):
     cli.main()
 
     assert captured["imatrix_bin"] == str(bin_dir / "llama-imatrix")
+
+
+def test_cmd_search_v2_stream_tps_named_in_ignored_v1_flags_warning(monkeypatch, capsys):
+    """--stream-tps (Task 7) is a v1-only scoring knob: _run_v2_search's
+    V2Config construction reads no such attribute, so cmd_search must name
+    it in the ignored-v1-flags warning, mirroring --bytes-tps above."""
+    calls = []
+    monkeypatch.setattr(
+        "magicquant.v2.run_budget_search", lambda cfg: calls.append(cfg) or {}
+    )
+
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "magicquant", "search", "/tmp/base.gguf", "--algo", "v2",
+            "--budget-gb", "5", "--stream-tps",
+        ],
+    )
+    cli.main()
+
+    assert len(calls) == 1, "the v2 search must still run"
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "--stream-tps" in out
