@@ -887,6 +887,75 @@ def test_load_matching_checkpoint_rejects_stored_binary_when_current_is_unresolv
     assert orch._load_matching_checkpoint(path, verbose=False) is None
 
 
+# ── PR6 review F1: the imatrix_id backward-compat default must derive from
+# ── the checkpoint's own top-level "imatrix" block, not hardcode inactive --
+# ── an imatrix-active pre-fix checkpoint resuming into a use_imatrix=False
+# ── run must be REJECTED, not silently matched on a false "both inactive".
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_load_matching_checkpoint_rejects_imatrix_active_prefix_checkpoint_under_no_imatrix_run(
+    tmp_path, monkeypatch
+):
+    """The actual F1 bug: a checkpoint written before "imatrix_id" existed
+    in measurement_conditions, but whose top-level "imatrix" block (recorded
+    since 2026-07-05, i.e. already present on every pre-fix checkpoint this
+    branch could ever meet) says imatrix WAS active for its candidates --
+    must NOT resume a fresh run with no imatrix. Before the fix, the missing
+    "imatrix_id" key defaulted to {"active": False}, which spuriously
+    matched a current {"active": False} and resumed, silently blending
+    imatrix-weighted candidate measurements with freshly-taken unweighted
+    ones in a single ranking."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    checkpoint = _base_fake_checkpoint(orch)
+    checkpoint["measurement_conditions"].pop("imatrix_id", None)
+    checkpoint["imatrix"] = {"active": True, "n_tensors": 5}
+    path = _checkpoint_path(orch)
+    path.write_text(json.dumps(checkpoint))
+
+    assert orch._imatrix is None  # sanity: current run genuinely has no imatrix
+    assert orch._load_matching_checkpoint(path, verbose=False) is None
+
+
+def test_load_matching_checkpoint_rejects_imatrix_active_prefix_checkpoint_even_under_imatrix_run(
+    tmp_path, monkeypatch
+):
+    """Same pre-fix shape, but the current run DOES have an imatrix active
+    too -- still rejected, since the stored checkpoint cannot prove it was
+    the SAME imatrix (no hash was captured before the imatrix_id key
+    existed). Not trusted rather than partially trusted, in both
+    directions."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    orch._imatrix = {"blk.0.attn_q.weight": [1.0, 2.0, 3.0]}
+    checkpoint = _base_fake_checkpoint(orch)
+    checkpoint["measurement_conditions"].pop("imatrix_id", None)
+    checkpoint["imatrix"] = {"active": True, "n_tensors": 5}
+    path = _checkpoint_path(orch)
+    path.write_text(json.dumps(checkpoint))
+
+    assert orch._load_matching_checkpoint(path, verbose=False) is None
+
+
+def test_load_matching_checkpoint_resumes_prefix_checkpoint_with_no_imatrix_record_at_all(
+    tmp_path, monkeypatch
+):
+    """The backward-compat path F1 must NOT break: a checkpoint with no
+    "imatrix_id" key AND no imatrix record at all (either no top-level
+    "imatrix" key, simulating a checkpoint older than 2026-07-05, or an
+    explicit {"active": False}) genuinely has no imatrix evidence either
+    way -- it must still resume a fresh no-imatrix run, exactly as before
+    this fix."""
+    orch, fake_tools = _make_orchestrator(tmp_path, monkeypatch)
+    checkpoint = _base_fake_checkpoint(orch)
+    checkpoint["measurement_conditions"].pop("imatrix_id", None)
+    del checkpoint["imatrix"]  # older than the "imatrix" block itself
+    path = _checkpoint_path(orch)
+    path.write_text(json.dumps(checkpoint))
+
+    assert orch._imatrix is None
+    assert orch._load_matching_checkpoint(path, verbose=False) is not None
+
+
 def test_mismatched_llamacpp_binary_forces_fresh_measured_search(tmp_path, monkeypatch):
     """Integration-level companion to the direct _load_matching_checkpoint
     tests above: end to end through run_measured_search, a checkpoint
