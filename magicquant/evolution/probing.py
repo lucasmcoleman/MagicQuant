@@ -180,6 +180,7 @@ class SensitivityProber:
         parameter_counts: Optional[Dict[str, int]] = None,
         kl_base_logits_path: Optional[str] = None,
         kl_corpus_path: Optional[str] = None,
+        imatrix: Optional[Dict[str, Any]] = None,
     ):
         """
         Args:
@@ -207,6 +208,16 @@ class SensitivityProber:
                 common case -- ``calculate_perplexity`` only returns a bare
                 float) falls back to a default in utils/measurement.py; see
                 ``magicquant.utils.measurement.measurement_eps``.
+            imatrix: the same per-tensor importance matrix the search's
+                candidate builds and final tier generation are quantized
+                with (``MagicQuantOrchestrator._imatrix``), threaded into
+                every real probe's ``create_hybrid_gguf`` call so probes are
+                measured under the SAME calibration state that steers them.
+                *None* (default) reproduces the historical unweighted-probe
+                behaviour exactly -- callers that never pass this see no
+                change. See CLAUDE.md / issue #5 for why an imatrix mismatch
+                between probes and candidates silently mis-ranks groups
+                rather than merely mis-scaling them.
         """
         self.base_model_path = base_model_path
         self.baseline_ppl = baseline_perplexity
@@ -214,6 +225,7 @@ class SensitivityProber:
         self.perplexity_calculator = perplexity_calculator
         self.output_dir = output_dir
         self.strict = strict
+        self.imatrix = imatrix
         # Per-group parameter counts, when the caller has them. Used to judge
         # probe coverage by MODEL MASS rather than by group count -- three of
         # nine groups resolving reads as 33% coverage but was 1.6% of the
@@ -808,6 +820,7 @@ class SensitivityProber:
                 base_model_path=self.base_model_path,
                 quant_config=quant_config,
                 verbose=False,
+                imatrix=self.imatrix,
             )
 
             # A probe measures nothing unless the group it names actually
