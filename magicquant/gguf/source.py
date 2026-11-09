@@ -489,6 +489,57 @@ _HF_TO_GGUF_PATTERNS = [
     # the attribute names differ) and keep their raw HF names, which
     # llama.cpp's deepseek2 loader won't recognize. Add a dedicated pattern
     # block here (mirroring the q/k/v block above) when MLA support is needed.
+    # --- draft_upstream_sync.py candidates (UNVERIFIED -- see PR body checklist before merging) ---
+    (r"^layers\.(\d+)\.attention\.wkv_a_with_mqa\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_kv_a_mqa.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_KV_A_MQA -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.self_attn\.kv_a_proj_with_mqa\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_kv_a_mqa.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_KV_A_MQA -- draft_upstream_sync, UNVERIFIED
+    (r"^layers\.(\d+)\.attention\.kv_a_norm\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_kv_a_norm.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_KV_A_NORM -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.self_attn\.kv_a_layernorm\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_kv_a_norm.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_KV_A_NORM -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.self_attn\.kv_b_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_kv_b.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_KV_B -- draft_upstream_sync, UNVERIFIED
+    (r"^layers\.(\d+)\.attention\.k_b_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_k_b.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_K_B -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.self_attn\.k_b_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_k_b.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_K_B -- draft_upstream_sync, UNVERIFIED
+    (r"^layers\.(\d+)\.attention\.wq_a\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_q_a.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_Q_A -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.self_attn\.q_a_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_q_a.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_Q_A -- draft_upstream_sync, UNVERIFIED
+    (r"^layers\.(\d+)\.attention\.q_a_norm\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_q_a_norm.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_Q_A_NORM -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.self_attn\.q_a_layernorm\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_q_a_norm.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_Q_A_NORM -- draft_upstream_sync, UNVERIFIED
+    (r"^layers\.(\d+)\.attention\.wq_b\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_q_b.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_Q_B -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.self_attn\.q_b_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_q_b.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_Q_B -- draft_upstream_sync, UNVERIFIED
+    (r"^layers\.(\d+)\.attention\.v_b_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_v_b.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_V_B -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.self_attn\.v_b_proj\.weight$",
+     lambda m: f"blk.{m.group(1)}.attn_v_b.weight"),  # DEEPSEEK2OCR, MISTRAL4 / ATTN_V_B -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.post_feedforward_layernorm_1\.weight$",
+     lambda m: f"blk.{m.group(1)}.post_ffw_norm_1.weight"),  # GEMMA4 / FFN_POST_NORM_1 -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.post_feedforward_layernorm_2\.weight$",
+     lambda m: f"blk.{m.group(1)}.post_ffw_norm_2.weight"),  # GEMMA4 / FFN_POST_NORM_2 -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.pre_feedforward_layernorm_2\.weight$",
+     lambda m: f"blk.{m.group(1)}.pre_ffw_norm_2.weight"),  # GEMMA4 / FFN_PRE_NORM_2 -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.layer_scalar\.weight$",
+     lambda m: f"blk.{m.group(1)}.layer_output_scale.weight"),  # GEMMA4 / LAYER_OUT_SCALE -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.per_layer_input_gate\.weight$",
+     lambda m: f"blk.{m.group(1)}.inp_gate.weight"),  # GEMMA4 / PER_LAYER_INP_GATE -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.per_layer_model_projection\.weight$",
+     'per_layer_model_proj.weight'),  # GEMMA4 / PER_LAYER_MODEL_PROJ -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.post_per_layer_input_norm\.weight$",
+     lambda m: f"blk.{m.group(1)}.post_norm.weight"),  # GEMMA4 / PER_LAYER_POST_NORM -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.layers\.(\d+)\.per_layer_projection\.weight$",
+     lambda m: f"blk.{m.group(1)}.proj.weight"),  # GEMMA4 / PER_LAYER_PROJ -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.per_layer_projection_norm\.weight$",
+     'per_layer_proj_norm.weight'),  # GEMMA4 / PER_LAYER_PROJ_NORM -- draft_upstream_sync, UNVERIFIED
+    (r"^model\.embed_tokens_per_layer\.weight$",
+     'per_layer_token_embd.weight'),  # GEMMA4 / PER_LAYER_TOKEN_EMBD -- draft_upstream_sync, UNVERIFIED
 ]
 
 _HF_TO_GGUF_COMPILED = [(re.compile(p), r) for p, r in _HF_TO_GGUF_PATTERNS]
@@ -707,18 +758,26 @@ def _build_gguf_metadata_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
     arch_map = {
         "arctic": "arctic", "baichuan": "baichuan", "bloom": "bloom",
         "chatglm": "chatglm", "cohere": "command-r", "cohere2": "cohere2",
+        "deepseek2ocr": "deepseek2-ocr",  # DEEPSEEK2OCR -- draft_upstream_sync, UNVERIFIED
+        "deepseek2ocr_text": "deepseek2-ocr",  # DEEPSEEK2OCR -- draft_upstream_sync, UNVERIFIED
         "dbrx": "dbrx", "deepseek": "deepseek", "deepseek_v2": "deepseek2",
         "deepseek_v3": "deepseek2", "exaone": "exaone",
         "falcon": "falcon", "falcon_h1": "falcon-h1",
         "falcon_mamba": "mamba", "gemma": "gemma", "gemma2": "gemma2",
+        "gemma4": "gemma4",  # GEMMA4 -- draft_upstream_sync, UNVERIFIED
+        "gemma4_text": "gemma4",  # GEMMA4 -- draft_upstream_sync, UNVERIFIED
         "gemma3": "gemma3", "glm4": "glm4", "gpt2": "gpt2",
         "gpt_neox": "gptneox", "granite": "granite",
         "granitemoe": "granitemoe", "granitemoehybrid": "granitehybrid",
         "grok": "grok",
+        "hunyuan_vl": "hunyuan_vl",  # HUNYUAN_VL -- draft_upstream_sync, UNVERIFIED
+        "hunyuan_vl_text": "hunyuan_vl",  # HUNYUAN_VL -- draft_upstream_sync, UNVERIFIED
         "internlm2": "internlm2", "internlm3": "llama",
         "jamba": "jamba", "llama": "llama", "llama4": "llama4",
         "mamba": "mamba", "mamba2": "mamba2", "minicpm": "minicpm",
         "minicpm3": "minicpm3", "mistral": "llama", "mistral3": "mistral3",
+        "mistral4": "mistral4",  # MISTRAL4 -- draft_upstream_sync, UNVERIFIED
+        "mistral4_text": "mistral4",  # MISTRAL4 -- draft_upstream_sync, UNVERIFIED
         "mixtral": "llama", "nemotron": "nemotron",
         "olmo": "olmo", "olmo2": "olmo2", "olmoe": "olmoe",
         "phi": "phi2", "phi3": "phi3", "phimoe": "phimoe",
